@@ -4,12 +4,20 @@
   <p><strong>YouTube Music in a fast, native desktop app.</strong></p>
   <p>Built with Rust, egui, and rodio. No Electron or browser-based player, and under 100 MB of memory while playing.</p>
   <p>
-    <a href="https://grapedjuice.github.io/ytm-rs/">Website</a>
-    · <a href="https://github.com/grapedjuice/ytm-rs/releases/latest">Download for Windows</a>
+    <a href="https://grapedjuice.github.io/ytm-rs/">Upstream website</a>
+    · <a href="https://github.com/Hellgers/ytm-rs/releases/latest">Download for Windows</a>
     · <a href="#features">Features</a>
     · <a href="#build-from-source">Build from source</a>
   </p>
 </div>
+
+## Fork notice: audio continuity fix
+
+This is **Hellgers/ytm-rs**, a modified fork of [grapedjuice/ytm-rs](https://github.com/grapedjuice/ytm-rs), based on upstream v0.2.20. The changes dated **2026-10-23** are released as **0.2.21**. This is not an official upstream release.
+
+The patch converts each finite track continuously to the mixer's format before it enters the playback queue. This prevents AAC packet boundaries from restarting sample-rate conversion, and rebuilds the decoder and converter when seeking. It addresses a reproduced timing and phase-continuity defect; it does not claim to remove every whistle, distortion, or playback interruption. See the [technical explanation and synthetic reproduction](docs/AUDIO_CONTINUITY_FIX.md) and [release notes](docs/RELEASE_NOTES_0.2.21.md).
+
+Use this fork's [Windows releases](https://github.com/Hellgers/ytm-rs/releases). Its updater checks **Hellgers/ytm-rs**, independently of upstream. These fork binaries are **unsigned**; the upstream signing arrangement does not cover them. The complete modified source, patch, and SHA-256 checksums are supplied with the release. Original authorship, credits, and the GPL license are retained below.
 
 <p align="center">
   <img src="docs/screenshots/now-playing.jpg" alt="Now playing: album art with synced lyrics over an animated album-art background" width="900">
@@ -29,7 +37,7 @@
 | **Transfer from Spotify** | Bring your Spotify playlists and Liked Songs over to YouTube Music. ytm-rs finds each song in the background while you keep listening, asks you when it isn't sure about a match, and picks up where it left off if a transfer gets interrupted. Liked Songs can go straight into Liked Music in the same order as on Spotify. |
 | **Themes**              | Pick from 26 presets rebuilt from the [Better Lyrics community themes](https://github.com/better-lyrics/themes), such as Apple Music, Spicy, Spinning Record and reCover. Each one restyles the lyrics, background, cover, player bar, fonts and the rest of the app. Prefer another font? Pick a bundled one or any font installed on your PC in **Settings → Appearance**. |
 | **Desktop integration** | Use system media controls, previous/play/next buttons on the taskbar thumbnail, Discord Rich Presence, Last.fm scrobbling, and screen-reader-accessible controls. Close to the tray to keep music playing in the background, and collapse the sidebar to a slim row of icons. |
-| **Automatic updates**   | The app (installed or portable) downloads new versions in the background and installs them when you close it, or right away with **Restart to update**. It shows each release's notes when an update is ready and after it installs.              |
+| **Automatic updates**   | This fork checks releases in **Hellgers/ytm-rs**. The app (installed or portable) downloads new versions in the background and installs them when you close it, or right away with **Restart to update**. It shows each release's notes when an update is ready and after it installs.              |
 
 ## Screenshots
 
@@ -49,7 +57,7 @@
     <td align="center">Transfer from Spotify</td>
   </tr>
   <tr>
-    <td><img src="docs/screenshots/artist.jpg" alt="The Weeknd's artist page with a large header image and his top songs, Blinding Lights playing"></td>
+    <td><img src="docs/screenshots/artist.jpg" alt="Artist page with a large header image and top songs"></td>
     <td><img src="docs/screenshots/settings-themes.jpg" alt="Settings with appearance switches and the theme gallery"></td>
   </tr>
   <tr>
@@ -70,7 +78,7 @@
 
 ### Install on Windows
 
-Download the latest `ytm-rs-setup-<version>.exe` from [GitHub Releases](https://github.com/grapedjuice/ytm-rs/releases/latest) and run it. The installer works for the current user without administrator access and adds a Start menu shortcut and an entry in Windows Settings for uninstalling.
+Download the latest `ytm-rs-setup-<version>.exe` from [this fork's GitHub Releases](https://github.com/Hellgers/ytm-rs/releases/latest) and run it. The Windows build targets x86-64. The installer works for the current user without administrator access and adds a Start menu shortcut and an entry in Windows Settings for uninstalling. Check the release's SHA-256 manifest before running a downloaded file; see [code signing](CODE_SIGNING.md) for the unsigned fork's status.
 
 Once installed, ytm-rs keeps itself up to date. You can turn this off in **Settings → Updates**.
 
@@ -111,12 +119,15 @@ Open **Settings → Theme** and click a card. Each card shows the original theme
 On Windows, install the [Rust toolchain](https://rustup.rs/) and the MSVC C++ build tools, then build the app itself:
 
 ```powershell
-git clone https://github.com/grapedjuice/ytm-rs.git
+git clone https://github.com/Hellgers/ytm-rs.git
 cd ytm-rs
-cargo build --release
+git checkout v0.2.21
+cargo build --release --locked
 ```
 
 The built application is at `target\release\ytm-rs.exe`.
+
+For the audio regression tests, run `cargo test --locked`. The release includes a full source archive and a patch against upstream v0.2.20. Neither requires an account, downloaded music, or an existing application profile to inspect or build. The synthetic audio tests run without opening an audio output device.
 
 The Listen together relay in `server/` is a separate Cloudflare Worker, also in Rust ([workers-rs](https://github.com/cloudflare/workers-rs)). You don't need it to build or run the app, which connects to the hosted relay. To run it locally, start `npx wrangler dev --local` in `server/` and launch the app with `YTM_JAM_SERVER=ws://127.0.0.1:8787`.
 
@@ -138,4 +149,4 @@ The Listen together relay in `server/` is a separate Cloudflare Worker, also in 
 
 [egui](https://github.com/emilk/egui) for the interface, [rodio](https://github.com/RustAudio/rodio) and Symphonia for audio. Browsing, search and your library come straight from YouTube Music's own web API, the one music.youtube.com uses. Signed-in stream URLs are decoded with yt-dlp's [EJS](https://github.com/yt-dlp/ejs) solver running in QuickJS. Listen together runs on a small relay built with [workers-rs](https://github.com/cloudflare/workers-rs) on Cloudflare Durable Objects. The animated background is based on Kawarp from Better Lyrics, and the theme presets are adapted from the Better Lyrics theme store, with credit to each theme's creators. The app also uses Inter, DM Sans, Google Sans Flex, Figtree and Instrument Sans (SIL OFL 1.1) and Lucide icons.
 
-Found a bug or have an idea? [Open an issue](https://github.com/grapedjuice/ytm-rs/issues).
+Found a bug or have an idea about this fork? [Open an issue](https://github.com/Hellgers/ytm-rs/issues). The original project is maintained at [grapedjuice/ytm-rs](https://github.com/grapedjuice/ytm-rs).

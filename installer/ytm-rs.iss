@@ -4,16 +4,16 @@
 ; Output: installer\Output\ytm-rs-setup-<version>.exe
 
 #define AppName "ytm-rs"
-#define AppVersion "0.2.20"
+#define AppVersion "0.2.21"
 #define AppExe "ytm-rs.exe"
 
 [Setup]
 AppId={{6E0B7C4A-2D1F-4C8E-9B3A-7F5D1E2A9C40}
 AppName={#AppName}
 AppVersion={#AppVersion}
-AppPublisher=grapedjuice
-AppPublisherURL=https://github.com/grapedjuice/ytm-rs
-AppSupportURL=https://github.com/grapedjuice/ytm-rs/issues
+AppPublisher=ytm-rs audio continuity fork
+AppPublisherURL=https://github.com/Hellgers/ytm-rs
+AppSupportURL=https://github.com/Hellgers/ytm-rs/issues
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
@@ -38,6 +38,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\docs\AUDIO_CONTINUITY_FIX.md"; DestDir: "{app}\docs"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"

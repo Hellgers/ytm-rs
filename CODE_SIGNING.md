@@ -1,15 +1,25 @@
 # Code signing policy
 
-Windows releases are built from this repository by [GitHub Actions](.github/workflows/release.yml); nothing is built or signed on a personal machine.
+## This fork
+
+The **0.2.21** Windows binaries published in [Hellgers/ytm-rs releases](https://github.com/Hellgers/ytm-rs/releases) are **unsigned**. They were modified on **2026-10-23** and are not official upstream releases. No SignPath signature or certificate is claimed for these binaries.
+
+The release supplies the complete modified source, a patch against upstream v0.2.20, and SHA-256 checksums for its assets. A matching checksum verifies that a download matches that manifest; it is not a code-signing certificate or an independent security review. You can build the tagged source using the instructions in [README.md](README.md).
+
+## Upstream signing policy
+
+The following signing arrangement belongs to the original [grapedjuice/ytm-rs](https://github.com/grapedjuice/ytm-rs) project. It does not transfer to this fork. Upstream documents that its Windows releases are built by GitHub Actions rather than on a personal machine.
 
 Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
 
-## Team
+### Upstream team
 
 - Committers and reviewers: [grapedjuice](https://github.com/grapedjuice)
 - Approvers: [grapedjuice](https://github.com/grapedjuice)
 
 ## Privacy
+
+The audio continuity patch operates locally on decoded samples. Release source and packages must not include account credentials, application profiles, downloaded music, diagnostic recordings, or private logs. The service descriptions below are retained from upstream; they are not an exhaustive network audit.
 
 ytm-rs only talks to the services it needs to play your music:
 

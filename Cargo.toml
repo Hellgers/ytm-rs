@@ -1,9 +1,9 @@
 [package]
 name = "ytm-rs"
-version = "0.2.20"
+version = "0.2.21"
 edition = "2024"
 license = "GPL-3.0-only"
-repository = "https://github.com/grapedjuice/ytm-rs"
+repository = "https://github.com/Hellgers/ytm-rs"
 
 [dependencies]
 anyhow = "1.0.104"

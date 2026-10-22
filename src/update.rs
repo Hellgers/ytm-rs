@@ -18,10 +18,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const LATEST: &str = "https://api.github.com/repos/grapedjuice/ytm-rs/releases/latest";
-const ALL_RELEASES: &str = "https://api.github.com/repos/grapedjuice/ytm-rs/releases";
-const BY_TAG: &str = "https://api.github.com/repos/grapedjuice/ytm-rs/releases/tags/v";
-pub const RELEASES: &str = "https://github.com/grapedjuice/ytm-rs/releases";
+const LATEST: &str = "https://api.github.com/repos/Hellgers/ytm-rs/releases/latest";
+const ALL_RELEASES: &str = "https://api.github.com/repos/Hellgers/ytm-rs/releases";
+const BY_TAG: &str = "https://api.github.com/repos/Hellgers/ytm-rs/releases/tags/v";
+pub const RELEASES: &str = "https://github.com/Hellgers/ytm-rs/releases";
 
 /// Release notes by version: `None` while fetching or when there are none.
 type Notes = Arc<Mutex<std::collections::HashMap<String, Option<String>>>>;

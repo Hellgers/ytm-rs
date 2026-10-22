@@ -1,76 +1,102 @@
-name: Release
-
-# Builds the Windows installer and the portable zip from the tagged source and
-# attaches them to the GitHub release for that tag. Releases are written as drafts
-# (with notes) and published here only once both are attached, so the app's
-# updater, which reads the latest published release, never sees one without them.
-# If no release exists yet, one is created as a draft to be given notes and
-# published by hand.
+name: Windows release candidate
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-
 permissions:
   contents: write
-
 jobs:
   windows:
+    if: github.repository == 'Hellgers/ytm-rs'
     runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - uses: actions/checkout@v5
-
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
-
-      - name: Check versions match
-        shell: bash
+      - name: Validate release version and public build paths
         run: |
-          cargo_ver=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          iss_ver=$(grep -m1 '#define AppVersion' installer/ytm-rs.iss | cut -d'"' -f2)
-          echo "Cargo.toml $cargo_ver, ytm-rs.iss $iss_ver"
-          [ "$cargo_ver" = "$iss_ver" ] || { echo "version mismatch"; exit 1; }
-          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$cargo_ver" ]; then
-            echo "tag $GITHUB_REF_NAME does not match v$cargo_ver"; exit 1
-          fi
-          echo "VERSION=$cargo_ver" >> "$GITHUB_ENV"
-
-      - name: Build
-        run: cargo build --release --locked
-
-      - name: Install Inno Setup
+          $ErrorActionPreference = 'Stop'
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([0-9]+\.[0-9]+\.[0-9]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $installer = (Select-String -Path installer/ytm-rs.iss -Pattern '^#define AppVersion "([^"]+)"').Matches.Groups[1].Value
+          if (!$version -or $version -ne $installer) { throw 'Cargo/installer version mismatch' }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag/version mismatch' }
+          "VERSION=$version" >> $env:GITHUB_ENV
+          $rustupRoot = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $env:USERPROFILE '.rustup' }
+          $cargoRoot = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+          "RUSTFLAGS=--remap-path-prefix=$env:GITHUB_WORKSPACE=/src --remap-path-prefix=$cargoRoot=/cargo --remap-path-prefix=$rustupRoot=/rust" >> $env:GITHUB_ENV
+          foreach ($path in @('LICENSE','README.md','docs/AUDIO_CONTINUITY_FIX.md','docs/RELEASE_NOTES_0.2.21.md')) {
+            if (!(Test-Path -LiteralPath $path)) { throw "Required document missing: $path" }
+          }
+      - name: Test release source
+        run: cargo test --release --locked --all-targets
+      - name: Build unsigned Windows executable
+        run: cargo build --release --locked --bin ytm-rs
+      - name: Scan executable for private build identifiers
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bytes = [IO.File]::ReadAllBytes((Resolve-Path 'target/release/ytm-rs.exe'))
+          $texts = @([Text.Encoding]::Latin1.GetString($bytes), [Text.Encoding]::Unicode.GetString($bytes), [Text.Encoding]::Unicode.GetString($bytes, 1, $bytes.Length - 1))
+          foreach ($raw in $texts) {
+            # Public fork URLs intentionally include the repository owner.
+            $text = $raw -replace '(?i)https://(?:api\.github\.com/repos|github\.com)/Hellgers/ytm-rs', 'PUBLIC_FORK_URL'
+            $forbidden = '(?i)Hellgers|DESKTOP-[A-Z0-9]+|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}|[A-Z]:[\\/]Users[\\/]'
+            if ($text -match $forbidden) { throw 'Private build identifier found; refusing upload' }
+          }
+          Write-Output 'Executable privacy scan passed (ASCII/Latin1 and both UTF-16 alignments).'
+      - name: Install Inno Setup build tool
         run: choco install innosetup --no-progress -y
-
-      - name: Build installer
-        run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q installer\ytm-rs.iss'
-
-      # The portable zip: the exe, the marker that makes it portable, README and LICENSE.
-      - name: Build portable zip
+      - name: Build unsigned installer
         run: |
-          New-Item -ItemType Directory -Force installer\Output\portable | Out-Null
-          Copy-Item target\release\ytm-rs.exe, installer\portable.txt, README.md, LICENSE installer\Output\portable
-          & "$env:SystemRoot\System32\tar.exe" -a -c -f "installer\Output\ytm-rs-portable-$env:VERSION.zip" -C installer\Output\portable ytm-rs.exe portable.txt README.md LICENSE
-          if ($LASTEXITCODE) { exit 1 }
-
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q installer\ytm-rs.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Package portable application and full corresponding source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'installer/Output'
+          $portable = Join-Path $env:RUNNER_TEMP 'ytm-rs-portable'
+          New-Item -ItemType Directory -Path "$portable/docs" -Force | Out-Null
+          Copy-Item -LiteralPath 'target/release/ytm-rs.exe','installer/portable.txt','README.md','LICENSE' -Destination $portable
+          Copy-Item -LiteralPath 'docs/AUDIO_CONTINUITY_FIX.md' -Destination "$portable/docs"
+          Compress-Archive -Path "$portable/*" -DestinationPath "$dist/ytm-rs-portable-$env:VERSION.zip" -Force
+          git archive --format=zip --prefix="ytm-rs-$env:VERSION/" --output="$dist/ytm-rs-source-$env:VERSION.zip" HEAD
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git diff --binary --output="$dist/ytm-rs-audio-continuity-$env:VERSION.patch" 4ae0b1f8f6df1a389fb5c181bdd2ef7040c19b86 HEAD -- src/audio.rs src/audio_source.rs src/main.rs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $names = @("ytm-rs-setup-$env:VERSION.exe", "ytm-rs-portable-$env:VERSION.zip", "ytm-rs-source-$env:VERSION.zip", "ytm-rs-audio-continuity-$env:VERSION.patch")
+          $lines = foreach ($name in $names) {
+            $hash = (Get-FileHash -LiteralPath (Join-Path $dist $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $name"
+          }
+          [IO.File]::WriteAllLines((Join-Path (Resolve-Path $dist) 'SHA256SUMS.txt'), $lines, [Text.UTF8Encoding]::new($false))
       - uses: actions/upload-artifact@v5
         with:
-          name: ytm-rs-${{ env.VERSION }}
+          name: ytm-rs-${{ env.VERSION }}-windows-candidate
           path: |
             installer/Output/ytm-rs-setup-${{ env.VERSION }}.exe
             installer/Output/ytm-rs-portable-${{ env.VERSION }}.zip
+            installer/Output/ytm-rs-source-${{ env.VERSION }}.zip
+            installer/Output/ytm-rs-audio-continuity-${{ env.VERSION }}.patch
+            installer/Output/SHA256SUMS.txt
           if-no-files-found: error
-
-      - name: Attach to release
+      - name: Attach assets to draft release only
         if: github.ref_type == 'tag'
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          files=("installer/Output/ytm-rs-setup-$VERSION.exe" "installer/Output/ytm-rs-portable-$VERSION.zip")
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
-            gh release edit "$GITHUB_REF_NAME" --draft=false --latest
-          else
-            gh release create "$GITHUB_REF_NAME" "${files[@]}" --draft --title "ytm-rs $VERSION" --notes ""
-          fi
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $files = @("installer/Output/ytm-rs-setup-$env:VERSION.exe", "installer/Output/ytm-rs-portable-$env:VERSION.zip", "installer/Output/ytm-rs-source-$env:VERSION.zip", "installer/Output/ytm-rs-audio-continuity-$env:VERSION.patch", 'installer/Output/SHA256SUMS.txt')
+          $existing = gh release view $tag --json isDraft 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            if (!(($existing | ConvertFrom-Json).isDraft)) { throw 'Refusing to modify a published release' }
+            gh release upload $tag @files --clobber
+          } else {
+            gh release create $tag @files --verify-tag --draft --title "ytm-rs $env:VERSION — Audio continuity fix" --notes-file docs/RELEASE_NOTES_0.2.21.md
+          }
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

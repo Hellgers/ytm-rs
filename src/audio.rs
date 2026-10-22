@@ -344,6 +344,8 @@ fn norm_gain(status: &AudioStatus, shared: Option<&Shared>) -> f32 {
 /// without touching the players or the songs in them.
 struct Output {
     mixer: Mixer,
+    channels: rodio::ChannelCount,
+    rate: rodio::SampleRate,
     /// Our mixer's output while no device has it; the device's `Bridge` holds it.
     slot: Arc<std::sync::Mutex<Option<MixerSource>>>,
     sink: Option<MixerDeviceSink>,
@@ -364,7 +366,7 @@ impl Output {
         let rate = config.as_ref().and_then(|c| std::num::NonZero::new(c.sample_rate())).unwrap_or(std::num::NonZero::new(48_000).unwrap());
         let (mixer, source) = rodio::mixer::mixer(channels, rate);
         let lost = Arc::new(AtomicBool::new(false));
-        let mut out = Self { mixer, slot: Arc::new(std::sync::Mutex::new(Some(source))), sink: None, device: None, preferred, lost, checked: Instant::now() };
+        let mut out = Self { mixer, channels, rate, slot: Arc::new(std::sync::Mutex::new(Some(source))), sink: None, device: None, preferred, lost, checked: Instant::now() };
         out.open(tx, status);
         out
     }
@@ -565,8 +567,9 @@ fn run(
     // The player counts position from when a source was appended; a swapped-in
     // seeked decoder starts at `offset`.
     let mut offset = Duration::ZERO;
-    // Whether the playing decoder can seek in place (it indexed the whole file).
-    let mut seekable = false;
+    // Each finite decoder is converted before Player's keepalive queue. Never
+    // seek that converter in place: its interpolation cache must be rebuilt.
+    let mut format_error = Arc::new(AtomicBool::new(false));
     // Latest seek; a slower, older seek's decoder must not land after a newer one.
     let mut seek_seq: u64 = 0;
     let seek_job: Arc<std::sync::Mutex<Option<SeekJob>>> = Default::default();
@@ -600,7 +603,10 @@ fn run(
                     log::debug!("audio: crossfade into generation {generation} over {fade_in} ms");
                 }
                 fade_out = Arc::new(AtomicU32::new(0));
-                player.append(Meter::new(decoder, status.clone(), fade_in, fade_out.clone()));
+                format_error = Arc::new(AtomicBool::new(false));
+                log::info!("audio: generation {generation}, source {} Hz / {} channels -> private mixer {} Hz / {} channels, continuous per-track resampler", rodio::Source::sample_rate(&decoder), rodio::Source::channels(&decoder), output.rate, output.channels);
+                let source = crate::audio_source::convert(decoder, output.channels, output.rate, format_error.clone());
+                player.append(Meter::new(source, status.clone(), fade_in, fade_out.clone()));
                 player.play();
                 // 0 means the stream didn't say; keep the length the UI already knows.
                 if s.duration_ms > 0 {
@@ -614,7 +620,6 @@ fn run(
                 }
                 current = generation;
                 offset = at;
-                seekable = !at.is_zero();
                 ending_sent = false;
                 status.playing.store(true, Ordering::Relaxed);
             }
@@ -623,11 +628,13 @@ fn run(
                     continue;
                 }
                 log::debug!("audio: seek to {at:?} via new decoder (seekable: {s})");
-                seekable = s;
                 let paused = player.is_paused();
                 player.clear();
                 fade_out = Arc::new(AtomicU32::new(0));
-                player.append(Meter::new(decoder, status.clone(), 0, fade_out.clone()));
+                format_error = Arc::new(AtomicBool::new(false));
+                log::info!("audio: generation {generation}, fresh seek decoder, source {} Hz / {} channels -> private mixer {} Hz / {} channels, continuous per-track resampler", rodio::Source::sample_rate(&decoder), rodio::Source::channels(&decoder), output.rate, output.channels);
+                let source = crate::audio_source::convert(decoder, output.channels, output.rate, format_error.clone());
+                player.append(Meter::new(source, status.clone(), 0, fade_out.clone()));
                 if !paused {
                     player.play();
                 }
@@ -715,13 +722,7 @@ fn run(
                 for f in &fading {
                     f.out.store(QUICK_FADE_MS, Ordering::Relaxed);
                 }
-                // A seekable decoder already indexed the (fully downloaded) file.
-                if seekable && player.try_seek(pos).is_ok() {
-                    log::debug!("audio: seek to {pos:?} in place");
-                    offset = Duration::ZERO;
-                    status.set_position(pos.as_millis() as u64);
-                    continue;
-                }
+                // A fresh decoder also resets resampler phase and lookahead.
                 // The playing decoder was opened non-seekable for a fast start. Build a
                 // seekable one over the same buffer off-thread (it needs every fragment
                 // header, so it may wait for the download) and swap it in. Back to the
@@ -828,7 +829,12 @@ fn run(
             }
             if player.empty() {
                 // A failed download ends the decoder early: that's not the song ending.
-                let event = match shared.as_ref().and_then(|s| s.error()) {
+                let failure = if format_error.load(Ordering::Acquire) {
+                    Some("Audio format changed within the track; playback stopped".into())
+                } else {
+                    shared.as_ref().and_then(|s| s.error())
+                };
+                let event = match failure {
                     Some(reason) => AudioEvent::Interrupted { generation: current, at: offset + player.get_pos(), reason },
                     None => AudioEvent::Finished { generation: current },
                 };

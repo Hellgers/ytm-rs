@@ -5,6 +5,7 @@ mod fullscreen;
 mod proxy;
 mod art;
 mod audio;
+mod audio_source;
 mod backend;
 mod deeplink;
 mod discord;
