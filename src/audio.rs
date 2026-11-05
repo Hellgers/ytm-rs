@@ -1151,9 +1151,18 @@ mod tests {
         assert_eq!(player.volume(), 0.375);
         assert_eq!(offset, Duration::from_secs(3));
         assert!(!jobs.pending.as_ref().unwrap().is_cancelled());
+        // Cancellation before the worker takes its queued job legitimately
+        // produces no completion. Establish an actual reader wait first so
+        // this test exercises in-flight cancellation and its stale result.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !jobs.pending.as_ref().unwrap().is_waiting() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let reached_wait = jobs.pending.as_ref().unwrap().is_waiting();
         // Cancel the synthetic decoder waiting for its missing input block.
         // Its completion is now stale and cannot end/recover the current song.
         jobs.cancel();
+        assert!(reached_wait, "replacement decoder did not reach its missing-block wait");
         match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
             AudioCmd::SeekFailed { generation, seek, .. } => {
                 assert_eq!(generation, 7);

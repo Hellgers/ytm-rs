@@ -1807,24 +1807,29 @@ mod visionos_fallback_tests {
         let chosen = choose_visionos_stream(&http, first, || async {
             innertube::audio_stream(&http, ID, &visitor, false).await.map(convert)
         }).await?;
-        anyhow::ensure!(!chosen.opus, "reported track did not exercise the AAC fallback");
-        let shared = Shared::new(chosen.size, chosen.duration_ms, chosen.loudness_db, chosen.opus, false);
-        tokio::time::timeout(Duration::from_secs(90), stream::download(http, chosen.url, chosen.user_agent, shared.clone(), None)).await
-            .map_err(|_| anyhow::anyhow!("reported track download exceeded test deadline"))?;
-        anyhow::ensure!(shared.error().is_none() && shared.is_complete(), "reported track download failed");
-        let mut decoder = stream::decoder(shared, true)?;
-        let channels = decoder.channels().get() as usize;
-        let rate = decoder.sample_rate().get() as f64;
-        let mut samples = 0usize;
-        let max_samples = ((chosen.duration_ms as f64 / 1000.0 + 5.0) * rate * channels as f64) as usize;
-        for sample in decoder.by_ref().take(max_samples + 1) {
-            anyhow::ensure!(sample.is_finite(), "decoder returned a non-finite sample");
-            samples += 1;
+        let aac = convert(innertube::audio_stream(&http, ID, &visitor, false).await?);
+        anyhow::ensure!(!aac.opus, "AAC check returned an unexpected representation");
+        // Availability can change between runs. Decode the format selected by
+        // the production helper, plus a separately resolved AAC safety path.
+        for chosen in [chosen, aac] {
+            let shared = Shared::new(chosen.size, chosen.duration_ms, chosen.loudness_db, chosen.opus, false);
+            tokio::time::timeout(Duration::from_secs(90), stream::download(http.clone(), chosen.url, chosen.user_agent, shared.clone(), None)).await
+                .map_err(|_| anyhow::anyhow!("reported track download exceeded test deadline"))?;
+            anyhow::ensure!(shared.error().is_none() && shared.is_complete(), "reported track download failed");
+            let mut decoder = stream::decoder(shared, true)?;
+            let channels = decoder.channels().get() as usize;
+            let rate = decoder.sample_rate().get() as f64;
+            let mut samples = 0usize;
+            let max_samples = ((chosen.duration_ms as f64 / 1000.0 + 5.0) * rate * channels as f64) as usize;
+            for sample in decoder.by_ref().take(max_samples + 1) {
+                anyhow::ensure!(sample.is_finite(), "decoder returned a non-finite sample");
+                samples += 1;
+            }
+            anyhow::ensure!(samples > 0 && samples <= max_samples && samples.is_multiple_of(channels), "decoder did not produce a finite sequence of complete frames");
+            let seconds = samples as f64 / (rate * channels as f64);
+            anyhow::ensure!((seconds - chosen.duration_ms as f64 / 1000.0).abs() < 1.0, "decoded duration differs from stream metadata");
+            println!("codec={}, rate={rate}, frames={}, seconds={seconds:.3}", if chosen.opus { "Opus" } else { "AAC" }, samples / channels);
         }
-        anyhow::ensure!(samples > 0 && samples <= max_samples && samples.is_multiple_of(channels), "decoder did not produce a finite sequence of complete frames");
-        let seconds = samples as f64 / (rate * channels as f64);
-        anyhow::ensure!((seconds - chosen.duration_ms as f64 / 1000.0).abs() < 1.0, "decoded duration differs from stream metadata");
-        println!("reported track: codec={}, channels={channels}, rate={rate}, frames={}, seconds={seconds:.3}", if chosen.opus { "Opus" } else { "AAC" }, samples / channels);
         Ok(())
     }
 }
