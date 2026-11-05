@@ -11,6 +11,9 @@ resampling fix from this fork's 0.2.21 release.
 - Creates a fresh decoder and converter on seek, avoiding stale interpolation
   samples. Queue EOF, crossfade, and output recovery remain separate from the
   finite track converter.
+- Primes an empty Player queue to the mixer format before connecting it. This
+  avoids interpreting the first 512 stereo samples as mono, preserves surround
+  channel order, and lets a new empty player clear without an output device.
 - Automatic updates, release notes, and download statistics use **Hellgers/ytm-rs**.
   The existing update setting remains enabled by default: checks occur after
   startup and every six hours, with installation on normal app exit or when

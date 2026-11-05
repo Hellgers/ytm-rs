@@ -25,6 +25,12 @@ Each new track gets a separate converter and a natural end of stream. The queue 
 
 The v0.2.31 integration covers both variants of `TrackDecoder`: AAC and Opus. Conversion happens before `Meter`, so the crossfade ramps count samples in the fixed private mixer format. Each outgoing player retains its own converter while the incoming track gets a new one. The private mixer's rate and channels are chosen once in `Output::new` and retained when `Output::open` recovers or changes a device. The existing `Bridge` returns that same mixer on a frame boundary and lets the device mixer adapt to the new device's format. Its continuous span describes this fixed-format mixer; it does not hide a track-changing `Player` queue.
 
+## Empty-player metadata at startup
+
+The updated regression tests also exposed a separate rodio 0.22.2 queue bootstrap defect. `Player::connect_new` calls `Mixer::add` while the queue is empty and reports its default mono / 48 kHz format. The mixer's converter captures those values immediately. If a stereo source is appended before that queue is first consumed, its first 512 interleaved samples are interpreted as mono and duplicated. A synthetic 100 ms stereo source at 48 kHz consequently produces 10,112 nonzero output samples instead of 9,600. The subsequent mono 44.1 kHz track after idle silence produces the expected 9,600; this is an initial metadata problem, not a repeated EOF tail or the earlier packet-phase defect.
+
+`audio_source::connect_player` now creates the queue explicitly, appends a zero-length source in the fixed private mixer format, and synchronously consumes one complete target-format silence frame before attaching the queue to the mixer. This retires the metadata seed and establishes correctly formatted keepalive silence without counting a pending sound. Synchronous retirement matters: leaving even a zero-length seed pending could make `Player::clear` wait for a disconnected output device. Consuming a complete target frame also preserves six-channel alignment. The original queue continues to expose its own span boundaries. Startup and both crossfade player-creation paths use this helper.
+
 Seeking builds a fresh decoder and converter through the existing replacement path. Old interpolation lookahead and phase are discarded. Delegating a seek through rodio's existing converter would leave its buffered interpolation state intact, so the new wrapper intentionally does not provide in-place seeking.
 
 This patch retains the pinned converter's interpolation method. It does not add a new high-quality resampling library, equalizer, limiter, normalization policy, driver, or virtual audio device.
@@ -47,6 +53,7 @@ The tests construct synthetic samples in memory and do not open an audio output 
 - Replacing a partially consumed source without returning its previous samples.
 - Alternating track formats and end of stream through a real `Player` queue.
 - A new track with a different format arriving after the player's keepalive silence, retaining the expected output sample count.
+- Initial queue priming that leaves `Player::empty` true and allows `clear` without consuming output, plus exact asymmetric channel patterns at 1/2/6 channels and 44.1/48/96 kHz at startup and after idle silence.
 - Crossfading converted 48 kHz stereo and 44.1 kHz mono sources in one mixer format, plus frame-aligned handback of the fixed-format mixer during simulated output recovery.
 
 The historical validation run for the original reviewed audio patch reported **69 tests passed, 5 ignored**. That count does not describe the updated v0.2.31 integration. Its checks must be rerun on the final merged tree. Ignored tests were not run; synthetic tests do not establish online service, physical-device recovery, or listening acceptance. Release packaging and repository metadata changes require their own final checks.

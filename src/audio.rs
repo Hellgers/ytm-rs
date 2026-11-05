@@ -570,7 +570,7 @@ fn run(
         let _ = events.send(AudioEvent::Error("No audio output device".into()));
         wake();
     }
-    let mut player = Player::connect_new(&output.mixer);
+    let mut player = crate::audio_source::connect_player(&output.mixer, output.channels, output.rate);
     player.set_volume(slider_gain(&status, volume));
     // The playing source's fade-out control (see `Meter`).
     let mut fade_out = Arc::new(AtomicU32::new(0));
@@ -694,7 +694,7 @@ fn run(
                 // Keeps playing at full volume until the next song starts (see `Start`).
                 let left = length.map(|d| d.saturating_sub(offset + player.get_pos()));
                 log::debug!("audio: handing off from generation {current}, {left:?} left");
-                let old = std::mem::replace(&mut player, Player::connect_new(&output.mixer));
+                let old = std::mem::replace(&mut player, crate::audio_source::connect_player(&output.mixer, output.channels, output.rate));
                 fading.push(Fading { player: old, shared: shared.take(), out: fade_out.clone(), waiting: Some((Instant::now(), left)) });
                 current = 0;
                 status.playing.store(false, Ordering::Relaxed);
@@ -712,7 +712,7 @@ fn run(
                     log::debug!("audio: skipped mid-crossfade, cutting over");
                     if current != 0 && !player.is_paused() && !player.empty() {
                         fade_out.store(QUICK_FADE_MS, Ordering::Relaxed);
-                        let old = std::mem::replace(&mut player, Player::connect_new(&output.mixer));
+                        let old = std::mem::replace(&mut player, crate::audio_source::connect_player(&output.mixer, output.channels, output.rate));
                         fading.push(Fading { player: old, shared: shared.take(), out: fade_out.clone(), waiting: None });
                     } else {
                         player.clear();

@@ -9,14 +9,37 @@ use std::{
     time::Duration,
 };
 
-pub fn convert<S: Source>(
+/// Connect an empty player whose queue already has the private mixer's format.
+/// rodio's unprimed empty queue reports mono / 48 kHz. Mixer::add captures that
+/// metadata immediately, before the first real source can supply its format.
+pub fn connect_player(
+    mixer: &rodio::mixer::Mixer,
+    channels: ChannelCount,
+    rate: SampleRate,
+) -> rodio::Player {
+    let (player, mut queue) = rodio::Player::new();
+    player.append(rodio::source::Zero::new_samples(channels, rate, 0));
+    // Retire the zero-length metadata seed synchronously: leaving it queued
+    // would make Player::clear wait for an output device that may be absent.
+    // Enter the correctly formatted keepalive silence and consume one complete
+    // frame so a multichannel track will also start on a channel boundary.
+    for _ in 0..channels.get() {
+        let _ = queue.next();
+    }
+    // Preserve the queue's own span boundaries, including its finite silence.
+    // Never replace them with an unconditional continuous span.
+    mixer.add(queue);
+    player
+}
+
+pub fn convert<S>(
     inner: S,
     channels: ChannelCount,
     rate: SampleRate,
     failed: Arc<AtomicBool>,
 ) -> impl Source + Send
 where
-    S: Send,
+    S: Source + Send,
 {
     let input_channels = inner.channels();
     let input_rate = inner.sample_rate();
@@ -237,7 +260,7 @@ mod tests {
             let out: Vec<_> = source.by_ref().collect();
             assert!(f.load(Ordering::Acquire));
             assert_eq!(out.len() % 2, 0);
-            assert!(out.chunks_exact(2).all(|frame| frame == [0.25, -0.5]));
+            assert!(out.as_chunks::<2>().0.iter().all(|frame| *frame == [0.25, -0.5]));
             assert_eq!(source.next(), None);
         }
     }
@@ -265,7 +288,7 @@ mod tests {
     #[test]
     fn player_queue_accepts_alternating_track_formats_and_eof() {
         let (mixer, mut output) = rodio::mixer::mixer(ch(2), nz(48000));
-        let player = rodio::Player::connect_new(&mixer);
+        let player = connect_player(&mixer, ch(2), nz(48000));
         player.pause();
         player.append(convert(
             SamplesBuffer::new(ch(1), nz(44100), vec![0.25; 4410]),
@@ -283,14 +306,14 @@ mod tests {
         assert!((0..1000).all(|_| output.next() == Some(0.0)));
         player.play();
         let out: Vec<_> = (0..24000).filter_map(|_| output.next()).collect();
-        assert!(out.iter().any(|&s| s == 0.25));
-        assert!(out.iter().any(|&s| s == -0.5));
+        assert!(out.contains(&0.25));
+        assert!(out.contains(&-0.5));
         assert!(player.empty());
     }
     #[test]
     fn player_keepalive_accepts_a_different_format_after_eof() {
         let (mixer, mut output) = rodio::mixer::mixer(ch(2), nz(48000));
-        let player = rodio::Player::connect_new(&mixer);
+        let player = connect_player(&mixer, ch(2), nz(48000));
         // Opus-like stereo at 48 kHz, followed after idle silence by AAC-like
         // mono at 44.1 kHz. The keepalive queue must retain its span boundaries.
         for (channels, rate, data, expected) in [
@@ -302,10 +325,55 @@ mod tests {
             let out: Vec<_> = (0..16000).map(|_| output.next().unwrap()).collect();
             // Each 100 ms song occupies exactly 4800 stereo output frames,
             // regardless of the input format or the preceding idle silence.
-            assert_eq!(out.iter().filter(|&&s| s == expected).count(), 9600);
+            assert_eq!(out.iter().filter(|&&s| s == expected).count(), 9600, "input {channels} ch / {rate} Hz");
             assert!(player.empty());
             assert!(!f.load(Ordering::Acquire));
             assert!((0..1000).all(|_| output.next() == Some(0.0)));
+        }
+    }
+    #[test]
+    fn primed_player_is_empty_and_can_clear_without_output_consumption() {
+        let (mixer, _output) = rodio::mixer::mixer(ch(6), nz(44100));
+        let player = connect_player(&mixer, ch(6), nz(44100));
+        assert!(player.empty());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            player.clear();
+            let _ = tx.send(player.empty());
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(true));
+        worker.join().unwrap();
+    }
+    #[test]
+    fn primed_queue_preserves_samples_and_channel_order_at_start_and_after_idle() {
+        for channels in [ch(1), ch(2), ch(6)] {
+            for rate in [nz(44100), nz(48000), nz(96000)] {
+                for idle in [false, true] {
+                    let (mixer, mut output) = rodio::mixer::mixer(channels, rate);
+                    let player = connect_player(&mixer, channels, rate);
+                    assert!(player.empty());
+                    // The engine clears a newly constructed player before Start.
+                    player.clear();
+                    player.play();
+                    let width = channels.get() as usize;
+                    if idle {
+                        assert!((0..width * 1000).all(|_| output.next() == Some(0.0)));
+                    }
+                    // Distinct nonzero channel values expose swaps and duplicated
+                    // samples that a constant mono/stereo tone would conceal.
+                    let frame: Vec<_> = (1..=channels.get()).map(|n| n as f32 * 0.125).collect();
+                    let expected: Vec<_> = frame.iter().copied().cycle().take(width * 1000).collect();
+                    let f = flag();
+                    player.append(convert(SamplesBuffer::new(channels, rate, expected.clone()), channels, rate, f.clone()));
+                    let out: Vec<_> = (0..expected.len() + width * 2000).map(|_| output.next().unwrap()).collect();
+                    let first = out.iter().position(|&s| s != 0.0).unwrap();
+                    assert_eq!(first % width, 0, "{channels} ch / {rate} Hz, idle {idle}");
+                    assert_eq!(&out[first..first + expected.len()], expected, "{channels} ch / {rate} Hz, idle {idle}");
+                    assert!(out[first + expected.len()..].iter().all(|&s| s == 0.0));
+                    assert!(player.empty());
+                    assert!(!f.load(Ordering::Acquire));
+                }
+            }
         }
     }
 }
