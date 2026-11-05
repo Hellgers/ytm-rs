@@ -418,6 +418,77 @@ pub async fn like_many(api: &ytmapi::Api, ids: Vec<String>, like: bool, mut prog
 
 /// A video id and its stream buffer.
 type StreamSlot = Arc<std::sync::Mutex<Option<(String, Arc<Shared>)>>>;
+/// Owns only a decoder being opened, never a source handed to the audio engine.
+/// Serializes generation changes with publication of a ready decoder.
+#[derive(Default)]
+struct PlaybackLoads {
+    state: std::sync::Mutex<PlaybackLoad>,
+}
+
+#[derive(Default)]
+struct PlaybackLoad {
+    generation: u64,
+    pending: Option<Arc<Shared>>,
+}
+
+impl PlaybackLoads {
+    fn begin(&self, generation: u64, wanted: &std::sync::atomic::AtomicU64) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if wanted.load(Ordering::Relaxed) != generation || generation < state.generation {
+            return false;
+        }
+        state.generation = generation;
+        if let Some(old) = state.pending.take() {
+            old.cancel();
+        }
+        true
+    }
+
+    fn current<T>(&self, generation: u64, wanted: &std::sync::atomic::AtomicU64, action: impl FnOnce() -> T) -> Option<T> {
+        let state = self.state.lock().unwrap();
+        (state.generation == generation && wanted.load(Ordering::Relaxed) == generation).then(action)
+    }
+
+    fn register(&self, generation: u64, wanted: &std::sync::atomic::AtomicU64, shared: &Arc<Shared>) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.generation != generation || wanted.load(Ordering::Relaxed) != generation {
+            shared.cancel();
+            return false;
+        }
+        state.pending = Some(shared.clone());
+        true
+    }
+
+    fn finish(&self, generation: u64, wanted: &std::sync::atomic::AtomicU64, shared: &Arc<Shared>, publish: impl FnOnce()) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.generation != generation || wanted.load(Ordering::Relaxed) != generation
+            || !state.pending.as_ref().is_some_and(|s| Arc::ptr_eq(s, shared))
+        {
+            shared.cancel();
+            return false;
+        }
+        state.pending = None;
+        publish();
+        true
+    }
+}
+
+#[derive(Debug)]
+struct DecoderPanicked;
+
+impl std::fmt::Display for DecoderPanicked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Audio decoder failed while opening the stream")
+    }
+}
+
+impl std::error::Error for DecoderPanicked {}
+
+fn open_decoder_guarded<T>(open: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(open))
+        .map_err(|_| anyhow::Error::new(DecoderPanicked))?
+}
+
 type SongCell = Arc<tokio::sync::OnceCell<Option<Track>>>;
 
 /// How long a play waits for a music video's song version before playing the video.
@@ -440,6 +511,7 @@ pub struct Backend {
     /// The stream most recently started, kept so a replay of a fully downloaded song
     /// (repeat one, restart) doesn't download it again.
     current: StreamSlot,
+    loads: Arc<PlaybackLoads>,
     jsc: Arc<jsc::Solver>,
     /// Whether the signed-in account has Premium; checked once per sign-in. A failed
     /// check is retried no sooner than `PREMIUM_RETRY` later.
@@ -477,7 +549,7 @@ impl Backend {
         {
             log::warn!("proxy relay: {e:#}");
         }
-        let backend = Self { rt: Arc::new(rt), api, tx, audio, wake, prefetched: Default::default(), current: Default::default(), data_dir, lyrics, translate, jsc, premium: Arc::new(tokio::sync::Mutex::new(Err(None))), hq: Default::default(), songs: Default::default() };
+        let backend = Self { rt: Arc::new(rt), api, tx, audio, wake, prefetched: Default::default(), current: Default::default(), loads: Default::default(), data_dir, lyrics, translate, jsc, premium: Arc::new(tokio::sync::Mutex::new(Err(None))), hq: Default::default(), songs: Default::default() };
         backend.keep_signed_in();
         Ok(backend)
     }
@@ -588,6 +660,11 @@ impl Backend {
             Req::Play { generation, .. } => Some(*generation),
             _ => None,
         };
+        if let Some(generation) = play_gen
+            && !self.loads.begin(generation, &self.audio.status.wanted_gen)
+        {
+            return;
+        }
         let collection = match &req {
             Req::Album { id, load } | Req::Playlist { id, load, .. } => Some((id.clone(), *load)),
             _ => None,
@@ -989,22 +1066,26 @@ impl Backend {
             return Ok(());
         }
         let mut video_id = song.as_ref().map_or(listed, |s| s.id.as_str()).to_owned();
-        let prefetched = self.prefetched.lock().unwrap().take();
-        let replay = self.current.lock().unwrap().take().filter(|(id, s)| *id == video_id && s.is_complete()).map(|(_, s)| s);
-        let ready = match prefetched {
-            Some((id, s)) if id == video_id => Some(s),
-            // Replaying the current song keeps the next one's prefetch.
-            other if replay.is_some() => {
-                *self.prefetched.lock().unwrap() = other;
-                replay
-            }
-            // Playback went elsewhere: that prefetch is moot.
-            other => {
-                if let Some((_, s)) = other {
-                    s.cancel();
+        let Some(ready) = self.loads.current(generation, &self.audio.status.wanted_gen, || {
+            let prefetched = self.prefetched.lock().unwrap().take().filter(|(_, s)| s.can_reuse());
+            let replay = self.current.lock().unwrap().as_ref().filter(|(id, s)| *id == video_id && s.is_complete()).map(|(_, s)| s.clone());
+            match prefetched {
+                Some((id, s)) if id == video_id => Some(s),
+                // Replaying the current song keeps the next one's prefetch.
+                other if replay.is_some() => {
+                    *self.prefetched.lock().unwrap() = other;
+                    replay
                 }
-                None
+                // Playback went elsewhere: that prefetch is moot.
+                other => {
+                    if let Some((_, s)) = other {
+                        s.cancel();
+                    }
+                    None
+                }
             }
+        }) else {
+            return Ok(());
         };
         let shared = match ready {
             Some(s) => {
@@ -1019,6 +1100,9 @@ impl Backend {
                     Ok(s) => s,
                     // The song won't play: the music video still does.
                     Err(e) if song.is_some() => {
+                        if self.loads.current(generation, &self.audio.status.wanted_gen, || ()).is_none() {
+                            return Ok(());
+                        }
                         log::warn!("{listed}'s song {video_id} won't play ({e:#}); playing the music video");
                         (song, video_id) = (None, listed.to_owned());
                         // The UI took the song as playing already.
@@ -1031,6 +1115,12 @@ impl Backend {
                 }
             }
         };
+        // A skipped resolver must not publish a stream or open another decoder.
+        // Only this pending load is cancelled by the next Play; the audio engine
+        // retains ownership of an outgoing song while it fades out.
+        if !self.loads.register(generation, &self.audio.status.wanted_gen, &shared) {
+            return Ok(());
+        }
         // If the song's audio won't start after all, the music video plays instead.
         let fallback = song.is_some().then(|| (self.clone(), listed.to_owned(), report));
         if let Some(song) = song {
@@ -1042,7 +1132,6 @@ impl Backend {
             }
         }
         let video_id = video_id.as_str();
-        *self.current.lock().unwrap() = Some((video_id.to_owned(), shared.clone()));
         log::debug!("play {video_id} (gen {generation}): stream open in {:?}", t0.elapsed());
         if self.audio.status.wanted_gen.load(Ordering::Relaxed) != generation {
             shared.cancel();
@@ -1057,6 +1146,8 @@ impl Backend {
         // header); from the top, the non-seekable one starts sooner.
         let seek = !at.is_zero();
         let shared2 = shared.clone();
+        let (loads, current) = (self.loads.clone(), self.current.clone());
+        let playing_id = video_id.to_owned();
         let report = (report && self.is_logged_in() && reports_plays()).then(|| (self.clone(), video_id.to_owned()));
         let open = move || -> anyhow::Result<crate::audio::TrackDecoder> {
             let mut d = stream::decoder(shared.clone(), seek)?;
@@ -1065,10 +1156,15 @@ impl Backend {
             }
             Ok(d)
         };
-        tokio::task::spawn_blocking(move || match open() {
+        tokio::task::spawn_blocking(move || match open_decoder_guarded(open) {
             Ok(decoder) => {
+                if !loads.finish(generation, &audio.status.wanted_gen, &shared2, || {
+                    *current.lock().unwrap() = Some((playing_id, shared2.clone()));
+                    audio.send(AudioCmd::Start { generation, decoder, shared: shared2.clone(), at });
+                }) {
+                    return;
+                }
                 log::debug!("play gen {generation}: decoder ready at {at:?} in {:?}", t0.elapsed());
-                audio.send(AudioCmd::Start { generation, decoder, shared: shared2, at });
                 // Skipped past before it started: that one doesn't count.
                 if let Some((this, id)) = report.filter(|_| audio.status.wanted_gen.load(Ordering::Relaxed) == generation) {
                     let rt = this.rt.clone();
@@ -1083,18 +1179,26 @@ impl Backend {
                     });
                 }
             }
-            Err(e) => match fallback {
-                Some((this, listed, report)) => {
-                    log::warn!("{listed}'s song won't start ({e}); playing the music video");
-                    let _ = tx.send(Resp::PlayingAs { generation, listed: listed.clone(), song: None });
-                    this.request(Req::Play { video_id: listed, generation, at, report, song_of: None, song: None });
-                    wake();
+            Err(e) => {
+                if !loads.finish(generation, &audio.status.wanted_gen, &shared2, || shared2.cancel()) {
+                    return;
                 }
-                None => {
-                    let _ = tx.send(Resp::PlayError { generation, msg: format!("decode: {e}") });
-                    wake();
+                // A library panic fails this play; don't silently launch another
+                // detached decoder through the song/video fallback.
+                let fallback = fallback.filter(|_| !e.is::<DecoderPanicked>());
+                match fallback {
+                    Some((this, listed, report)) => {
+                        log::warn!("{listed}'s song won't start ({e}); playing the music video");
+                        let _ = tx.send(Resp::PlayingAs { generation, listed: listed.clone(), song: None });
+                        this.request(Req::Play { video_id: listed, generation, at, report, song_of: None, song: None });
+                        wake();
+                    }
+                    None => {
+                        let _ = tx.send(Resp::PlayError { generation, msg: format!("decode: {e}") });
+                        wake();
+                    }
                 }
-            },
+            }
         });
         Ok(())
     }
@@ -1239,21 +1343,30 @@ impl Backend {
         if let Some(shared) = tokio::task::spawn_blocking(move || crate::downloads::open(&id)).await? {
             return Ok(shared);
         }
-        let (source, s) = self.resolve(video_id, false).await?;
+        let (source, mut s) = self.resolve(video_id, false).await?;
+        if matches!(source, Source::VisionOs) && s.opus {
+            let failed_opus = self.current.lock().unwrap().as_ref()
+                .is_some_and(|(id, shared)| id == video_id && shared.opus && shared.error().is_some());
+            s = if failed_opus {
+                self.resolve_from(Source::VisionOs, video_id, false).await?
+            } else {
+                choose_visionos_stream(&self.http(), s, || self.resolve_from(Source::VisionOs, video_id, false)).await?
+            };
+        }
+        let identity = StreamIdentity::capture(&s)?;
         let shared = Shared::new(s.size, s.duration_ms, s.loudness_db, s.opus, prefetch);
-        self.rt.spawn(stream::download(self.http(), s.url, s.user_agent, shared.clone(), Some(self.refresher(source, video_id, s.opus))));
+        self.rt.spawn(stream::download(self.http(), s.url, s.user_agent, shared.clone(), Some(self.refresher(source, video_id, identity))));
         Ok(shared)
     }
 
-    /// Resolves a fresh URL from the same source and format, for a download that got a 403.
-    fn refresher(&self, source: Source, video_id: &str, opus: bool) -> stream::Refresh {
+    /// Resolve a fresh URL for exactly the representation already buffered.
+    fn refresher(&self, source: Source, video_id: &str, identity: StreamIdentity) -> stream::Refresh {
         let (this, id) = (self.clone(), video_id.to_owned());
         Arc::new(move || {
-            let (this, id) = (this.clone(), id.clone());
+            let (this, id, identity) = (this.clone(), id.clone(), identity.clone());
             Box::pin(async move {
-                let s = this.resolve_from(source, &id, opus).await?;
-                // The buffer is laid out for the format it started with.
-                anyhow::ensure!(s.opus == opus, "the stream changed format");
+                let s = this.resolve_from(source, &id, identity.opus).await?;
+                identity.validate(&s)?;
                 Ok(s.url)
             })
         })
@@ -1262,9 +1375,10 @@ impl Backend {
     /// Download a song into the downloads folder, at the best quality the account gets.
     async fn download(&self, t: &Track, for_video: Option<String>) -> anyhow::Result<PathBuf> {
         let (source, s) = self.resolve(&t.id, true).await?;
+        let identity = StreamIdentity::capture(&s)?;
         log::info!("download {}: {} bytes from {source:?}", t.id, s.size);
         let shared = Shared::new(s.size, s.duration_ms, s.loudness_db, s.opus, false);
-        stream::download(self.http(), s.url, s.user_agent, shared.clone(), Some(self.refresher(source, &t.id, s.opus))).await;
+        stream::download(self.http(), s.url, s.user_agent, shared.clone(), Some(self.refresher(source, &t.id, identity))).await;
         if let Some(e) = shared.error() {
             anyhow::bail!("{e}");
         }
@@ -1494,6 +1608,74 @@ struct ResolvedStream {
     opus: bool,
 }
 
+/// Probe only anonymous visionOS Opus. A different representation is selected
+/// before Shared is created, never spliced into an already buffered download.
+async fn choose_visionos_stream<F, Fut>(http: &reqwest::Client, first: ResolvedStream, resolve_aac: F) -> anyhow::Result<ResolvedStream>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<ResolvedStream>>,
+{
+    if !first.opus {
+        return Ok(first);
+    }
+    let probe = async {
+        anyhow::ensure!(first.size > 0, "empty audio stream");
+        let expect = first.size.min(1024) as usize;
+        let mut url = url::Url::parse(&first.url).map_err(|_| anyhow::anyhow!("invalid audio stream address"))?;
+        url.query_pairs_mut().append_pair("range", &format!("0-{}", expect - 1));
+        let mut response = http.get(url).header("User-Agent", &first.user_agent).send().await
+            .and_then(reqwest::Response::error_for_status).map_err(reqwest::Error::without_url)?;
+        let mut received = 0;
+        while let Some(chunk) = response.chunk().await.map_err(reqwest::Error::without_url)? {
+            received += chunk.len();
+            anyhow::ensure!(received <= expect, "audio probe returned an unexpected range");
+        }
+        anyhow::ensure!(received == expect, "audio probe ended early");
+        anyhow::Ok(())
+    };
+    if matches!(tokio::time::timeout(std::time::Duration::from_secs(3), probe).await, Ok(Ok(()))) {
+        return Ok(first);
+    }
+    log::info!("visionOS Opus stream unavailable; trying a fresh AAC stream");
+    let aac = resolve_aac().await?;
+    anyhow::ensure!(!aac.opus, "AAC fallback returned an unexpected representation");
+    Ok(aac)
+}
+
+/// Byte representation identity, excluding signatures and routing parameters.
+/// Deliberately not Debug: query values must never enter diagnostic output.
+#[derive(Clone)]
+struct StreamIdentity {
+    opus: bool,
+    size: u64,
+    duration_ms: u64,
+    query: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+impl StreamIdentity {
+    fn capture(stream: &ResolvedStream) -> anyhow::Result<Self> {
+        let url = url::Url::parse(&stream.url).map_err(|_| anyhow::anyhow!("the stream changed representation"))?;
+        let mut query = std::collections::BTreeMap::<String, Vec<String>>::new();
+        for (key, value) in url.query_pairs().filter(|(key, _)| matches!(key.as_ref(), "itag" | "lmt" | "clen" | "mime" | "dur")) {
+            query.entry(key.into_owned()).or_default().push(value.into_owned());
+        }
+        for values in query.values_mut() {
+            values.sort();
+        }
+        Ok(Self { opus: stream.opus, size: stream.size, duration_ms: stream.duration_ms, query })
+    }
+
+    fn validate(&self, stream: &ResolvedStream) -> anyhow::Result<()> {
+        let next = Self::capture(stream)?;
+        anyhow::ensure!(
+            self.opus == next.opus && self.size == next.size && self.duration_ms == next.duration_ms
+                && self.query.iter().all(|(key, value)| next.query.get(key) == Some(value)),
+            "the stream changed representation"
+        );
+        Ok(())
+    }
+}
+
 /// The anonymous visionOS player refused because the song needs an account:
 /// age-restricted (LOGIN_REQUIRED) or Music Premium only.
 fn needs_account(e: &anyhow::Error) -> bool {
@@ -1537,6 +1719,275 @@ pub fn compact(n: u64) -> String {
 // Larger art URL for the background / now-playing view.
 pub fn art_url(t: &Track) -> Option<String> {
     model::pick(&t.thumbs, 120).map(|u| sized(u, 544))
+}
+
+#[cfg(test)]
+mod visionos_fallback_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    fn resolved(url: String, opus: bool, size: u64) -> ResolvedStream {
+        ResolvedStream { url, size, duration_ms: 1000, user_agent: "probe-test".into(), loudness_db: None, opus }
+    }
+
+    fn probe_server(status: u16) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/audio", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let worker = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let (mut socket, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && start.elapsed() < Duration::from_secs(4) => std::thread::sleep(Duration::from_millis(5)),
+                    Err(e) => panic!("probe mock did not receive a request: {e}"),
+                }
+            };
+            socket.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let mut request = [0; 4096];
+            let n = socket.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..n]).contains("range=0-1023"));
+            let body = if status == 200 { vec![1; 1024] } else { vec![] };
+            write!(socket, "HTTP/1.1 {status} Result\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            socket.write_all(&body).unwrap();
+        });
+        (url, worker)
+    }
+
+    #[tokio::test]
+    async fn unavailable_opus_selects_aac_before_creating_a_fresh_buffer() {
+        let (url, server) = probe_server(503);
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let old = Shared::new(1024, 1000, None, true, false);
+        let chosen = choose_visionos_stream(&http, resolved(url, true, old.total), || async {
+            Ok(resolved("http://aac.invalid/audio".into(), false, 2048))
+        }).await.unwrap();
+        assert!(!chosen.opus);
+        let fresh = Shared::new(chosen.size, chosen.duration_ms, chosen.loudness_db, chosen.opus, false);
+        assert!(!Arc::ptr_eq(&old, &fresh));
+        assert_eq!(fresh.total, 2048);
+        assert!(!fresh.opus);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn healthy_opus_does_not_resolve_aac() {
+        let (url, server) = probe_server(200);
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let called = AtomicBool::new(false);
+        let chosen = choose_visionos_stream(&http, resolved(url, true, 1024), || async {
+            called.store(true, Ordering::Relaxed);
+            anyhow::bail!("healthy Opus must not resolve AAC")
+        }).await.unwrap();
+        assert!(chosen.opus);
+        assert!(!called.load(Ordering::Relaxed));
+        server.join().unwrap();
+    }
+
+    /// Explicit network acceptance for the reported track; no Api, profile, files,
+    /// credentials, hardware output, or account history are involved.
+    #[tokio::test]
+    #[ignore = "live anonymous service test for the reported playback stall"]
+    async fn reported_track_visionos_fallback_decodes_in_memory() -> anyhow::Result<()> {
+        use rodio::Source;
+        const ID: &str = "qYxLQ1YNu-g";
+        let http = crate::proxy::http();
+        let response = http.get("https://music.youtube.com/").header("User-Agent", innertube::UA)
+            .timeout(Duration::from_secs(20))
+            .send().await.and_then(reqwest::Response::error_for_status).map_err(reqwest::Error::without_url)?;
+        let html = response.text().await.map_err(reqwest::Error::without_url)?;
+        let visitor = html.split_once("\"VISITOR_DATA\":\"").and_then(|(_, tail)| tail.split('"').next()).map(str::to_owned)
+            .filter(|s| !s.is_empty()).ok_or_else(|| anyhow::anyhow!("no anonymous visitor data on page"))?;
+        let convert = |s: innertube::Stream| ResolvedStream {
+            url: s.url, size: s.size, duration_ms: s.duration_ms, user_agent: innertube::UA.into(), loudness_db: s.loudness_db, opus: s.opus,
+        };
+        let first = convert(innertube::audio_stream(&http, ID, &visitor, true).await?);
+        let chosen = choose_visionos_stream(&http, first, || async {
+            innertube::audio_stream(&http, ID, &visitor, false).await.map(convert)
+        }).await?;
+        anyhow::ensure!(!chosen.opus, "reported track did not exercise the AAC fallback");
+        let shared = Shared::new(chosen.size, chosen.duration_ms, chosen.loudness_db, chosen.opus, false);
+        tokio::time::timeout(Duration::from_secs(90), stream::download(http, chosen.url, chosen.user_agent, shared.clone(), None)).await
+            .map_err(|_| anyhow::anyhow!("reported track download exceeded test deadline"))?;
+        anyhow::ensure!(shared.error().is_none() && shared.is_complete(), "reported track download failed");
+        let mut decoder = stream::decoder(shared, true)?;
+        let channels = decoder.channels().get() as usize;
+        let rate = decoder.sample_rate().get() as f64;
+        let mut samples = 0usize;
+        let max_samples = ((chosen.duration_ms as f64 / 1000.0 + 5.0) * rate * channels as f64) as usize;
+        for sample in decoder.by_ref().take(max_samples + 1) {
+            anyhow::ensure!(sample.is_finite(), "decoder returned a non-finite sample");
+            samples += 1;
+        }
+        anyhow::ensure!(samples > 0 && samples <= max_samples && samples.is_multiple_of(channels), "decoder did not produce a finite sequence of complete frames");
+        let seconds = samples as f64 / (rate * channels as f64);
+        anyhow::ensure!((seconds - chosen.duration_ms as f64 / 1000.0).abs() < 1.0, "decoded duration differs from stream metadata");
+        println!("reported track: codec={}, channels={channels}, rate={rate}, frames={}, seconds={seconds:.3}", if chosen.opus { "Opus" } else { "AAC" }, samples / channels);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod stream_identity_tests {
+    use super::*;
+
+    fn stream(query: &str) -> ResolvedStream {
+        ResolvedStream {
+            url: format!("https://media.invalid/audio?{query}"),
+            size: 1024,
+            duration_ms: 1000,
+            user_agent: "test".into(),
+            loudness_db: None,
+            opus: true,
+        }
+    }
+
+    #[test]
+    fn same_rep_new_signature_allowed() {
+        let old = stream("itag=251&lmt=123&clen=1024&mime=audio%2Fwebm&dur=1.0&sig=old&expire=1&ip=old&n=old&id=old");
+        let identity = StreamIdentity::capture(&old).unwrap();
+        let mut new = stream("dur=1.0&mime=audio%2Fwebm&clen=1024&lmt=123&itag=251&sig=new&expire=2&ip=new&n=new&id=new");
+        new.url = new.url.replace("media.invalid", "another-media.invalid");
+        assert!(identity.validate(&new).is_ok());
+    }
+
+    #[test]
+    fn same_codec_changed_size_rejected() {
+        let old = stream("itag=251&lmt=123");
+        let identity = StreamIdentity::capture(&old).unwrap();
+        let mut new = stream("itag=251&lmt=123");
+        new.size += 1;
+        assert_eq!(identity.validate(&new).unwrap_err().to_string(), "the stream changed representation");
+        new.size = old.size;
+        new.duration_ms += 1;
+        assert!(identity.validate(&new).is_err());
+        new.duration_ms = old.duration_ms;
+        new.opus = false;
+        assert!(identity.validate(&new).is_err());
+    }
+
+    #[test]
+    fn itag_or_lmt_changed_or_missing_rejected() {
+        let old = stream("itag=251&lmt=123&clen=1024&mime=audio%2Fwebm&dur=1.0");
+        let identity = StreamIdentity::capture(&old).unwrap();
+        for query in [
+            "itag=140&lmt=123&clen=1024&mime=audio%2Fwebm&dur=1.0",
+            "itag=251&lmt=124&clen=1024&mime=audio%2Fwebm&dur=1.0",
+            "itag=251&clen=1024&mime=audio%2Fwebm&dur=1.0",
+            "lmt=123&clen=1024&mime=audio%2Fwebm&dur=1.0",
+            "itag=251&lmt=123&clen=2048&mime=audio%2Fwebm&dur=1.0",
+            "itag=251&lmt=123&clen=1024&mime=audio%2Fmp4&dur=1.0",
+            "itag=251&lmt=123&clen=1024&mime=audio%2Fwebm&dur=2.0",
+        ] {
+            assert_eq!(identity.validate(&stream(query)).unwrap_err().to_string(), "the stream changed representation");
+        }
+    }
+}
+
+#[cfg(test)]
+mod playback_load_tests {
+    use super::*;
+    use std::io::Read;
+    use std::sync::{atomic::AtomicU64, mpsc};
+    use std::time::Duration;
+
+    fn pending_stream() -> Arc<Shared> {
+        Shared::new(1024, 1000, None, false, false)
+    }
+
+    fn read_in_background(shared: &Arc<Shared>) -> (mpsc::Receiver<std::io::Result<usize>>, std::thread::JoinHandle<()>) {
+        let mut reader = stream::StreamReader::new(shared.clone());
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(reader.read(&mut [0]));
+        });
+        (rx, worker)
+    }
+
+    #[test]
+    fn superseding_a_pending_decoder_wakes_its_blocked_reader() {
+        let loads = PlaybackLoads::default();
+        let wanted = AtomicU64::new(1);
+        let old = pending_stream();
+        assert!(loads.begin(1, &wanted));
+        assert!(loads.register(1, &wanted, &old));
+        let (rx, worker) = read_in_background(&old);
+        wanted.store(2, Ordering::Relaxed);
+        assert!(loads.begin(2, &wanted));
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        old.cancel();
+        worker.join().unwrap();
+        assert!(result.unwrap().is_err());
+        assert!(!loads.finish(1, &wanted, &old, || panic!("stale decoder published")));
+    }
+
+    #[test]
+    fn a_late_old_resolver_cannot_replace_a_new_ready_stream() {
+        let loads = PlaybackLoads::default();
+        let wanted = AtomicU64::new(1);
+        let current: StreamSlot = Default::default();
+        assert!(loads.begin(1, &wanted));
+        // The second resolution and decoder finish before the first resolver.
+        wanted.store(2, Ordering::Relaxed);
+        assert!(loads.begin(2, &wanted));
+        let new = pending_stream();
+        assert!(loads.register(2, &wanted, &new));
+        assert!(loads.finish(2, &wanted, &new, || {
+            *current.lock().unwrap() = Some(("new".into(), new.clone()));
+        }));
+        let old = pending_stream();
+        assert!(!loads.register(1, &wanted, &old));
+        assert!(loads.current(1, &wanted, || panic!("stale resolver changed state")).is_none());
+        assert!(Arc::ptr_eq(&current.lock().unwrap().as_ref().unwrap().1, &new));
+        let (rx, worker) = read_in_background(&old);
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        old.cancel();
+        worker.join().unwrap();
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn handing_a_decoder_to_audio_removes_it_from_pending_cancellation() {
+        let loads = PlaybackLoads::default();
+        let wanted = AtomicU64::new(1);
+        let outgoing = pending_stream();
+        assert!(loads.begin(1, &wanted));
+        assert!(loads.register(1, &wanted, &outgoing));
+        assert!(loads.finish(1, &wanted, &outgoing, || ()));
+        let (rx, worker) = read_in_background(&outgoing);
+        wanted.store(2, Ordering::Relaxed);
+        assert!(loads.begin(2, &wanted));
+        // This reader represents the still-playing outgoing crossfade source.
+        let untouched = rx.recv_timeout(Duration::from_millis(50));
+        outgoing.cancel();
+        let ended = rx.recv_timeout(Duration::from_secs(1));
+        worker.join().unwrap();
+        assert!(matches!(untouched, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert!(ended.unwrap().is_err());
+    }
+
+    #[test]
+    fn decoder_constructor_panic_is_an_error_for_only_the_current_play() {
+        let loads = PlaybackLoads::default();
+        let wanted = AtomicU64::new(1);
+        let shared = pending_stream();
+        assert!(loads.begin(1, &wanted));
+        assert!(loads.register(1, &wanted, &shared));
+        let error = open_decoder_guarded::<()>(|| panic!("synthetic constructor failure")).unwrap_err();
+        assert!(error.is::<DecoderPanicked>());
+        let (tx, rx) = mpsc::channel();
+        assert!(loads.finish(1, &wanted, &shared, || {
+            shared.cancel();
+            tx.send(Resp::PlayError { generation: 1, msg: format!("decode: {error}") }).unwrap();
+        }));
+        assert!(matches!(rx.recv().unwrap(), Resp::PlayError { generation: 1, .. }));
+        wanted.store(2, Ordering::Relaxed);
+        assert!(loads.begin(2, &wanted));
+        assert!(!loads.finish(1, &wanted, &shared, || panic!("stale constructor sent an error")));
+        assert!(open_decoder_guarded(|| Ok(7)).is_ok_and(|n| n == 7));
+    }
 }
 
 #[cfg(test)]

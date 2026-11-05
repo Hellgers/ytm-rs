@@ -18,12 +18,12 @@ use bytes::Bytes;
 
 const BLOCK: u64 = 256 * 1024;
 const WORKERS: usize = 4;
-/// Tries per block before the download gives up, waiting a little longer each time
-/// (about half a minute in all): long enough to ride out a dropped connection.
+/// Retries are also bounded by a per-block deadline, including URL renewal.
 const RETRIES: u32 = 6;
 /// A response that delivers nothing for this long is dead; a slow one that keeps
 /// delivering is fine, however long the block takes.
-const STALL: Duration = Duration::from_secs(20);
+const STALL: Duration = Duration::from_secs(8);
+const BLOCK_DEADLINE: Duration = Duration::from_secs(30);
 /// googlevideo occasionally starts rejecting a URL partway through (HTTP 403);
 /// a freshly resolved URL for the same video resumes the download.
 const MAX_REFRESHES: u32 = 2;
@@ -157,6 +157,11 @@ impl Shared {
         self.inner.lock().unwrap().blocks.iter().all(Option::is_some)
     }
 
+    pub fn can_reuse(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.error.is_none() && (!inner.cancelled || inner.blocks.iter().all(Option::is_some))
+    }
+
     /// Wait until the download stops, however it ends.
     pub async fn finished(&self) {
         let _ = self.done.subscribe().wait_for(|d| *d).await;
@@ -172,6 +177,12 @@ impl Shared {
         self.inner.lock().unwrap().cancelled = true;
         self.ready.notify_all();
         self.changed.notify_waiters();
+    }
+
+    /// Reserve a decoder reader before starting a blocking constructor. A local
+    /// interruption wakes that reader without cancelling another seek's reader.
+    pub fn read_interrupt(self: &Arc<Self>) -> ReadInterrupt {
+        ReadInterrupt::new(self.clone())
     }
 
     fn claim(&self) -> Claim {
@@ -217,10 +228,22 @@ impl Shared {
     }
 
     fn fail(&self, err: String) {
-        log::error!("download failed: {err}");
         FAIL_FROM.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
-        self.inner.lock().unwrap().error = Some(err);
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.cancelled || inner.error.is_some() {
+                return;
+            }
+            log::error!("download failed: {err}");
+            inner.error = Some(err);
+        }
         self.ready.notify_all();
+        self.changed.notify_waiters();
+    }
+
+    fn stopped(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.cancelled || inner.error.is_some()
     }
 
     fn range(&self, idx: usize) -> (u64, u64) {
@@ -245,7 +268,7 @@ impl UrlSlot {
         let Some(refresh) = self.refresh.as_ref().filter(|_| slot.1 < MAX_REFRESHES) else { return false };
         match refresh().await {
             Ok(url) => {
-                log::info!("stream URL refreshed after 403");
+                log::info!("stream URL refreshed after a rejected or stalled request");
                 *slot = (url, slot.1 + 1);
                 true
             }
@@ -260,6 +283,36 @@ impl UrlSlot {
 /// Download into `shared` with parallel range requests; returns when complete,
 /// failed, or every reader was dropped.
 pub async fn download(http: reqwest::Client, url: String, ua: String, shared: Arc<Shared>, refresh: Option<Refresh>) {
+    download_with_policy(http, url, ua, shared, refresh, DownloadPolicy { stall: STALL, deadline: BLOCK_DEADLINE, retry_base: Duration::from_millis(400), refresh_http: |_| crate::proxy::http() }).await;
+}
+
+#[derive(Clone, Copy)]
+struct DownloadPolicy {
+    stall: Duration,
+    deadline: Duration,
+    retry_base: Duration,
+    refresh_http: fn(&reqwest::Client) -> reqwest::Client,
+}
+
+/// Normal reader/limit notifications do not restart a request. Cancellation or
+/// another worker's terminal failure drops the in-flight HTTP/renew/backoff future.
+async fn until_stopped<T>(shared: &Shared, future: impl Future<Output = T>) -> Option<T> {
+    tokio::pin!(future);
+    loop {
+        let changed = shared.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if shared.stopped() {
+            return None;
+        }
+        tokio::select! {
+            result = &mut future => return Some(result),
+            _ = changed => {}
+        }
+    }
+}
+
+async fn download_with_policy(http: reqwest::Client, url: String, ua: String, shared: Arc<Shared>, refresh: Option<Refresh>, policy: DownloadPolicy) {
     let slot = Arc::new(UrlSlot { url: tokio::sync::Mutex::new((url, 0)), refresh });
     let mut set = tokio::task::JoinSet::new();
     for _ in 0..WORKERS {
@@ -279,38 +332,46 @@ pub async fn download(http: reqwest::Client, url: String, ua: String, shared: Ar
                     Claim::Done => break,
                 };
                 let (a, b) = shared.range(idx);
-                let mut attempt = 0;
-                loop {
+                let block = async {
+                  let mut attempt = 0;
+                  loop {
                     let (url, version) = slot.url.lock().await.clone();
                     // A refreshed URL is tied to the address that resolved it, which is the
                     // current shared client's (a proxy may have switched exits since).
-                    let client = if version > 0 { crate::proxy::http() } else { http.clone() };
+                    let client = if version > 0 { (policy.refresh_http)(&http) } else { http.clone() };
                     let res = if idx >= FAIL_FROM.load(std::sync::atomic::Ordering::Relaxed) {
                         Err(anyhow::anyhow!("simulated network failure"))
                     } else {
-                        fetch(&client, &format!("{url}&range={a}-{b}"), &ua, b - a + 1).await
+                        fetch(&client, &format!("{url}&range={a}-{b}"), &ua, b - a + 1, policy.stall).await
                     };
                     match res {
-                        Ok(data) => {
-                            shared.put(idx, data);
-                            break;
-                        }
-                        Err(e) if is_forbidden(&e) && slot.renew(version).await => {}
+                        Ok(data) => return Ok(data),
+                        Err(e) if should_renew(&e) && slot.renew(version).await => {}
                         Err(e) if attempt < RETRIES && !is_forbidden(&e) => {
                             attempt += 1;
                             log::warn!("range {a}-{b}: {e:#} (retry {attempt})");
-                            tokio::time::sleep(Duration::from_millis(400 * (attempt * attempt) as u64)).await;
+                            tokio::time::sleep(policy.retry_base * (attempt * attempt)).await;
                         }
                         Err(e) => {
-                            shared.fail(format!("range {a}-{b}: {e:#}"));
-                            return;
+                            return Err(e);
                         }
                     }
+                  }
+                };
+                match until_stopped(&shared, tokio::time::timeout(policy.deadline, block)).await {
+                    None => return,
+                    Some(Ok(Ok(data))) => shared.put(idx, data),
+                    Some(Ok(Err(e))) => { shared.fail(format!("range {a}-{b}: {e:#}")); return; }
+                    Some(Err(_)) => { shared.fail(format!("range {a}-{b}: block deadline exceeded ({} s)", policy.deadline.as_secs())); return; }
                 }
             }
         });
     }
-    while set.join_next().await.is_some() {}
+    while let Some(result) = set.join_next().await {
+        if result.is_err() {
+            shared.fail("audio download worker stopped unexpectedly".into());
+        }
+    }
     shared.done.send_replace(true);
 }
 
@@ -319,6 +380,20 @@ fn is_forbidden(e: &anyhow::Error) -> bool {
         .and_then(reqwest::Error::status)
         .is_some_and(|s| s == reqwest::StatusCode::FORBIDDEN)
 }
+
+fn should_renew(e: &anyhow::Error) -> bool {
+    e.is::<Stalled>() || e.downcast_ref::<reqwest::Error>().is_some_and(|e| {
+        e.is_timeout() || e.is_connect() || e.is_body()
+            || e.status().is_some_and(|s| s == reqwest::StatusCode::FORBIDDEN || s.is_server_error())
+    })
+}
+
+#[derive(Debug)]
+struct Stalled;
+impl std::fmt::Display for Stalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("audio response stopped delivering data") }
+}
+impl std::error::Error for Stalled {}
 
 /// Dev hook: YTM_STREAM_FAIL=<block> makes the first download fail from that block on,
 /// as if the connection died mid-song; later downloads work.
@@ -330,32 +405,38 @@ pub fn init_dev_hooks() {
     }
 }
 
-async fn fetch(http: &reqwest::Client, url: &str, ua: &str, expect: u64) -> anyhow::Result<Bytes> {
-    let stalled = || anyhow::anyhow!("no data for {} s", STALL.as_secs());
+async fn fetch(http: &reqwest::Client, url: &str, ua: &str, expect: u64, stall: Duration) -> anyhow::Result<Bytes> {
+    let stalled = || anyhow::Error::new(Stalled);
     // Errors leave the URL out: it carries the client's IP address and signatures (logs).
-    let mut resp = tokio::time::timeout(STALL, http.get(url).header("User-Agent", ua).send())
+    let mut resp = tokio::time::timeout(stall, http.get(url).header("User-Agent", ua).send())
         .await
         .map_err(|_| stalled())?
         .and_then(reqwest::Response::error_for_status)
         .map_err(reqwest::Error::without_url)?;
     let mut buf = bytes::BytesMut::with_capacity(expect as usize);
-    while let Some(chunk) = tokio::time::timeout(STALL, resp.chunk()).await.map_err(|_| stalled())?.map_err(reqwest::Error::without_url)? {
+    while let Some(chunk) = tokio::time::timeout(stall, resp.chunk()).await.map_err(|_| stalled())?.map_err(reqwest::Error::without_url)? {
+        anyhow::ensure!(buf.len() as u64 + chunk.len() as u64 <= expect, "server returned more bytes than the requested range");
         buf.extend_from_slice(&chunk);
     }
     anyhow::ensure!(buf.len() as u64 == expect, "short read: {} of {expect} bytes", buf.len());
     Ok(buf.freeze())
 }
 
-pub struct StreamReader {
+struct ReadControl {
     shared: Arc<Shared>,
-    pos: u64,
+    stopped: std::sync::atomic::AtomicBool,
+    waiting: std::sync::atomic::AtomicBool,
     id: u64,
-    /// The block this reader last read.
-    block: usize,
 }
 
-impl StreamReader {
-    pub fn new(shared: Arc<Shared>) -> Self {
+/// A reader reservation and its independent cancellation signal. Keeping the
+/// reservation alive bridges the gap between retiring a decoder and opening its
+/// replacement on the same download.
+#[derive(Clone)]
+pub struct ReadInterrupt(Arc<ReadControl>);
+
+impl ReadInterrupt {
+    fn new(shared: Arc<Shared>) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
@@ -365,20 +446,61 @@ impl StreamReader {
             inner.wants.push((id, 0));
         }
         shared.changed.notify_waiters();
-        Self { shared, pos: 0, id, block: 0 }
+        Self(Arc::new(ReadControl { shared, stopped: std::sync::atomic::AtomicBool::new(false), waiting: std::sync::atomic::AtomicBool::new(false), id }))
+    }
+
+    pub fn cancel(&self) {
+        // Pair the flag with the Condvar mutex: a cancellation between the
+        // reader's predicate check and wait must not lose its notification.
+        let _inner = self.0.shared.inner.lock().unwrap();
+        self.0.stopped.store(true, std::sync::atomic::Ordering::Release);
+        self.0.shared.ready.notify_all();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.stopped.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn is_waiting(&self) -> bool {
+        self.0.waiting.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
-impl Drop for StreamReader {
+struct ReadWait<'a>(&'a std::sync::atomic::AtomicBool);
+impl Drop for ReadWait<'_> {
+    fn drop(&mut self) { self.0.store(false, std::sync::atomic::Ordering::Release); }
+}
+
+impl Drop for ReadControl {
     fn drop(&mut self) {
         let mut inner = self.shared.inner.lock().unwrap();
         inner.readers -= 1;
         inner.wants.retain(|&(id, _)| id != self.id);
         if inner.readers == 0 {
-            // Stops the workers once their current request finishes.
             inner.cancelled = true;
         }
+        self.shared.ready.notify_all();
         self.shared.changed.notify_waiters();
+    }
+}
+
+pub struct StreamReader {
+    shared: Arc<Shared>,
+    pos: u64,
+    id: u64,
+    /// The block this reader last read.
+    block: usize,
+    interrupt: ReadInterrupt,
+}
+
+impl StreamReader {
+    #[cfg(test)]
+    pub fn new(shared: Arc<Shared>) -> Self {
+        Self::with_interrupt(shared.read_interrupt())
+    }
+
+    pub(crate) fn with_interrupt(interrupt: ReadInterrupt) -> Self {
+        Self { shared: interrupt.0.shared.clone(), pos: 0, id: interrupt.0.id, block: 0, interrupt }
     }
 }
 
@@ -389,6 +511,9 @@ impl Read for StreamReader {
         }
         let idx = (self.pos / BLOCK) as usize;
         let mut inner = self.shared.inner.lock().unwrap();
+        if self.interrupt.is_cancelled() {
+            return Err(io::Error::other("reader interrupted"));
+        }
         inner.want = idx;
         if idx != self.block {
             self.block = idx;
@@ -400,13 +525,19 @@ impl Read for StreamReader {
             }
         }
         while inner.blocks[idx].is_none() {
+            if self.interrupt.is_cancelled() {
+                return Err(io::Error::other("reader interrupted"));
+            }
             if let Some(e) = &inner.error {
                 return Err(io::Error::other(e.clone()));
             }
             if inner.cancelled {
                 return Err(io::Error::other("download cancelled"));
             }
+            self.interrupt.0.waiting.store(true, std::sync::atomic::Ordering::Release);
+            let waiting = ReadWait(&self.interrupt.0.waiting);
             inner = self.shared.ready.wait(inner).unwrap();
+            drop(waiting);
         }
         let block = inner.blocks[idx].as_ref().unwrap();
         let off = (self.pos - idx as u64 * BLOCK) as usize;
@@ -437,24 +568,45 @@ impl Seek for StreamReader {
 /// fragment; seekable ones index every fragment first (i.e. effectively wait for the
 /// download). Opus ones are always seekable: WebM's index is at the start.
 pub fn decoder(shared: Arc<Shared>, seekable: bool) -> anyhow::Result<TrackDecoder> {
+    let interrupt = shared.read_interrupt();
+    decoder_with_interrupt(shared, seekable, interrupt)
+}
+
+pub fn decoder_with_interrupt(shared: Arc<Shared>, seekable: bool, interrupt: ReadInterrupt) -> anyhow::Result<TrackDecoder> {
+    anyhow::ensure!(Arc::ptr_eq(&shared, &interrupt.0.shared), "reader belongs to a different download");
+    anyhow::ensure!(!interrupt.is_cancelled(), "decoder opening interrupted");
     let size = shared.total;
-    if shared.opus {
+    let reader = StreamReader::with_interrupt(interrupt.clone());
+    let kind = if shared.opus {
         let duration_ms = shared.duration_ms;
-        return Ok(TrackDecoder::Opus(Box::new(crate::opus::OpusSource::new(StreamReader::new(shared), size, duration_ms)?)));
-    }
-    Ok(TrackDecoder::Aac(
+        DecoderKind::Opus(Box::new(crate::opus::OpusSource::new(reader, size, duration_ms)?))
+    } else {
+        DecoderKind::Aac(
         rodio::Decoder::builder()
-            .with_data(StreamReader::new(shared))
+            .with_data(reader)
             .with_byte_len(size)
             .with_seekable(seekable)
             .with_mime_type("audio/mp4")
             .with_hint("m4a")
             .build()?,
-    ))
+        )
+    };
+    Ok(TrackDecoder { kind, interrupt })
 }
 
 /// A song's decoder: AAC (rodio's own) or Opus.
-pub enum TrackDecoder {
+pub struct TrackDecoder {
+    kind: DecoderKind,
+    interrupt: ReadInterrupt,
+}
+
+impl TrackDecoder {
+    pub fn interrupt_handle(&self) -> ReadInterrupt {
+        self.interrupt.clone()
+    }
+}
+
+enum DecoderKind {
     Aac(rodio::Decoder<StreamReader>),
     /// Boxed: its decoder state is about 11 KB.
     Opus(Box<crate::opus::OpusSource>),
@@ -464,42 +616,173 @@ impl Iterator for TrackDecoder {
     type Item = rodio::Sample;
 
     fn next(&mut self) -> Option<rodio::Sample> {
-        match self {
-            Self::Aac(d) => d.next(),
-            Self::Opus(d) => d.next(),
+        match &mut self.kind {
+            DecoderKind::Aac(d) => d.next(),
+            DecoderKind::Opus(d) => d.next(),
         }
     }
 }
 
 impl rodio::Source for TrackDecoder {
     fn current_span_len(&self) -> Option<usize> {
-        match self {
-            Self::Aac(d) => d.current_span_len(),
-            Self::Opus(d) => d.current_span_len(),
+        match &self.kind {
+            DecoderKind::Aac(d) => d.current_span_len(),
+            DecoderKind::Opus(d) => d.current_span_len(),
         }
     }
     fn channels(&self) -> rodio::ChannelCount {
-        match self {
-            Self::Aac(d) => d.channels(),
-            Self::Opus(d) => d.channels(),
+        match &self.kind {
+            DecoderKind::Aac(d) => d.channels(),
+            DecoderKind::Opus(d) => d.channels(),
         }
     }
     fn sample_rate(&self) -> rodio::SampleRate {
-        match self {
-            Self::Aac(d) => d.sample_rate(),
-            Self::Opus(d) => d.sample_rate(),
+        match &self.kind {
+            DecoderKind::Aac(d) => d.sample_rate(),
+            DecoderKind::Opus(d) => d.sample_rate(),
         }
     }
     fn total_duration(&self) -> Option<Duration> {
-        match self {
-            Self::Aac(d) => d.total_duration(),
-            Self::Opus(d) => d.total_duration(),
+        match &self.kind {
+            DecoderKind::Aac(d) => d.total_duration(),
+            DecoderKind::Opus(d) => d.total_duration(),
         }
     }
     fn try_seek(&mut self, pos: Duration) -> Result<(), rodio::source::SeekError> {
-        match self {
-            Self::Aac(d) => d.try_seek(pos),
-            Self::Opus(d) => d.try_seek(pos),
+        match &mut self.kind {
+            DecoderKind::Aac(d) => d.try_seek(pos),
+            DecoderKind::Opus(d) => d.try_seek(pos),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn local_interrupt_wakes_reader_and_preserves_reserved_replacement() {
+        let shared = Shared::new(1, 0, None, false, false);
+        let old = shared.read_interrupt();
+        let replacement = shared.read_interrupt();
+        let mut reader = StreamReader::with_interrupt(old.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || { let result = reader.read(&mut [0]); let _ = tx.send(result); });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !old.is_waiting() && std::time::Instant::now() < deadline { std::thread::yield_now(); }
+        let was_waiting = old.is_waiting();
+        old.cancel();
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        worker.join().unwrap();
+        assert!(was_waiting);
+        assert!(result.unwrap().is_err());
+        assert!(!old.is_waiting());
+        drop(old);
+        assert!(!shared.stopped());
+        shared.put(0, Bytes::from_static(b"Z"));
+        let mut next = StreamReader::with_interrupt(replacement.clone());
+        let mut out = [0];
+        assert_eq!(next.read(&mut out).unwrap(), 1);
+        assert_eq!(out, [b'Z']);
+        drop(next);
+        assert!(!shared.stopped());
+        drop(replacement);
+        assert!(shared.stopped());
+    }
+
+    #[test]
+    fn local_interrupt_stops_even_a_fully_cached_reader() {
+        let shared = Shared::from_bytes(b"ABC".to_vec(), 0, None);
+        let handle = shared.read_interrupt();
+        let mut reader = StreamReader::with_interrupt(handle.clone());
+        handle.cancel();
+        assert!(reader.read(&mut [0]).is_err());
+    }
+
+    fn fast_policy() -> DownloadPolicy {
+        DownloadPolicy { stall: Duration::from_millis(50), deadline: Duration::from_millis(300), retry_base: Duration::ZERO, refresh_http: Clone::clone }
+    }
+
+    #[tokio::test]
+    async fn failed_head_prefetch_releases_waiting_workers_and_finished() {
+        let shared = Shared::new(BLOCK * 3, 0, None, false, true);
+        let run = download_with_policy(reqwest::Client::new(), "invalid-url".into(), "test".into(), shared.clone(), None, fast_policy());
+        tokio::time::timeout(Duration::from_secs(1), run).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(100), shared.finished()).await.unwrap();
+        assert!(shared.error().is_some());
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_in_flight_http_before_its_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted, wait_accepted) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _ = accepted.send(());
+            let _socket = socket;
+            std::future::pending::<()>().await;
+        });
+        let shared = Shared::new(1, 0, None, false, false);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let task = tokio::spawn(download_with_policy(client, format!("http://{address}/audio?x=1"), "test".into(), shared.clone(), None,
+            DownloadPolicy { stall: Duration::from_secs(30), deadline: Duration::from_secs(60), retry_base: Duration::from_secs(10), refresh_http: Clone::clone }));
+        tokio::time::timeout(Duration::from_secs(1), wait_accepted).await.unwrap().unwrap();
+        shared.cancel();
+        let result = tokio::time::timeout(Duration::from_millis(500), task).await;
+        server.abort();
+        let _ = server.await;
+        result.unwrap().unwrap();
+        assert!(shared.error().is_none());
+        assert!(*shared.done.borrow());
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_interrupts_registered_backoff() {
+        let shared = Shared::new(1, 0, None, false, false);
+        let (entered, wait_entered) = tokio::sync::oneshot::channel();
+        let other = shared.clone();
+        let task = tokio::spawn(async move { until_stopped(&other, async move {
+            let _ = entered.send(());
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }).await });
+        wait_entered.await.unwrap();
+        shared.fail("simulated terminal failure".into());
+        assert!(tokio::time::timeout(Duration::from_millis(500), task).await.unwrap().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn service_error_renews_url_and_fetches_same_representation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut paths = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let n = socket.read(&mut request).await.unwrap();
+                let good = String::from_utf8_lossy(&request[..n]).starts_with("GET /good?");
+                paths.push(good);
+                let response: &[u8] = if good { b"HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nConnection: close\r\n\r\nZ" }
+                    else { b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" };
+                socket.write_all(response).await.unwrap();
+            }
+            paths
+        });
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let count = renewals.clone();
+        let refresh: Refresh = Arc::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move { Ok(format!("http://{address}/good?x=1")) })
+        });
+        let shared = Shared::new(1, 0, None, false, false);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), download_with_policy(client, format!("http://{address}/bad?x=1"), "test".into(), shared.clone(), Some(refresh), fast_policy())).await.unwrap();
+        assert_eq!(server.await.unwrap(), [false, true]);
+        assert_eq!(renewals.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.bytes().unwrap(), b"Z");
+        assert!(shared.error().is_none());
     }
 }

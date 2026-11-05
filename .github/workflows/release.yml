@@ -30,7 +30,7 @@ jobs:
           $rustupRoot = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $env:USERPROFILE '.rustup' }
           $cargoRoot = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
           "RUSTFLAGS=--remap-path-prefix=$env:GITHUB_WORKSPACE=/src --remap-path-prefix=$cargoRoot=/cargo --remap-path-prefix=$rustupRoot=/rust" >> $env:GITHUB_ENV
-          foreach ($path in @('LICENSE','README.md','docs/AUDIO_CONTINUITY_FIX.md','docs/RELEASE_NOTES_0.2.32.md')) {
+          foreach ($path in @('LICENSE','README.md','docs/AUDIO_CONTINUITY_FIX.md','docs/RELEASE_NOTES_0.2.33.md')) {
             if (!(Test-Path -LiteralPath $path)) { throw "Required document missing: $path" }
           }
       - name: Test release source
@@ -66,7 +66,7 @@ jobs:
           Compress-Archive -Path "$portable/*" -DestinationPath "$dist/ytm-rs-portable-$env:VERSION.zip" -Force
           git archive --format=zip --prefix="ytm-rs-$env:VERSION/" --output="$dist/ytm-rs-source-$env:VERSION.zip" HEAD
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          git diff --binary --output="$dist/ytm-rs-audio-continuity-$env:VERSION.patch" 133ad8990a6cd60eafdc812b333ef356b52380f7 HEAD -- src/audio.rs src/audio_source.rs src/main.rs
+          git diff --binary --output="$dist/ytm-rs-audio-continuity-$env:VERSION.patch" 133ad8990a6cd60eafdc812b333ef356b52380f7 HEAD -- src/audio.rs src/audio_source.rs src/main.rs src/stream.rs src/backend.rs
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $names = @("ytm-rs-setup-$env:VERSION.exe", "ytm-rs-portable-$env:VERSION.zip", "ytm-rs-source-$env:VERSION.zip", "ytm-rs-audio-continuity-$env:VERSION.patch")
           $lines = foreach ($name in $names) {
@@ -97,6 +97,6 @@ jobs:
             if (!(($existing | ConvertFrom-Json).isDraft)) { throw 'Refusing to modify a published release' }
             gh release upload $tag @files --clobber
           } else {
-            gh release create $tag @files --verify-tag --draft --title "ytm-rs $env:VERSION — Audio continuity fix" --notes-file docs/RELEASE_NOTES_0.2.32.md
+            gh release create $tag @files --verify-tag --draft --title "ytm-rs $env:VERSION — Audio continuity fix" --notes-file docs/RELEASE_NOTES_0.2.33.md
           }
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

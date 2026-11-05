@@ -1,8 +1,8 @@
-> **Windows audio continuity fork (0.2.32).** Based on upstream stable 0.2.31
+> **Windows audio continuity fork (0.2.33).** Based on upstream stable 0.2.31
 > (`133ad8990a6cd60eafdc812b333ef356b52380f7`), with continuous per-track
 > resampling to prevent crackle at decoder packet boundaries. Windows builds and
 > automatic updates come from [this fork's releases](https://github.com/Hellgers/ytm-rs/releases).
-> See [audio fix](docs/AUDIO_CONTINUITY_FIX.md) and [release notes](docs/RELEASE_NOTES_0.2.32.md).
+> See [audio fix](docs/AUDIO_CONTINUITY_FIX.md) and [release notes](docs/RELEASE_NOTES_0.2.33.md).
 > The upstream project's cross-platform documentation follows; this fork ships Windows x64 binaries.
 <div align="center">
   <img src="assets/icon/icon.png" alt="ytm-rs app icon" width="96">

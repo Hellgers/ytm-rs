@@ -32,6 +32,25 @@ pub fn connect_player(
     player
 }
 
+/// Retire controls without waiting for a device callback or a blocked decoder.
+pub fn replace_player(
+    player: &mut rodio::Player,
+    mixer: &rodio::mixer::Mixer,
+    channels: ChannelCount,
+    rate: SampleRate,
+) {
+    let replacement = connect_player(mixer, channels, rate);
+    replacement.set_volume(player.volume());
+    if player.is_paused() {
+        replacement.pause();
+    }
+    let old = std::mem::replace(player, replacement);
+    old.stop();
+    // Player::clear waits for the output to consume its source. A stopped
+    // device, or a decoder waiting for the network, cannot satisfy that wait.
+    drop(old);
+}
+
 pub fn convert<S>(
     inner: S,
     channels: ChannelCount,
@@ -43,8 +62,9 @@ where
 {
     let input_channels = inner.channels();
     let input_rate = inner.sample_rate();
-    UniformSourceIterator::new(
-        Frames {
+    let duration = inner.total_duration();
+    LazyConversion {
+        pending: Some(Frames {
             inner,
             channels: input_channels,
             rate: input_rate,
@@ -52,10 +72,39 @@ where
             at: input_channels.get() as usize,
             ended: false,
             failed,
-        },
+        }),
+        converted: None,
         channels,
         rate,
-    )
+        duration,
+    }
+}
+
+// UniformSourceIterator::new pulls two input frames when resampling. Defer
+// that bootstrap until next(), outside the engine's command-processing thread.
+struct LazyConversion<S: Source> {
+    pending: Option<Frames<S>>,
+    converted: Option<UniformSourceIterator<Frames<S>>>,
+    channels: ChannelCount,
+    rate: SampleRate,
+    duration: Option<Duration>,
+}
+
+impl<S: Source> Iterator for LazyConversion<S> {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        if let Some(input) = self.pending.take() {
+            self.converted = Some(UniformSourceIterator::new(input, self.channels, self.rate));
+        }
+        self.converted.as_mut()?.next()
+    }
+}
+
+impl<S: Source> Source for LazyConversion<S> {
+    fn current_span_len(&self) -> Option<usize> { None }
+    fn channels(&self) -> ChannelCount { self.channels }
+    fn sample_rate(&self) -> SampleRate { self.rate }
+    fn total_duration(&self) -> Option<Duration> { self.duration }
 }
 
 struct Frames<S> {
@@ -130,6 +179,75 @@ mod tests {
     }
     fn flag() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
+    }
+    struct CountReads {
+        inner: SamplesBuffer,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Iterator for CountReads {
+        type Item = f32;
+        fn next(&mut self) -> Option<f32> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.next()
+        }
+    }
+    impl Source for CountReads {
+        fn current_span_len(&self) -> Option<usize> { self.inner.current_span_len() }
+        fn channels(&self) -> ChannelCount { self.inner.channels() }
+        fn sample_rate(&self) -> SampleRate { self.inner.sample_rate() }
+        fn total_duration(&self) -> Option<Duration> { self.inner.total_duration() }
+    }
+    #[test]
+    fn conversion_construction_and_player_append_do_not_read_decoder() {
+        for input_rate in [44100, 48000] {
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let source = convert(CountReads {
+                inner: SamplesBuffer::new(ch(2), nz(input_rate), vec![0.25; 2000]),
+                reads: reads.clone(),
+            }, ch(2), nz(48000), flag());
+            assert_eq!(source.sample_rate(), nz(48000));
+            assert_eq!(reads.load(Ordering::Relaxed), 0);
+            let (mixer, mut output) = rodio::mixer::mixer(ch(2), nz(48000));
+            let player = connect_player(&mixer, ch(2), nz(48000));
+            player.append(source);
+            assert_eq!(reads.load(Ordering::Relaxed), 0);
+            for _ in 0..2000 { output.next(); }
+            assert!(reads.load(Ordering::Relaxed) > 0);
+        }
+    }
+    #[test]
+    fn replacement_without_output_preserves_gain_and_pause_without_waiting() {
+        let (mixer, _output) = rodio::mixer::mixer(ch(2), nz(48000));
+        let mut player = connect_player(&mixer, ch(2), nz(48000));
+        player.set_volume(0.375);
+        player.pause();
+        player.append(SamplesBuffer::new(ch(2), nz(48000), vec![0.25; 2000]));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            replace_player(&mut player, &mixer, ch(2), nz(48000));
+            let _ = tx.send((player.empty(), player.is_paused(), player.volume()));
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok((true, true, 0.375)));
+        worker.join().unwrap();
+    }
+    #[test]
+    fn clear_waits_for_a_consumer_even_for_fully_buffered_audio() {
+        let (player, mut queue) = rodio::Player::new();
+        player.append(SamplesBuffer::new(ch(2), nz(48000), vec![0.25; 2000]));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = started_tx.send(());
+            player.clear();
+            let _ = done_tx.send(());
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(done_rx.recv_timeout(Duration::from_millis(30)), Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        // Release the intentional old-behavior reproduction, then join it;
+        // the test leaves no blocked thread or device behind.
+        for _ in 0..4000 { queue.next(); }
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
     }
     struct Packet {
         data: Vec<f32>,

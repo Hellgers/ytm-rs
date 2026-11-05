@@ -2,7 +2,7 @@
 
 ## This fork
 
-The **0.2.32** Windows binaries published in [Hellgers/ytm-rs releases](https://github.com/Hellgers/ytm-rs/releases) are **unsigned**. They incorporate upstream **0.2.31** and the audio continuity patch, updated on **2026-11-05**. They are not official upstream releases. No SignPath signature or certificate is claimed for these binaries. The earlier fork 0.2.21 binaries were unsigned too.
+The **0.2.33** Windows binaries published in [Hellgers/ytm-rs releases](https://github.com/Hellgers/ytm-rs/releases) are **unsigned**. They incorporate upstream **0.2.31** and the audio continuity patch, updated on **2026-11-06**. They are not official upstream releases. No SignPath signature or certificate is claimed for these binaries. The earlier fork 0.2.21 binaries were unsigned too.
 
 The release supplies the complete modified source, a patch against upstream v0.2.31, and SHA-256 checksums for its assets. A matching checksum verifies that a download matches that manifest; it is not a code-signing certificate or an independent security review. You can build the tagged source using the instructions in [README.md](README.md).
 
