@@ -21,14 +21,44 @@ const VERSION: &str = "1.20260707.12.00";
 
 /// The signed-in Google session: the youtube.com cookies the sign-in window captured,
 /// plus which signed-in account and channel they are for.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Session {
     pub cookie: String,
     session_index: u32,
     /// Brand channel to act as (X-Goog-PageId), when it isn't the account's own.
     #[serde(default)]
     page_id: Option<String>,
+    /// The signed-in browser's visitor ID: signed-in requests carry it, as the site's do,
+    /// not an anonymous visitor's.
+    #[serde(default)]
+    pub visitor_data: Option<String>,
+    /// Cookies Google replaced while answering a request made from here (the Premium
+    /// check, the web player), for the API to take into the session.
+    #[serde(skip)]
+    replaced: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Which sign-in this is, in this run: every copy of it (newer cookies, another
+    /// channel) has the same, another sign-in never does.
+    #[serde(skip, default = "new_login")]
+    login: u64,
 }
+
+fn new_login() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Google has signed the session out (password change, "sign out everywhere", or a
+/// copy it took for stolen).
+#[derive(Debug)]
+pub struct Revoked;
+
+impl std::fmt::Display for Revoked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Google signed this session out")
+    }
+}
+
+impl std::error::Error for Revoked {}
 
 /// The credential the session is saved under (see [`crate::vault`]).
 const VAULT: &str = "google session";
@@ -40,7 +70,17 @@ const LEGACY: &str = "rustypipe_cache.json";
 
 impl Session {
     pub fn new(cookie: String, session_index: u32, page_id: Option<String>) -> Self {
-        Self { cookie, session_index, page_id }
+        Self { cookie, session_index, page_id, visitor_data: None, replaced: Default::default(), login: new_login() }
+    }
+
+    /// The brand channel this session acts as; `None` for the Google account's own.
+    pub fn channel(&self) -> Option<&str> {
+        self.page_id.as_deref()
+    }
+
+    /// The same sign-in acting as another of its channels (`None`: the account's own).
+    pub fn on_channel(&self, page_id: Option<String>) -> Self {
+        Self { page_id, ..self.clone() }
     }
 
     /// `None` when signed out. A session saved by an older version is carried over.
@@ -130,6 +170,85 @@ impl Session {
         Ok(req)
     }
 
+    /// Google keeps a signed-in session alive by replacing its cookies as it's used
+    /// (`__Secure-1PSIDTS`, `SIDCC`, …), and treats a copy that never takes the new
+    /// ones as stolen. The session with these `Set-Cookie` headers applied, when they
+    /// change anything. Only youtube.com-wide cookies count, and deletions are left out:
+    /// a revoked session is noticed by the signed-out answers instead.
+    pub fn updated<'a>(&self, set_cookies: impl IntoIterator<Item = &'a str>) -> Option<Self> {
+        let year = 1970 + SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() / 31_556_952);
+        let mut jar: Vec<(String, String)> = self
+            .cookie
+            .split(';')
+            .filter_map(|kv| kv.trim().split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())))
+            .collect();
+        let mut changed = false;
+        for line in set_cookies {
+            let mut parts = line.split(';');
+            let Some((name, value)) = parts.next().and_then(|kv| kv.trim().split_once('=')) else { continue };
+            let attr = |key: &str| parts.clone().find_map(|a| a.trim().split_once('=').filter(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.trim()));
+            let wide = attr("domain").is_some_and(|d| d.trim_start_matches('.').eq_ignore_ascii_case("youtube.com"));
+            let gone = value.is_empty()
+                || attr("max-age").is_some_and(|a| a.parse::<i64>().is_ok_and(|a| a <= 0))
+                || attr("expires").and_then(|e| e.split(|c: char| !c.is_ascii_digit()).find(|t| t.len() == 4)?.parse::<u64>().ok()).is_some_and(|y| y < year);
+            if !wide || gone {
+                continue;
+            }
+            match jar.iter_mut().find(|(k, _)| k == name) {
+                Some((_, v)) if v == value => {}
+                Some((_, v)) => {
+                    *v = value.to_owned();
+                    changed = true;
+                }
+                None => {
+                    jar.push((name.to_owned(), value.to_owned()));
+                    changed = true;
+                }
+            }
+        }
+        changed.then(|| Self { cookie: jar.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("; "), ..self.clone() })
+    }
+
+    /// Ask Google for fresh session cookies, as an open YouTube tab does every few
+    /// minutes: the `Set-Cookie` headers it answers with. Fails with [`Revoked`] when
+    /// Google no longer knows the session.
+    pub async fn rotate(&self, http: &reqwest::Client) -> anyhow::Result<Vec<String>> {
+        const ACCOUNTS: &str = "https://accounts.youtube.com";
+        let resp = http
+            .post(format!("{ACCOUNTS}/RotateCookies"))
+            .header("User-Agent", UA)
+            .header("Origin", ACCOUNTS)
+            .header("Content-Type", "application/json")
+            .header("Cookie", &self.cookie)
+            .body(r#"[000,"-0000000000000000000"]"#)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            anyhow::bail!(Revoked);
+        }
+        Ok(resp.error_for_status()?.headers().get_all("set-cookie").iter().filter_map(|c| c.to_str().ok().map(str::to_owned)).collect())
+    }
+
+    /// The `Set-Cookie` lines collected since the last call.
+    pub fn take_replaced(&self) -> Vec<String> {
+        std::mem::take(&mut *self.replaced.lock().unwrap())
+    }
+
+    /// Note a response's `Set-Cookie` lines for the API to take in.
+    pub fn note_replaced(&self, headers: &reqwest::header::HeaderMap) {
+        let lines: Vec<String> = headers.get_all("set-cookie").iter().filter_map(|c| c.to_str().ok().map(str::to_owned)).collect();
+        if !lines.is_empty() {
+            self.replaced.lock().unwrap().extend(lines);
+        }
+    }
+
+    /// The same Google sign-in as `other`, whatever the cookies' age and whichever of
+    /// its channels either acts as: the cookies are the sign-in's.
+    pub fn same_login(&self, other: &Self) -> bool {
+        self.login == other.login
+    }
+
     async fn post(&self, http: &reqwest::Client, origin: &str, endpoint: &str, client: (&str, &str, &str), body: Value) -> anyhow::Result<Value> {
         let (number, version, ua) = client;
         let req = http
@@ -139,16 +258,15 @@ impl Session {
             .header("X-YouTube-Client-Version", version)
             .header("Origin", origin)
             .header("X-Origin", origin);
-        Ok(self
+        let resp = self
             .sign(req, origin)?
             // The Premium check's browse page is about 1 MB, slow through Tor.
             .timeout(std::time::Duration::from_secs(if crate::proxy::active().resolve().is_some() { 30 } else { 10 }))
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .await?;
+        self.note_replaced(resp.headers());
+        Ok(resp.error_for_status()?.json().await?)
     }
 
     /// Upload an audio file to the account's library, like "Upload music" on
@@ -253,13 +371,47 @@ impl Session {
             pairs.push((sp, sig));
         }
         url.query_pairs_mut().clear().extend_pairs(pairs);
-        Ok(Stream { url: url.into(), size, duration_ms, loudness_db })
+        Ok(Stream { url: url.into(), size, duration_ms, loudness_db, opus: false })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channels_of_one_sign_in_share_its_cookies() {
+        let s = Session::new("SID=a; SAPISID=k".into(), 0, None);
+        let brand = s.on_channel(Some("42".into()));
+        assert!(brand.same_login(&s));
+        assert_eq!((brand.channel(), brand.on_channel(None).channel()), (Some("42"), None));
+        // Still the same once Google replaces cookies, SAPISID included.
+        assert!(brand.updated(["SAPISID=new; Domain=.youtube.com"]).unwrap().same_login(&s));
+        // Another sign-in isn't, even with the same cookies (or none of the ones compared).
+        assert!(!Session::new("SID=a; SAPISID=k".into(), 0, None).same_login(&s));
+        let loaded: Session = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert!(!loaded.same_login(&s));
+    }
+
+    #[test]
+    fn takes_replaced_cookies_but_not_deletions() {
+        let s = Session::new("SID=a; __Secure-1PSIDTS=old; SAPISID=k".into(), 0, None);
+        let next = s
+            .updated([
+                "__Secure-1PSIDTS=new; Domain=.youtube.com; Path=/; Expires=Thu, 28-Oct-2027 02:22:00 GMT; Secure; HttpOnly",
+                "SIDCC=c; expires=Thu, 28-Oct-2027 02:22:00 GMT; path=/; domain=.youtube.com",
+                // Deletions, a host-only cookie and an unchanged one change nothing.
+                "SID=gone; Domain=.youtube.com; Expires=Fri, 02-Feb-2024 02:22:00 GMT",
+                "SAPISID=; Domain=.youtube.com",
+                "SAPISID=x; Domain=.youtube.com; Max-Age=0",
+                "YSC=h; Path=/",
+                "SID=a; Domain=.youtube.com",
+            ])
+            .unwrap();
+        assert_eq!(next.cookie, "SID=a; __Secure-1PSIDTS=new; SAPISID=k; SIDCC=c");
+        assert!(next.updated(["SID=a; Domain=.youtube.com"]).is_none());
+        assert!(next.same_login(&s));
+    }
 
     #[test]
     fn carries_over_and_forgets_an_older_versions_session() {

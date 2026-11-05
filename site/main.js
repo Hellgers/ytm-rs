@@ -54,54 +54,6 @@
 
   onScroll();
 
-  /* ---------------- together: tabs that advance on their own ---------------- */
-  const feat = $("[data-feat]");
-  if (feat) {
-    const tabs = $$("[data-feat-tab]", feat);
-    const DUR = 9000;
-    let cur = 0, t0 = performance.now(), auto = !reduced, visible = false, held = false, p = 0;
-    const show = (i, focus) => {
-      cur = (i + tabs.length) % tabs.length;
-      p = 0;
-      tabs.forEach((t, j) => {
-        const on = j === cur;
-        t.setAttribute("aria-selected", on);
-        t.tabIndex = on ? 0 : -1;
-        t.style.setProperty("--p", 0);
-        const panel = $(`[data-feat-panel="${t.dataset.featTab}"]`, feat);
-        panel.hidden = !on;
-        panel.classList.toggle("is-on", on);
-      });
-      if (focus) tabs[cur].focus();
-      t0 = performance.now();
-    };
-    tabs.forEach((t, i) => {
-      t.addEventListener("click", () => { auto = false; show(i); });
-      t.addEventListener("keydown", (e) => {
-        const d = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
-        if (d) { e.preventDefault(); auto = false; show(cur + d, true); }
-      });
-    });
-    // Hovering or scrolling away pauses the timer; it resumes where it stopped.
-    const resume = () => (t0 = performance.now() - p * DUR);
-    feat.addEventListener("pointerenter", () => (held = true));
-    feat.addEventListener("pointerleave", () => { held = false; resume(); });
-    new IntersectionObserver(([e]) => {
-      visible = e.isIntersecting;
-      if (visible) resume();
-    }, { threshold: 0.35 }).observe(feat);
-    const tick = (now) => {
-      if (!auto) return;
-      if (visible && !held) {
-        p = (now - t0) / DUR;
-        if (p >= 1) show(cur + 1);
-        else tabs[cur].style.setProperty("--p", p.toFixed(4));
-      }
-      requestAnimationFrame(tick);
-    };
-    if (auto) requestAnimationFrame(tick);
-  }
-
   /* ---------------- hero headline: karaoke sweep ---------------- */
   const kws = $$(".hero__title .kw");
   if (reduced) kws.forEach((w) => w.style.setProperty("--p", 1.2));
@@ -120,7 +72,7 @@
   }
 
   /* ---------------- entrance rise ---------------- */
-  const riseEls = $$(".section__head, .card, .note, .gallery__item, .dl, .faq__list, .themes__copy, .player, .themepick, .beams, .showcase");
+  const riseEls = $$(".section__head, .card, .note, .row, .dl, .faq__list, .themes__copy, .player, .themepick, .beams, .showcase");
   if (!reduced && "IntersectionObserver" in window) {
     riseEls.forEach((el) => el.classList.add("rise"));
     const io = new IntersectionObserver((es) => es.forEach((e) => {
@@ -551,14 +503,37 @@ void main(){
   loadStars();
   document.addEventListener("visibilitychange", () => { if (!document.hidden) loadStars(); });
   addEventListener("focus", loadStars);
+  // The visitor's own platform leads: the hero button names it and its download card is highlighted.
+  const ua = navigator.userAgentData?.platform || navigator.platform || navigator.userAgent;
+  const os = /iPhone|iPad|Android/i.test(navigator.userAgent) ? null : /mac/i.test(ua) ? "macos" : /win/i.test(ua) ? "windows" : /linux|x11/i.test(ua) ? "linux" : null;
+  if (os) {
+    const name = { windows: "Windows", macos: "macOS", linux: "Linux" }[os];
+    $$("[data-os-label]").forEach((el) => (el.textContent = `Download for ${name}`));
+    $$(`[data-os="${os}"]`).forEach((el) => el.classList.add("is-yours"));
+  }
   cached("ytmrs-release", `https://api.github.com/repos/${REPO}/releases/latest`).then((rel) => {
     if (!rel || !rel.tag_name) return;
     $$("[data-version]").forEach((el) => (el.textContent = rel.tag_name));
-    const exe = (rel.assets || []).find((a) => /setup.*\.exe$/i.test(a.name));
-    if (exe) {
-      $$("[data-dl-direct]").forEach((a) => (a.href = exe.browser_download_url));
-      $$("[data-size]").forEach((el) => (el.textContent = `${(exe.size / 1048576).toFixed(1)} MB`));
-    }
+    const assets = rel.assets || [];
+    const find = (re) => assets.find((a) => re.test(a.name));
+    const builds = {
+      windows: { x86: find(/setup-[\d.]+\.exe$/i), arm: find(/setup-[\d.]+-arm64\.exe$/i) },
+      macos: { arm: find(/setup-[\d.]+-macos-aarch64\.dmg$/i), x86: find(/setup-[\d.]+-macos-x86_64\.dmg$/i) },
+      linux: { x86: find(/^ytm-rs-[\d.]+-linux-x86_64\.tar\.gz$/i) },
+    };
+    const show = (os, file) => {
+      if (!file) return;
+      $$(`[data-os="${os}"]`).forEach((a) => (a.href = file.browser_download_url));
+      $$(`[data-size="${os}"]`).forEach((el) => (el.textContent = `${(file.size / 1048576).toFixed(1)} MB`));
+    };
+    // Macs default to Apple silicon, everything else to x64; Chromium reports the CPU and corrects it.
+    show("windows", builds.windows.x86);
+    show("macos", builds.macos.arm);
+    show("linux", builds.linux.x86);
+    navigator.userAgentData?.getHighEntropyValues?.(["architecture"]).then((h) => {
+      if (os === "windows" && h.architecture === "arm") show("windows", builds.windows.arm);
+      if (os === "macos" && h.architecture === "x86") show("macos", builds.macos.x86);
+    }).catch(() => {});
     if (rel.published_at) {
       const d = new Date(rel.published_at);
       $$("[data-date]").forEach((el) => (el.textContent = d.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })));

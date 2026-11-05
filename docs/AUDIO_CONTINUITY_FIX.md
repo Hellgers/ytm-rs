@@ -1,6 +1,6 @@
 # Audio continuity fix
 
-Modified **2026-10-23**. Fork release **0.2.21**, based on upstream **v0.2.20**. This is not an official upstream release.
+Updated **2026-11-05** for upstream **v0.2.31** (`133ad8990a6cd60eafdc812b333ef356b52380f7`). The original fix was reviewed for fork **0.2.21**, based on upstream **v0.2.20**, on **2026-10-23**. This is a fork-specific patch, not an official upstream release.
 
 ## Reproduced defect
 
@@ -23,6 +23,8 @@ The frame wrapper exposes a continuous span while that particular track's format
 
 Each new track gets a separate converter and a natural end of stream. The queue therefore receives a stable mixer format even when consecutive tracks have different input formats. Merely hiding spans on the whole `Player` queue would be unsafe: its keep-alive silence could conceal the next track's format change indefinitely.
 
+The v0.2.31 integration covers both variants of `TrackDecoder`: AAC and Opus. Conversion happens before `Meter`, so the crossfade ramps count samples in the fixed private mixer format. Each outgoing player retains its own converter while the incoming track gets a new one. The private mixer's rate and channels are chosen once in `Output::new` and retained when `Output::open` recovers or changes a device. The existing `Bridge` returns that same mixer on a frame boundary and lets the device mixer adapt to the new device's format. Its continuous span describes this fixed-format mixer; it does not hide a track-changing `Player` queue.
+
 Seeking builds a fresh decoder and converter through the existing replacement path. Old interpolation lookahead and phase are discarded. Delegating a seek through rodio's existing converter would leave its buffered interpolation state intact, so the new wrapper intentionally does not provide in-place seeking.
 
 This patch retains the pinned converter's interpolation method. It does not add a new high-quality resampling library, equalizer, limiter, normalization policy, driver, or virtual audio device.
@@ -41,10 +43,13 @@ The tests construct synthetic samples in memory and do not open an audio output 
 - A packetized 44,100 Hz stereo tone converted to 48,000 Hz, compared sample-for-sample with a single continuous conversion, including output length.
 - Same-rate pass-through, empty sources, and very short complete frames.
 - A format change terminating without a panic or partial output frame.
+- A channel-count change dropping the entire affected frame, and a truncated final frame setting the failure flag at equal and different conversion rates.
 - Replacing a partially consumed source without returning its previous samples.
 - Alternating track formats and end of stream through a real `Player` queue.
+- A new track with a different format arriving after the player's keepalive silence, retaining the expected output sample count.
+- Crossfading converted 48 kHz stereo and 44.1 kHz mono sources in one mixer format, plus frame-aligned handback of the fixed-format mixer during simulated output recovery.
 
-The validation run for the reviewed audio patch reported **69 tests passed, 5 ignored**. Ignored tests were not run; this count does not imply that all online service integrations or every output device were tested. Release packaging and repository metadata changes require their own final checks.
+The historical validation run for the original reviewed audio patch reported **69 tests passed, 5 ignored**. That count does not describe the updated v0.2.31 integration. Its checks must be rerun on the final merged tree. Ignored tests were not run; synthetic tests do not establish online service, physical-device recovery, or listening acceptance. Release packaging and repository metadata changes require their own final checks.
 
 For a minimal independent reproduction, implement a `Source` that emits the same 55 Hz stereo samples and rate metadata in both runs. In one run return finite 2,048-sample spans; in the other expose the single finite track continuously. Feed both to rodio 0.22.2's `UniformSourceIterator` at 48,000 Hz and compare output lengths and phase after aligning their starts. Repeat with a 48,000 Hz input and output as a pass-through control. Do not make the continuous source infinite: it must end with its track.
 
@@ -57,6 +62,7 @@ A listening comparison should use the same encoded input, output device, normali
 ## References
 
 - [Upstream v0.2.20](https://github.com/grapedjuice/ytm-rs/tree/v0.2.20).
+- [Upstream v0.2.31](https://github.com/grapedjuice/ytm-rs/tree/v0.2.31).
 - [rodio 0.22.2 uniform source iterator](https://docs.rs/crate/rodio/0.22.2/source/src/source/uniform.rs).
 - [rodio 0.22.2 sample-rate converter](https://docs.rs/crate/rodio/0.22.2/source/src/conversions/sample_rate.rs).
 - [rodio resampling issue #584](https://github.com/RustAudio/rodio/issues/584), background discussion rather than proof of every playback problem.

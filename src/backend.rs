@@ -25,42 +25,67 @@ pub enum Req {
     MoreQuickPicks(String),
     Explore(Vec<String>),
     Search(String),
-    Suggest(String),
-    Album(String),
+    /// Suggestions for a query; `round` comes back with them, so stale ones can be dropped.
+    Suggest { query: String, round: u64 },
+    /// Remove a past search (its token) from the account's history.
+    ForgetSearch(String),
+    /// `load` comes back with the album, so an older answer can't replace a newer one.
+    Album { id: String, load: u64 },
     Artist(String),
-    Playlist(String),
+    /// `stream`: send the first page as soon as it's in and the rest as they come,
+    /// rather than all of it at the end.
+    Playlist { id: String, load: u64, stream: bool },
     Library,
     History,
     /// Songs the account uploaded to YouTube Music.
     Uploads,
     /// The signed-in account's name and photo.
     Account,
+    /// The channels the signed-in Google account can act as.
+    Channels,
+    /// Act as another of them from now on: a brand channel's page id, or `None` for the
+    /// account's own channel. `epoch`: the list's, picked from.
+    SwitchChannel { page_id: Option<String>, epoch: u64 },
+    /// The queue another device left off with (YouTube Music's own cross-device queue).
+    ServerQueue,
     /// Upload audio files to the account's library.
     Upload(Vec<PathBuf>),
-    /// Save a song's audio to the downloads folder.
-    Download(Track),
+    /// Save a song's audio to the downloads folder. `for_video`: the music video it's the
+    /// song version of, which then plays it from the file (offline too).
+    Download { track: Track, for_video: Option<String> },
     Lyrics(Track),
-    /// SponsorBlock's parts of a video to skip; `duration` in seconds, if known.
-    Segments { video_id: String, duration: Option<f64> },
+    /// SponsorBlock's parts of a video to skip.
+    Segments { video_id: String },
     /// Romanization and translation for the lyric lines of one source.
     LyricsExtras { video_id: String, source: String, lines: Vec<String>, lang: Option<String>, target: String },
     /// Process cover art for the background; `key` is echoed back.
     Art { key: String, url: String },
-    /// Radio seeded from a track; appended to the queue.
-    Radio(String),
+    /// Radio seeded from a track (`seed`, its id); appended to the queue. `song_of`: the
+    /// track, when it's a music video to play as its song: the song's radio is asked for.
+    Radio { seed: String, song_of: Option<Track> },
     /// Fetch an album/playlist and play it from the start.
-    PlayCollection { target: Target, shuffle: bool },
+    PlayCollection { target: Target },
     /// `at`: start position (non-zero when resuming last session's song). `report`: tell
-    /// YouTube about the play (not when picking up a song already counted).
-    Play { video_id: String, generation: u64, at: std::time::Duration, report: bool },
+    /// YouTube about the play (not when picking up a song already counted). `song_of`:
+    /// the track, when it's a music video to play as its song version if one is found.
+    /// `song`: the song version already playing for the music video `video_id` (picked up
+    /// mid-song): played without a lookup, and the video if it won't.
+    Play { video_id: String, generation: u64, at: std::time::Duration, report: bool, song_of: Option<Track>, song: Option<Track> },
     /// Resolve and download a track ahead of time so skipping to it is instant.
-    Prefetch(String),
+    Prefetch { video_id: String, song_of: Option<Track> },
     Like { video_id: String, like: bool },
+    /// Several likes (or unlikes) one after another, for a selection.
+    LikeMany { video_ids: Vec<String>, like: bool },
     Dislike(String),
-    CreatePlaylist { title: String, video_id: Option<String> },
+    CreatePlaylist { title: String, video_ids: Vec<String> },
     EditPlaylist { id: String, title: String, description: String, privacy: Option<String> },
-    AddToPlaylist { playlist_id: String, video_id: String },
+    AddToPlaylist { playlist_id: String, video_ids: Vec<String> },
+    /// `(videoId, setVideoId)` entries to take out of the playlist.
+    RemoveFromPlaylist { playlist_id: String, items: Vec<(String, String)> },
     DeletePlaylist(String),
+    /// A playlist's collaboration settings and invite link.
+    Collaboration(String),
+    SetCollaboration { info: ytm::Collaboration, change: ytm::CollabChange },
     SaveCollection { id: String, save: bool },
     SetCookie(String),
     Logout,
@@ -73,30 +98,37 @@ impl Req {
             Req::MoreQuickPicks(_) => "Loading more picks",
             Req::Explore(_) => "Loading explore",
             Req::Search(_) => "Search",
-            Req::Suggest(_) => "Suggest",
-            Req::Album(_) => "Loading album",
+            Req::Suggest { .. } => "Suggest",
+            Req::ForgetSearch(_) => "Removing the search",
+            Req::Album { .. } => "Loading album",
             Req::Artist(_) => "Loading artist",
-            Req::Playlist(_) => "Loading playlist",
+            Req::Playlist { .. } => "Loading playlist",
             Req::Library => "Loading library",
             Req::History => "Loading history",
             Req::Uploads => "Loading uploads",
             Req::Account => "Account",
+            Req::Channels => "Channels",
+            Req::SwitchChannel { .. } => "Switching channel",
+            Req::ServerQueue => "Queue from other devices",
             Req::Upload(_) => "Upload",
-            Req::Download(_) => "Download",
+            Req::Download { .. } => "Download",
             Req::Lyrics(_) => "Lyrics",
             Req::Segments { .. } => "SponsorBlock",
             Req::LyricsExtras { .. } => "Translation",
             Req::Art { .. } => "Art",
-            Req::Radio(_) => "Loading radio",
+            Req::Radio { .. } => "Loading radio",
             Req::PlayCollection { .. } => "Playback",
             Req::Play { .. } => "Playback",
-            Req::Prefetch(_) => "Prefetch",
-            Req::Like { .. } => "Like",
+            Req::Prefetch { .. } => "Prefetch",
+            Req::Like { .. } | Req::LikeMany { .. } => "Like",
             Req::Dislike(_) => "Dislike",
             Req::CreatePlaylist { .. } => "Create playlist",
             Req::EditPlaylist { .. } => "Edit playlist",
             Req::AddToPlaylist { .. } => "Add to playlist",
+            Req::RemoveFromPlaylist { .. } => "Remove from playlist",
             Req::DeletePlaylist(_) => "Delete playlist",
+            Req::Collaboration(_) => "Loading collaboration",
+            Req::SetCollaboration { .. } => "Collaboration",
             Req::SaveCollection { .. } => "Save to library",
             Req::SetCookie(_) => "Sign in",
             Req::Logout => "Sign out",
@@ -105,7 +137,7 @@ impl Req {
 
     /// Background requests fail quietly (logged, no toast).
     fn quiet(&self) -> bool {
-        matches!(self, Req::Suggest(_) | Req::Account | Req::Art { .. } | Req::Prefetch(_) | Req::HomeMore(_) | Req::Lyrics(_) | Req::Segments { .. } | Req::LyricsExtras { .. })
+        matches!(self, Req::Suggest { .. } | Req::Account | Req::Channels | Req::ServerQueue | Req::Art { .. } | Req::Prefetch { .. } | Req::HomeMore(_) | Req::Lyrics(_) | Req::Segments { .. } | Req::LyricsExtras { .. })
     }
 }
 
@@ -136,8 +168,37 @@ pub struct Collection {
     pub description: Option<String>,
     pub thumbs: Vec<Thumb>,
     pub tracks: Vec<Track>,
+    /// Each track's playlist entry id (`setVideoId`), for removing it; empty for albums.
+    pub set_ids: Vec<Option<String>>,
+    /// How many songs the playlist's header counts (unplayable ones too, so it can be more
+    /// than `tracks`); kept in step with removals and unlikes made here.
+    pub count: Option<u64>,
     /// The account's own playlist (editable), not one saved from someone else.
     pub owned: bool,
+}
+
+impl Collection {
+    /// The subtitle, with the song count for a playlist.
+    pub fn byline(&self) -> String {
+        match self.count {
+            Some(n) if self.subtitle.is_empty() => format!("{n} songs"),
+            Some(n) => format!("{} • {n} songs", self.subtitle),
+            None => self.subtitle.clone(),
+        }
+    }
+
+    /// Take rows out (sorted indices), and out of the count.
+    pub fn remove_rows(&mut self, rows: &[usize]) {
+        for &i in rows.iter().rev() {
+            if i < self.tracks.len() {
+                self.tracks.remove(i);
+                if i < self.set_ids.len() {
+                    self.set_ids.remove(i);
+                }
+                self.count = self.count.map(|n| n.saturating_sub(1));
+            }
+        }
+    }
 }
 
 pub struct ArtistPage {
@@ -155,9 +216,20 @@ pub struct ArtistPage {
 }
 
 pub struct Library {
-    pub liked: Vec<Track>,
     pub playlists: Vec<Card>,
     pub albums: Vec<Card>,
+    /// That half didn't load (YouTube Music refused it, say): the one shown stays.
+    pub playlists_failed: bool,
+    pub albums_failed: bool,
+}
+
+/// The signed-in account's channels.
+pub struct Channels {
+    pub list: Vec<ytm::Channel>,
+    /// The page id of the one requests go as (`None`: the account's own).
+    pub current: Option<String>,
+    /// [`ytmapi::Api::epoch`] when listed: a switch picked from here applies only then.
+    pub epoch: u64,
 }
 
 pub enum Resp {
@@ -166,13 +238,20 @@ pub enum Resp {
     QuickPicksMore { seed: String, tracks: Vec<Track> },
     Explore(Explore),
     Search(SearchResults),
-    Suggest { query: String, terms: Vec<String> },
-    Collection(Collection),
+    Suggest { query: String, round: u64, terms: Vec<ytm::Suggestion> },
+    /// An album or playlist; `more`: the rest of its songs follow in `CollectionMore`.
+    Collection { load: u64, c: Collection, more: bool },
+    /// The next page of a playlist sent as `Collection` with the same `load`.
+    CollectionMore { id: String, load: u64, tracks: Vec<Track>, set_ids: Vec<Option<String>>, more: bool },
     Artist(ArtistPage),
     Library(Library),
     History(Vec<Track>),
     Uploads(Vec<Track>),
     Account { name: Option<String>, photo: Option<String> },
+    Channels(Channels),
+    /// A `Req::SwitchChannel` is done (requests go as `epoch` now), or `error` says why it isn't.
+    SwitchedChannel { page_id: Option<String>, epoch: u64, error: Option<String> },
+    ServerQueue(ytm::ServerQueue),
     /// Upload finished: how many files went up, and which failed.
     Uploaded { done: usize, failed: Vec<String> },
     Downloaded { title: String, path: PathBuf },
@@ -183,18 +262,168 @@ pub enum Resp {
     LyricsExtras { video_id: String, source: String, target: String, extras: crate::translate::Extras },
     Art { key: String, art: Art },
     Radio { seed: String, tracks: Vec<Track> },
-    PlayQueue { tracks: Vec<Track> },
+    /// What was asked to play (a `Req::PlayCollection`), and its songs.
+    PlayQueue { target: Target, tracks: Vec<Track> },
     Liked { video_id: String, like: bool },
-    PlaylistCreated { id: String, had_song: bool },
-    PlaylistChanged { id: Option<String>, message: &'static str },
+    /// A run of likes or unlikes: `taken` just went through, `done` of `total` tried.
+    LikeProgress { taken: Vec<String>, done: usize, total: usize, like: bool },
+    /// The songs YouTube Music took, and the ones it refused.
+    LikedMany { video_ids: Vec<String>, failed: Vec<String>, like: bool },
+    PlaylistCreated { id: String, songs: usize },
+    PlaylistChanged { id: String, message: &'static str },
+    Collaboration(ytm::Collaboration),
     /// Playback for `generation` failed before reaching the audio engine.
     PlayError { generation: u64, msg: String },
+    /// Play `generation` is the song version of the music video that was asked for
+    /// (`None`: that song wouldn't start, and the music video plays after all).
+    PlayingAs { generation: u64, listed: String, song: Option<Track> },
     LoggedIn(bool),
+    /// A past search left the account's history; the list already shows it gone.
+    SearchForgotten,
     Error(String),
+}
+
+impl Resp {
+    /// An answer that belongs to the signed-in account and channel it was asked as.
+    fn is_account_scoped(&self) -> bool {
+        matches!(
+            self,
+            Resp::Home(_)
+                | Resp::HomeMore(_)
+                | Resp::QuickPicksMore { .. }
+                | Resp::Suggest { .. }
+                | Resp::Library(_)
+                | Resp::History(_)
+                | Resp::Uploads(_)
+                | Resp::Account { .. }
+                | Resp::Channels(_)
+                | Resp::ServerQueue(_)
+                | Resp::Liked { .. }
+                | Resp::LikeProgress { .. }
+                | Resp::LikedMany { .. }
+        )
+    }
+
+    /// An album or playlist load that ends without more songs: also sent when it fails,
+    /// so the page stops waiting for it.
+    fn ended(id: String, load: u64) -> Self {
+        Resp::CollectionMore { id, load, tracks: Vec::new(), set_ids: Vec::new(), more: false }
+    }
+}
+
+/// Likes and unlikes go one after another, this far apart. YouTube Music answers faster
+/// ones as taken and then drops many: on a test account 9 of 20 unlikes sent back to back
+/// stayed liked, against 1 of 20 sent 400 ms apart; on a limited account 576 of 1,296
+/// likes sent back to back were dropped, and liking those again took as long as pacing.
+pub const LIKE_GAP: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// One run of many likes at a time (a selection here, or a Spotify transfer): run side by
+/// side, one undoes the other (a transfer skips songs as liked that an unlike run then
+/// takes out).
+pub static LIKES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// How long one like or unlike may take. Taken ones answer in about a quarter second;
+/// ones YouTube Music refuses while it limits the account are held 8–9 s before the 403
+/// (two of ten unlikes cost 17 of 27 s; in a transfer one like in six or so hangs).
+/// Sending it again is harmless (liking a liked song changes nothing) and usually goes
+/// straight through.
+pub const LIKE_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Like or unlike one song; whether YouTube Music took it. Refusals are retried by the
+/// API (after its shared pause while the account is limited); one that hangs or fails is
+/// sent again, up to three times in all.
+async fn like_one(api: &ytmapi::Api, id: &str, like: bool) -> bool {
+    for tries in 0..3 {
+        match tokio::time::timeout(LIKE_WAIT, ytm::set_like(api, id, like)).await {
+            Ok(Ok(())) => return true,
+            Ok(Err(e)) => log::debug!("like={like} {id}: {e:#}"),
+            // Not refused yet: again right away.
+            Err(_) => {
+                log::debug!("like={like} {id}: no answer in {LIKE_WAIT:?}; sending it again");
+                continue;
+            }
+        }
+        if tries < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+    false
+}
+
+/// Like or unlike a selection, one at a time (paced, see `LIKE_GAP`), then check
+/// Liked Music and try again what didn't take. `progress(taken, tried)` after each song.
+/// Returns the ones taken and the ones refused; unlikes still listed once checking stops
+/// getting anywhere count as refused, likes don't (songs that can't be played are liked but not listed).
+/// One run at a time, transfers included (`LIKES`); `progress(None, 0)` while waiting its turn.
+pub async fn like_many(api: &ytmapi::Api, ids: Vec<String>, like: bool, mut progress: impl FnMut(Option<&str>, usize)) -> (Vec<String>, Vec<String>) {
+    let epoch = api.epoch();
+    let _turn = match LIKES.try_lock() {
+        Ok(turn) => turn,
+        Err(_) => {
+            progress(None, 0);
+            LIKES.lock().await
+        }
+    };
+    // A channel switch went first: these were picked in the other channel's lists.
+    if api.epoch() != epoch {
+        log::info!("likes: {} not sent, the account or channel changed while they waited", ids.len());
+        return (Vec::new(), ids);
+    }
+    let total = ids.len();
+    let mut failed = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        let taken = like_one(api, id, like).await;
+        if !taken {
+            failed.push(id.clone());
+        }
+        progress(taken.then_some(id.as_str()), i + 1);
+        tokio::time::sleep(LIKE_GAP).await;
+    }
+    // Check and try again while it gets anywhere: a throttled account takes a few rounds.
+    let (mut before, mut stuck) = (usize::MAX, 0);
+    for round in 0..10 {
+        if total < 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let listed: std::collections::HashSet<String> = match ytm::playlist(api, "LM", true, None).await {
+            Ok(lm) => lm.tracks.into_iter().map(|t| t.id).collect(),
+            Err(e) => {
+                log::warn!("checking likes: {e:#}");
+                break;
+            }
+        };
+        let left: Vec<String> = ids.iter().filter(|id| listed.contains(*id) != like && !failed.contains(*id)).cloned().collect();
+        log::debug!("like={like} check {round}: Liked Music lists {}, {} of {total} not taken yet", listed.len(), left.len());
+        if left.is_empty() {
+            break;
+        }
+        stuck = if left.len() < before { 0 } else { stuck + 1 };
+        before = left.len();
+        if stuck == 2 || round == 9 {
+            if !like {
+                failed.extend(left);
+            }
+            break;
+        }
+        // The second go is paced either way.
+        for id in &left {
+            like_one(api, id, like).await;
+            tokio::time::sleep(LIKE_GAP).await;
+        }
+    }
+    let done: Vec<String> = ids.into_iter().filter(|id| !failed.contains(id)).collect();
+    (done, failed)
 }
 
 /// A video id and its stream buffer.
 type StreamSlot = Arc<std::sync::Mutex<Option<(String, Arc<Shared>)>>>;
+type SongCell = Arc<tokio::sync::OnceCell<Option<Track>>>;
+
+/// How long a play waits for a music video's song version before playing the video.
+const PLAY_SONG_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
+/// A prefetch has until the song before it ends.
+const PREFETCH_SONG_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[derive(Clone)]
 pub struct Backend {
@@ -218,6 +447,10 @@ pub struct Backend {
     /// High quality: with Premium, every song goes through the signed-in web player
     /// for its 256 kbps stream instead of the anonymous 128 kbps one.
     hq: Arc<std::sync::atomic::AtomicBool>,
+    /// Song versions of music videos looked up this session (`None`: there's none), by
+    /// video and whether the account has Premium (which gets YouTube's own pairs). One
+    /// cell each, so a prefetch and the play of the same video share a lookup.
+    songs: Arc<std::sync::Mutex<std::collections::HashMap<String, SongCell>>>,
 }
 
 impl Backend {
@@ -244,7 +477,92 @@ impl Backend {
         {
             log::warn!("proxy relay: {e:#}");
         }
-        Ok(Self { rt: Arc::new(rt), api, tx, audio, wake, prefetched: Default::default(), current: Default::default(), data_dir, lyrics, translate, jsc, premium: Arc::new(tokio::sync::Mutex::new(Err(None))), hq: Default::default() })
+        let backend = Self { rt: Arc::new(rt), api, tx, audio, wake, prefetched: Default::default(), current: Default::default(), data_dir, lyrics, translate, jsc, premium: Arc::new(tokio::sync::Mutex::new(Err(None))), hq: Default::default(), songs: Default::default() };
+        backend.keep_signed_in();
+        Ok(backend)
+    }
+
+    /// Refresh the session's cookies every few minutes, as an open YouTube tab does:
+    /// Google signs out a copy that stops taking new ones.
+    fn keep_signed_in(&self) {
+        const EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+        let this = self.clone();
+        self.rt.spawn(async move {
+            loop {
+                if this.api.account().is_some() {
+                    this.api.ensure_visitor().await;
+                    match this.api.rotate().await {
+                        Ok(()) => log::debug!("session cookies refreshed"),
+                        Err(e) if e.is::<webmusic::Revoked>() => this.check_session().await,
+                        Err(e) => log::info!("refreshing session cookies failed: {e:#}"),
+                    }
+                }
+                tokio::time::sleep(EVERY).await;
+            }
+        });
+    }
+
+    /// Something suggested Google signed the session out. When YouTube confirms it no
+    /// longer knows the session, sign out here too and say so, rather than every
+    /// signed-in page failing on its own.
+    async fn check_session(&self) {
+        // Several requests answered at once ask together; one check is enough.
+        static CHECKING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _one = CHECKING.lock().await;
+        if self.api.account().is_none() {
+            return;
+        }
+        // Signing out deletes the session, so only once youtube.com shows it signed out
+        // twice, a minute apart (each after a rotation, which can bring it back). One
+        // signed-out answer can be a hiccup (throttling, a consent or "unusual traffic"
+        // page), and a refused rotation alone isn't proof either: the clients whose
+        // sessions last never sign out on their own.
+        for attempt in 0..2 {
+            if let Err(e) = self.api.rotate().await {
+                log::info!("rotating cookies while checking the session: {e:#}");
+            }
+            let Some(account) = self.api.account() else { return };
+            match self.api.session_from_cookie(&account.cookie).await {
+                Ok(_) => return,
+                Err(e) if e.is::<ytmapi::NotSignedIn>() => {
+                    log::warn!("signed-in session looks signed out ({}): {e:#}", if attempt == 0 { "checking again in a minute" } else { "twice" });
+                    if attempt == 0 {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
+                }
+                // Offline, throttled or similar: nothing learned.
+                Err(e) => {
+                    log::info!("couldn't check the session: {e:#}");
+                    return;
+                }
+            }
+        }
+        log::warn!("signed-in session no longer valid");
+        self.forget_session().await;
+        let _ = self.tx.send(Resp::LoggedIn(false));
+        let _ = self.tx.send(Resp::Error("Your YouTube sign-in expired. Sign in again to get your library back".into()));
+        self.wake();
+    }
+
+    /// Act as another of the account's channels. Not while likes of a selection or a
+    /// transfer are running: they'd go on as the new channel.
+    async fn switch_channel(&self, page_id: Option<String>, epoch: u64) -> anyhow::Result<u64> {
+        let _likes = LIKES.try_lock().map_err(|_| anyhow::anyhow!("Wait until the likes going through are done"))?;
+        // A Premium check running now is for the old channel: let it finish, then forget it.
+        let mut premium = self.premium.lock().await;
+        let epoch = self.api.switch_channel(page_id, epoch)?;
+        *premium = Err(None);
+        drop(premium);
+        self.warm_signed_in();
+        log::info!("switched channel");
+        Ok(epoch)
+    }
+
+    async fn forget_session(&self) {
+        self.api.sign_out();
+        *self.premium.lock().await = Err(None);
+        let profile = self.login_profile();
+        let _ = tokio::task::spawn_blocking(move || crate::login::forget(&profile)).await;
     }
 
     pub fn api(&self) -> Arc<ytmapi::Api> {
@@ -270,8 +588,13 @@ impl Backend {
             Req::Play { generation, .. } => Some(*generation),
             _ => None,
         };
+        let collection = match &req {
+            Req::Album { id, load } | Req::Playlist { id, load, .. } => Some((id.clone(), *load)),
+            _ => None,
+        };
         let this = self.clone();
         let t0 = std::time::Instant::now();
+        let epoch = self.api.epoch();
         let task = self.rt.spawn(async move {
             let r = this.handle(req).await;
             log::debug!("{what}: done in {:?}", t0.elapsed());
@@ -292,9 +615,26 @@ impl Backend {
                 }
                 Err(_) => None,
             };
+            // An album or playlist load that failed ends too, so its page stops waiting.
+            if let Some((id, load)) = collection
+                && !matches!(resp, Some(Resp::Collection { .. } | Resp::CollectionMore { .. }))
+            {
+                let _ = this.tx.send(Resp::ended(id, load));
+            }
+            // Asked as another sign-in or channel than the one now used: it isn't this one's.
+            let resp = resp.filter(|r| {
+                let stale = this.api.epoch() != epoch && r.is_account_scoped();
+                if stale {
+                    log::debug!("{what}: answer for the previous account or channel dropped");
+                }
+                !stale
+            });
             if let Some(resp) = resp {
                 let _ = this.tx.send(resp);
                 this.wake();
+            }
+            if this.api.take_signed_out() {
+                this.check_session().await;
             }
         });
     }
@@ -312,86 +652,50 @@ impl Backend {
                     let tracks = ytm::radio(api, &seed, me, 0).await?;
                     Resp::QuickPicksMore { seed, tracks }
                 }
-                Req::Explore(preferred_artists) => {
-                    let (charts, new) = tokio::join!(ytm::charts(api), ytm::new_albums(api, me));
-                    let charts = charts?;
-                    Resp::Explore(Explore {
-                        new_albums: popular_new_albums(&new.unwrap_or_default(), &charts.artists, &preferred_artists),
-                        charts: charts.playlists,
-                        top: charts.top,
-                    })
+                Req::Explore(preferred_artists) => self.explore(&preferred_artists, me).await?,
+                Req::Search(query) => self.search(query, me).await?,
+                Req::Suggest { query, round } => {
+                    let terms = ytm::suggestions(api, &query, me).await?.into_iter().take(8).collect();
+                    Resp::Suggest { query, round, terms }
                 }
-                Req::Search(query) => {
-                    let (t, al, ar, pl) = tokio::join!(
-                        ytm::search_songs(api, &query),
-                        ytm::search_cards(api, &query, ytm::Filter::Albums),
-                        ytm::search_cards(api, &query, ytm::Filter::Artists),
-                        ytm::search_cards(api, &query, ytm::Filter::Playlists),
-                    );
-                    Resp::Search(SearchResults {
-                        tracks: t?,
-                        albums: al.unwrap_or_default(),
-                        artists: ar.unwrap_or_default(),
-                        playlists: pl.unwrap_or_default(),
-                        query,
-                    })
+                Req::ForgetSearch(token) => {
+                    ytm::forget_search(api, &token).await?;
+                    Resp::SearchForgotten
                 }
-                Req::Suggest(query) => {
-                    let terms = ytm::suggestions(api, &query).await?.into_iter().take(8).collect();
-                    Resp::Suggest { query, terms }
-                }
-                Req::Album(id) => Resp::Collection(ytm::album(api, &id).await?),
-                Req::Playlist(id) => Resp::Collection(ytm::playlist(api, &id, me, 500).await?),
+                Req::Album { id, load } => Resp::Collection { load, c: ytm::album(api, &id).await?, more: false },
+                Req::Playlist { id, load, stream: false } => Resp::Collection { load, c: ytm::playlist(api, &id, me, None).await?, more: false },
+                Req::Playlist { id, load, stream: true } => self.stream_playlist(id, load, me).await?,
                 Req::Artist(id) => Resp::Artist(ytm::artist(api, &id).await?),
-                Req::Library => {
-                    let (liked, pls, albums) =
-                        tokio::join!(ytm::playlist(api, "LM", true, 1000), ytm::saved_playlists(api), ytm::saved_albums(api));
-                    Resp::Library(Library {
-                        liked: liked?.tracks,
-                        playlists: pls.map(|p| p.into_iter().filter(saved_playlist_visible).collect()).unwrap_or_default(),
-                        albums: albums.unwrap_or_default(),
-                    })
-                }
+                Req::Library => self.library().await?,
                 Req::History => Resp::History(ytm::history(api).await?),
                 Req::Uploads => Resp::Uploads(ytm::uploads(api).await?),
                 Req::Account => {
                     let (name, photo) = ytm::account(api).await?;
                     Resp::Account { name, photo }
                 }
-                Req::Upload(files) => {
-                    let session = api.account().ok_or_else(|| anyhow::anyhow!("sign in to upload music"))?;
-                    let (mut done, mut failed) = (0, Vec::new());
-                    for f in &files {
-                        let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        match session.upload(&self.http(), f).await {
-                            Ok(()) => done += 1,
-                            Err(e) => {
-                                log::warn!("upload {name}: {e:#}");
-                                failed.push(name);
-                            }
-                        }
-                    }
-                    if done > 0 {
-                        // YouTube Music needs a little while to process new uploads.
-                        let this = self.clone();
-                        self.rt.spawn(async move {
-                            for wait in [20, 40, 60] {
-                                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                                if let Ok(t) = ytm::uploads(&this.api).await {
-                                    let _ = this.tx.send(Resp::Uploads(t));
-                                    this.wake();
-                                }
-                            }
-                        });
-                    }
-                    Resp::Uploaded { done, failed }
+                Req::Channels => {
+                    let epoch = api.epoch();
+                    let list = ytm::channels(api).await?;
+                    Resp::Channels(Channels { list, current: api.account().and_then(|a| a.channel().map(str::to_owned)), epoch })
                 }
+                Req::SwitchChannel { page_id, epoch } => match self.switch_channel(page_id.clone(), epoch).await {
+                    Ok(epoch) => Resp::SwitchedChannel { page_id, epoch, error: None },
+                    Err(e) => {
+                        log::warn!("switching channel failed: {e:#}");
+                        Resp::SwitchedChannel { page_id, epoch, error: Some(e.to_string()) }
+                    }
+                },
+                Req::ServerQueue => match ytm::server_queue(api).await? {
+                    Some(q) => Resp::ServerQueue(q),
+                    None => return Ok(None),
+                },
+                Req::Upload(files) => self.upload(&files).await?,
                 Req::Lyrics(track) => {
                     let video_id = track.id.clone();
                     Resp::Lyrics { lyrics: self.lyrics_for(&track).await, video_id }
                 }
-                Req::Segments { video_id, duration } => {
-                    let segments = crate::sponsorblock::segments(&self.http(), &video_id, duration).await?;
+                Req::Segments { video_id } => {
+                    let segments = crate::sponsorblock::segments(&self.http(), &video_id).await?;
                     Resp::Segments { video_id, segments }
                 }
                 Req::LyricsExtras { video_id, source, lines, lang, target } => {
@@ -406,77 +710,78 @@ impl Backend {
                     let art = tokio::task::spawn_blocking(move || crate::art::process(&bytes)).await??;
                     Resp::Art { key, art }
                 }
-                Req::Radio(seed) => {
-                    let tracks = ytm::radio(api, &seed, false, 50).await?;
+                Req::Radio { seed, song_of } => {
+                    // A music video's radio is music videos; its song's is songs, as from the
+                    // song itself. The lookup is shared with its play's (one per video).
+                    let song = self.song_version(&seed, song_of.as_ref(), PREFETCH_SONG_WAIT).await;
+                    let from = song.as_ref().map_or(&seed, |s| &s.id);
+                    let mut tracks = ytm::radio(api, from, false, 50).await?;
+                    // The radio starts with its seed, which is playing already.
+                    tracks.retain(|t| t.id != *from);
                     Resp::Radio { seed, tracks }
                 }
-                Req::PlayCollection { target, shuffle } => {
-                    let mut tracks = match target {
-                        Target::Album(id) => ytm::album(api, &id).await?.tracks,
-                        Target::Playlist(id) => ytm::playlist(api, &id, me, 500).await?.tracks,
-                        Target::Artist(id) => ytm::artist(api, &id).await?.top,
-                        Target::Song(t) => vec![t],
+                Req::PlayCollection { target } => {
+                    let tracks = match &target {
+                        Target::Album(id) => ytm::album(api, id).await?.tracks,
+                        Target::Playlist(id) => ytm::playlist(api, id, me, None).await?.tracks,
+                        Target::Artist(id) => ytm::artist(api, id).await?.top,
+                        Target::Song(t) => vec![t.clone()],
                     };
-                    if shuffle {
-                        crate::ui::shuffle(&mut tracks);
-                    }
-                    Resp::PlayQueue { tracks }
+                    Resp::PlayQueue { target, tracks }
                 }
-                Req::Download(t) => {
-                    let path = self.download(&t).await?;
+                Req::Download { track: t, for_video } => {
+                    let path = self.download(&t, for_video).await?;
                     Resp::Downloaded { title: t.title, path }
                 }
-                Req::Play { video_id, generation, at, report } => match self.start_playback(&video_id, generation, at, report).await {
+                Req::Play { video_id, generation, at, report, song_of, song } => match self.start_playback(&video_id, song_of.as_ref(), song, generation, at, report).await {
                     Ok(()) => return Ok(None),
                     Err(e) => Resp::PlayError { generation, msg: format!("{e:#}") },
                 },
-                Req::Prefetch(video_id) => {
-                    // Let the playing song finish downloading first: it gets the whole
-                    // bandwidth, and a skip in the meantime makes this prefetch moot.
-                    let generation = self.audio.status.wanted_gen.load(Ordering::Relaxed);
-                    let playing = self.current.lock().unwrap().as_ref().map(|(_, s)| s.clone());
-                    if let Some(s) = playing {
-                        s.finished().await;
-                    }
-                    if self.audio.status.wanted_gen.load(Ordering::Relaxed) != generation
-                        || self.prefetched.lock().unwrap().as_ref().is_some_and(|(id, _)| *id == video_id)
-                    {
-                        return Ok(None);
-                    }
-                    log::debug!("prefetch {video_id}");
-                    let shared = self.open_stream(&video_id, true).await?;
-                    if let Some((_, old)) = self.prefetched.lock().unwrap().replace((video_id, shared)) {
-                        old.cancel();
-                    }
+                Req::Prefetch { video_id, song_of } => {
+                    self.prefetch(video_id, song_of).await?;
                     return Ok(None);
                 }
                 Req::Like { video_id, like } => {
                     ytm::set_like(api, &video_id, like).await?;
                     Resp::Liked { video_id, like }
                 }
+                Req::LikeMany { video_ids, like } => self.like_many(video_ids, like).await?,
                 Req::Dislike(video_id) => {
                     ytm::dislike(api, &video_id).await?;
                     Resp::Liked { video_id, like: false }
                 }
-                Req::CreatePlaylist { title, video_id } => {
-                    let id = ytm::create_playlist(api, &title, video_id.as_deref()).await?;
-                    Resp::PlaylistCreated { id, had_song: video_id.is_some() }
+                Req::CreatePlaylist { title, video_ids } => {
+                    let id = match video_ids.as_slice() {
+                        [] => ytm::create_playlist(api, &title, None).await?,
+                        [one] => ytm::create_playlist(api, &title, Some(one)).await?,
+                        many => ytm::create_playlist_with(api, &title, many).await?,
+                    };
+                    Resp::PlaylistCreated { id, songs: video_ids.len() }
                 }
                 Req::EditPlaylist { id, title, description, privacy } => {
                     ytm::edit_playlist(api, &id, &title, &description, privacy.as_deref()).await?;
-                    Resp::PlaylistChanged { id: Some(id), message: "Playlist updated" }
+                    Resp::PlaylistChanged { id, message: "Playlist updated" }
                 }
-                Req::AddToPlaylist { playlist_id, video_id } => {
-                    ytm::add_to_playlist(api, &playlist_id, &video_id).await?;
-                    Resp::PlaylistChanged { id: Some(playlist_id), message: "Added to playlist" }
+                Req::AddToPlaylist { playlist_id, video_ids } => {
+                    ytm::add_videos(api, &playlist_id, &video_ids).await?;
+                    Resp::PlaylistChanged { id: playlist_id, message: "Added to playlist" }
+                }
+                Req::RemoveFromPlaylist { playlist_id, items } => {
+                    ytm::remove_videos(api, &playlist_id, &items).await?;
+                    Resp::PlaylistChanged { id: playlist_id, message: "Removed from playlist" }
                 }
                 Req::DeletePlaylist(id) => {
                     ytm::delete_playlist(api, &id).await?;
-                    Resp::PlaylistChanged { id: None, message: "Playlist deleted" }
+                    Resp::PlaylistChanged { id, message: "Playlist deleted" }
+                }
+                Req::Collaboration(id) => Resp::Collaboration(ytm::collaboration(api, &id).await?),
+                Req::SetCollaboration { info, change } => {
+                    ytm::set_collaboration(api, &info, change).await?;
+                    Resp::Collaboration(ytm::collaboration(api, &info.playlist_id).await?)
                 }
                 Req::SaveCollection { id, save } => {
                     ytm::save_collection(api, &id, save).await?;
-                    Resp::PlaylistChanged { id: Some(id), message: if save { "Saved to library" } else { "Removed from library" } }
+                    Resp::PlaylistChanged { id, message: if save { "Saved to library" } else { "Removed from library" } }
                 }
                 Req::SetCookie(input) => {
                     self.set_cookie(&input).await?;
@@ -486,10 +791,7 @@ impl Backend {
                     Resp::LoggedIn(true)
                 }
                 Req::Logout => {
-                    webmusic::Session::remove(&self.data_dir);
-                    api.set_account(None);
-                    *self.premium.lock().await = Err(None);
-                    crate::login::forget(&self.login_profile());
+                    self.forget_session().await;
                     Resp::LoggedIn(false)
                 }
             }))
@@ -499,6 +801,120 @@ impl Backend {
             log::warn!("{what} failed: {e:#}");
             (!quiet).then(|| Resp::Error(format!("{what} failed: {e}")))
         })
+    }
+
+    /// Explore: the charts, and new albums by charting artists or the listener's own.
+    async fn explore(&self, preferred_artists: &[String], me: bool) -> anyhow::Result<Resp> {
+        let api = &*self.api;
+        let (charts, new) = tokio::join!(ytm::charts(api), ytm::new_albums(api, me));
+        let charts = charts?;
+        Ok(Resp::Explore(Explore {
+            new_albums: popular_new_albums(&new.unwrap_or_default(), &charts.artists, preferred_artists),
+            charts: charts.playlists,
+            top: charts.top,
+        }))
+    }
+
+    /// Songs, albums, artists and playlists for a search, asked at once. Only the songs
+    /// must arrive.
+    async fn search(&self, query: String, me: bool) -> anyhow::Result<Resp> {
+        let api = &*self.api;
+        let (t, al, ar, pl) = tokio::join!(
+            ytm::search_songs(api, &query, me),
+            ytm::search_cards(api, &query, ytm::Filter::Albums, me),
+            ytm::search_cards(api, &query, ytm::Filter::Artists, me),
+            ytm::search_cards(api, &query, ytm::Filter::Playlists, me),
+        );
+        Ok(Resp::Search(SearchResults {
+            tracks: t?,
+            albums: al.unwrap_or_default(),
+            artists: ar.unwrap_or_default(),
+            playlists: pl.unwrap_or_default(),
+            query,
+        }))
+    }
+
+    /// Saved playlists and albums.
+    async fn library(&self) -> anyhow::Result<Resp> {
+        let api = &*self.api;
+        // Liked songs are Liked Music, loaded like any playlist. Each half shows
+        // without the other; it only fails when both do.
+        let (pls, albums) = tokio::join!(ytm::saved_playlists(api), ytm::saved_albums(api));
+        let pls = match (pls, &albums) {
+            (Err(e), Err(_)) => return Err(e),
+            (pls, _) => pls,
+        };
+        if let Err(e) = &pls {
+            log::warn!("saved playlists didn't load: {e:#}");
+        }
+        if let Err(e) = &albums {
+            log::warn!("saved albums didn't load: {e:#}");
+        }
+        Ok(Resp::Library(Library {
+            playlists_failed: pls.is_err(),
+            albums_failed: albums.is_err(),
+            playlists: pls.map(|p| p.into_iter().filter(saved_playlist_visible).collect()).unwrap_or_default(),
+            albums: albums.unwrap_or_default(),
+        }))
+    }
+
+    /// Upload songs, then refresh the uploads while YouTube Music processes them.
+    async fn upload(&self, files: &[PathBuf]) -> anyhow::Result<Resp> {
+        let api = &*self.api;
+        let session = api.account().ok_or_else(|| anyhow::anyhow!("sign in to upload music"))?;
+        let (mut done, mut failed) = (0, Vec::new());
+        for f in files {
+            let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match session.upload(&self.http(), f).await {
+                Ok(()) => done += 1,
+                Err(e) => {
+                    log::warn!("upload {name}: {e:#}");
+                    failed.push(name);
+                }
+            }
+        }
+        if done > 0 {
+            // YouTube Music needs a little while to process new uploads.
+            let this = self.clone();
+            self.rt.spawn(async move {
+                for wait in [20, 40, 60] {
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    if let Ok(t) = ytm::uploads(&this.api).await {
+                        let _ = this.tx.send(Resp::Uploads(t));
+                        this.wake();
+                    }
+                }
+            });
+        }
+        Ok(Resp::Uploaded { done, failed })
+    }
+
+    /// Open the next song's stream ahead of time, once the playing one has downloaded.
+    /// `song_of`: the music video it stands for, whose song version is what will play.
+    async fn prefetch(&self, video_id: String, song_of: Option<Track>) -> anyhow::Result<()> {
+        // For the play it was asked during: a skip in the meantime makes it moot.
+        let generation = self.audio.status.wanted_gen.load(Ordering::Relaxed);
+        // Looked up now, so the play doesn't wait for it.
+        let video_id = match self.song_version(&video_id, song_of.as_ref(), PREFETCH_SONG_WAIT).await {
+            Some(song) => song.id,
+            None => video_id,
+        };
+        // Let the playing song finish downloading first: it gets the whole bandwidth.
+        let playing = self.current.lock().unwrap().as_ref().map(|(_, s)| s.clone());
+        if let Some(s) = playing {
+            s.finished().await;
+        }
+        if self.audio.status.wanted_gen.load(Ordering::Relaxed) != generation
+            || self.prefetched.lock().unwrap().as_ref().is_some_and(|(id, _)| *id == video_id)
+        {
+            return Ok(());
+        }
+        log::debug!("prefetch {video_id}");
+        let shared = self.open_stream(&video_id, true).await?;
+        if let Some((_, old)) = self.prefetched.lock().unwrap().replace((video_id, shared)) {
+            old.cancel();
+        }
+        Ok(())
     }
 
     async fn lyrics_for(&self, t: &Track) -> LyricsSet {
@@ -550,15 +966,31 @@ impl Backend {
             let names: Vec<&str> = cookie.split(';').filter_map(|kv| kv.trim().split('=').next()).take(40).collect();
             log::warn!("cookie sign-in rejected: {e:#}; cookie names: {names:?}");
         })?;
-        session.save(&self.data_dir);
-        self.api.set_account(Some(session));
+        self.api.sign_in(session);
+        // The sign-in window's copy of the session would go stale as the app takes new
+        // cookies, and opening it again would show Google the old ones, which it treats
+        // as stolen and signs the session out. Keep only the app's copy.
+        let profile = self.login_profile();
+        let _ = tokio::task::spawn_blocking(move || crate::login::forget(&profile)).await;
         Ok(())
     }
 
-    async fn start_playback(&self, video_id: &str, generation: u64, at: std::time::Duration, report: bool) -> anyhow::Result<()> {
+    async fn start_playback(&self, listed: &str, song_of: Option<&Track>, carried: Option<Track>, generation: u64, at: std::time::Duration, report: bool) -> anyhow::Result<()> {
         let t0 = std::time::Instant::now();
+        // A music video plays as its song when one is found in time (or goes on as the
+        // one it was). From here on, everything (prefetch, replay, history) goes by what
+        // actually plays.
+        let was_carried = carried.is_some();
+        let mut song = match carried {
+            Some(song) => Some(song),
+            None => self.song_version(listed, song_of, PLAY_SONG_WAIT).await,
+        };
+        if self.audio.status.wanted_gen.load(Ordering::Relaxed) != generation {
+            return Ok(());
+        }
+        let mut video_id = song.as_ref().map_or(listed, |s| s.id.as_str()).to_owned();
         let prefetched = self.prefetched.lock().unwrap().take();
-        let replay = self.current.lock().unwrap().take().filter(|(id, s)| id == video_id && s.is_complete()).map(|(_, s)| s);
+        let replay = self.current.lock().unwrap().take().filter(|(id, s)| *id == video_id && s.is_complete()).map(|(_, s)| s);
         let ready = match prefetched {
             Some((id, s)) if id == video_id => Some(s),
             // Replaying the current song keeps the next one's prefetch.
@@ -583,9 +1015,33 @@ impl Backend {
                 if self.audio.status.wanted_gen.load(Ordering::Relaxed) != generation {
                     return Ok(());
                 }
-                self.open_stream(video_id, false).await?
+                match self.open_stream(&video_id, false).await {
+                    Ok(s) => s,
+                    // The song won't play: the music video still does.
+                    Err(e) if song.is_some() => {
+                        log::warn!("{listed}'s song {video_id} won't play ({e:#}); playing the music video");
+                        (song, video_id) = (None, listed.to_owned());
+                        // The UI took the song as playing already.
+                        if was_carried {
+                            let _ = self.tx.send(Resp::PlayingAs { generation, listed: listed.to_owned(), song: None });
+                        }
+                        self.open_stream(listed, false).await?
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         };
+        // If the song's audio won't start after all, the music video plays instead.
+        let fallback = song.is_some().then(|| (self.clone(), listed.to_owned(), report));
+        if let Some(song) = song {
+            log::info!("play {listed} as its song {video_id}");
+            // Carried over, the UI has it already.
+            if !was_carried {
+                let _ = self.tx.send(Resp::PlayingAs { generation, listed: listed.to_owned(), song: Some(song) });
+                (self.wake)();
+            }
+        }
+        let video_id = video_id.as_str();
         *self.current.lock().unwrap() = Some((video_id.to_owned(), shared.clone()));
         log::debug!("play {video_id} (gen {generation}): stream open in {:?}", t0.elapsed());
         if self.audio.status.wanted_gen.load(Ordering::Relaxed) != generation {
@@ -615,51 +1071,200 @@ impl Backend {
                 audio.send(AudioCmd::Start { generation, decoder, shared: shared2, at });
                 // Skipped past before it started: that one doesn't count.
                 if let Some((this, id)) = report.filter(|_| audio.status.wanted_gen.load(Ordering::Relaxed) == generation) {
-                    this.rt.spawn(async move {
+                    let rt = this.rt.clone();
+                    rt.spawn(async move {
                         match ytm::report_play(&this.api, &id).await {
-                            Ok(()) => log::debug!("reported play of {id}"),
+                            Ok(w) => {
+                                log::debug!("reported play of {id}");
+                                this.report_watchtime(&id, generation, w).await;
+                            }
                             Err(e) => log::warn!("couldn't report play of {id}: {e:#}"),
                         }
                     });
                 }
             }
-            Err(e) => {
-                let _ = tx.send(Resp::PlayError { generation, msg: format!("decode: {e}") });
-                wake();
-            }
+            Err(e) => match fallback {
+                Some((this, listed, report)) => {
+                    log::warn!("{listed}'s song won't start ({e}); playing the music video");
+                    let _ = tx.send(Resp::PlayingAs { generation, listed: listed.clone(), song: None });
+                    this.request(Req::Play { video_id: listed, generation, at, report, song_of: None, song: None });
+                    wake();
+                }
+                None => {
+                    let _ = tx.send(Resp::PlayError { generation, msg: format!("decode: {e}") });
+                    wake();
+                }
+            },
         });
         Ok(())
+    }
+
+    /// Report how much of play `generation` is heard, on the web player's schedule
+    /// (10, 20 and 30 s in, then every 40 s), with a last report once it ends or is left.
+    /// Each covers the stretch played since the one before; time paused doesn't count.
+    async fn report_watchtime(&self, id: &str, generation: u64, w: ytm::Watchtime) {
+        // Reported as the sign-in and channel that started it, or not at all.
+        let epoch = self.api.epoch();
+        let status = &self.audio.status;
+        let started = std::time::Instant::now();
+        let mut flush = w.flush_at.iter().copied();
+        let mut due = flush.next().unwrap_or(w.flush_every);
+        // The stretch not yet reported, and where the song was at the last check.
+        let pos = || status.position().as_secs_f64();
+        let (mut from, mut at) = (pos(), pos());
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let gone = status.wanted_gen.load(Ordering::Relaxed) != generation;
+            if !gone {
+                let now = pos();
+                // A seek starts a new stretch.
+                if now < at || now > at + 5.0 {
+                    from = now;
+                }
+                at = now;
+            }
+            let elapsed = started.elapsed().as_secs();
+            if !gone && elapsed < due {
+                continue;
+            }
+            if self.api.epoch() != epoch {
+                log::debug!("stopped reporting listening time of {id}: the account or channel changed");
+                return;
+            }
+            if at > from || gone {
+                if let Err(e) = ytm::report_watchtime(&self.api, &w, from, at, started.elapsed().as_secs_f64(), gone).await {
+                    log::warn!("couldn't report listening time of {id}: {e:#}");
+                }
+                from = at;
+            }
+            if gone {
+                log::debug!("reported listening time of {id}");
+                return;
+            }
+            due = flush.next().unwrap_or(due + w.flush_every);
+        }
     }
 
     /// Resolve a stream URL and start downloading it into a new buffer (just its start,
     /// for a prefetch, until playback opens it).
     /// A downloaded song opens from its file.
+    /// The song version of the music video `listed`, when `song_of` asks for one: from
+    /// this session's lookups, YouTube's own pair (Premium), or a sure signed-out search
+    /// match. `None` when there's none, it isn't found within `wait`, or the music video
+    /// is downloaded (that file plays, offline too). A failed lookup isn't remembered,
+    /// so the next play tries again.
+    async fn song_version(&self, listed: &str, song_of: Option<&Track>, wait: std::time::Duration) -> Option<Track> {
+        let video = song_of.filter(|t| t.id == listed && t.music_video)?;
+        if crate::downloads::path(listed).is_some() {
+            return None;
+        }
+        // Its song version downloaded from Now playing: from the file, no lookup (offline too).
+        if let Some(song) = crate::downloads::song_for(listed) {
+            return Some(song);
+        }
+        let start = std::time::Instant::now();
+        // Premium gets YouTube's own pair; a search needs the video's length to be sure.
+        // The check counts toward the wait (the first one after launch asks YouTube): not
+        // back in time, this lookup searches. It finishes anyway, for the next song.
+        let premium = match self.api.account() {
+            Some(session) => {
+                let this = self.clone();
+                let check = tokio::spawn(async move { this.is_premium(&session).await });
+                tokio::time::timeout(wait, check).await.is_ok_and(|p| p.unwrap_or(false))
+            }
+            None => false,
+        };
+        if !premium && (video.duration.is_none() || video.artists.is_empty()) {
+            return None;
+        }
+        let cell = {
+            let mut songs = self.songs.lock().unwrap();
+            let key = format!("{listed} {premium}");
+            match songs.get(&key) {
+                Some(cell) => cell.clone(),
+                None => {
+                    if songs.len() >= 1000 {
+                        // Keeps the lookups still running.
+                        songs.retain(|_, c| !c.initialized());
+                    }
+                    songs.entry(key).or_default().clone()
+                }
+            }
+        };
+        // Its own task: when the wait runs out the lookup still finishes, so the next play
+        // of this video finds the song in the cell.
+        let (this, video) = (self.clone(), video.clone());
+        let lookup = tokio::spawn(async move {
+            cell.get_or_try_init(|| async {
+                let found = this.look_up_song(&video, premium).await?;
+                match &found {
+                    Some(s) => log::info!("song version of {} \"{}\": {} \"{}\"", video.id, video.title, s.id, s.title),
+                    None => log::info!("song version of {} \"{}\": none found", video.id, video.title),
+                }
+                anyhow::Ok(found)
+            })
+            .await
+            .cloned()
+        });
+        match tokio::time::timeout(wait.saturating_sub(start.elapsed()), lookup).await {
+            Ok(Ok(Ok(found))) => found,
+            Ok(Ok(Err(e))) => {
+                log::debug!("song version of {listed}: {e:#}");
+                None
+            }
+            Ok(Err(e)) => {
+                log::debug!("song version of {listed}: lookup stopped: {e}");
+                None
+            }
+            Err(_) => {
+                log::debug!("song version of {listed}: not found in {wait:?}, playing the music video");
+                None
+            }
+        }
+    }
+
+    async fn look_up_song(&self, video: &Track, premium: bool) -> anyhow::Result<Option<Track>> {
+        if premium {
+            match ytm::paired_song(&self.api, &video.id).await {
+                // YouTube pairs every music video that has a song; trust it when it says none.
+                Ok(found) => return Ok(found),
+                Err(e) => log::debug!("song pair of {}: {e:#}; searching instead", video.id),
+            }
+        }
+        ytm::searched_song(&self.api, video).await
+    }
+
     async fn open_stream(&self, video_id: &str, prefetch: bool) -> anyhow::Result<Arc<Shared>> {
         let id = video_id.to_owned();
         if let Some(shared) = tokio::task::spawn_blocking(move || crate::downloads::open(&id)).await? {
             return Ok(shared);
         }
         let (source, s) = self.resolve(video_id, false).await?;
-        let shared = Shared::new(s.size, s.duration_ms, s.loudness_db, prefetch);
-        self.rt.spawn(stream::download(self.http(), s.url, s.user_agent, shared.clone(), Some(self.refresher(source, video_id))));
+        let shared = Shared::new(s.size, s.duration_ms, s.loudness_db, s.opus, prefetch);
+        self.rt.spawn(stream::download(self.http(), s.url, s.user_agent, shared.clone(), Some(self.refresher(source, video_id, s.opus))));
         Ok(shared)
     }
 
-    /// Resolves a fresh URL from the same source, for a download that got a 403.
-    fn refresher(&self, source: Source, video_id: &str) -> stream::Refresh {
+    /// Resolves a fresh URL from the same source and format, for a download that got a 403.
+    fn refresher(&self, source: Source, video_id: &str, opus: bool) -> stream::Refresh {
         let (this, id) = (self.clone(), video_id.to_owned());
         Arc::new(move || {
             let (this, id) = (this.clone(), id.clone());
-            Box::pin(async move { Ok(this.resolve_from(source, &id).await?.url) })
+            Box::pin(async move {
+                let s = this.resolve_from(source, &id, opus).await?;
+                // The buffer is laid out for the format it started with.
+                anyhow::ensure!(s.opus == opus, "the stream changed format");
+                Ok(s.url)
+            })
         })
     }
 
     /// Download a song into the downloads folder, at the best quality the account gets.
-    async fn download(&self, t: &Track) -> anyhow::Result<PathBuf> {
+    async fn download(&self, t: &Track, for_video: Option<String>) -> anyhow::Result<PathBuf> {
         let (source, s) = self.resolve(&t.id, true).await?;
         log::info!("download {}: {} bytes from {source:?}", t.id, s.size);
-        let shared = Shared::new(s.size, s.duration_ms, s.loudness_db, false);
-        stream::download(self.http(), s.url, s.user_agent, shared.clone(), Some(self.refresher(source, &t.id))).await;
+        let shared = Shared::new(s.size, s.duration_ms, s.loudness_db, s.opus, false);
+        stream::download(self.http(), s.url, s.user_agent, shared.clone(), Some(self.refresher(source, &t.id, s.opus))).await;
         if let Some(e) = shared.error() {
             anyhow::bail!("{e}");
         }
@@ -669,12 +1274,13 @@ impl Backend {
             None => None,
         };
         let (t, duration_ms, loudness) = (t.clone(), shared.duration_ms, shared.loudness_db);
-        tokio::task::spawn_blocking(move || crate::downloads::save(&t, &audio, duration_ms, loudness, cover)).await?
+        tokio::task::spawn_blocking(move || crate::downloads::save(&t, &audio, duration_ms, loudness, cover, for_video)).await?
     }
 
     /// Find a stream URL, trying the fastest source that can play the song. `best`
     /// (downloads) takes the high quality stream whatever the setting, and waits for
-    /// the solver it needs.
+    /// the solver it needs. Playback without Premium takes Opus where there is one;
+    /// downloads stay AAC, which saves as a tagged .m4a.
     async fn resolve(&self, video_id: &str, best: bool) -> anyhow::Result<(Source, ResolvedStream)> {
         let hq = best || self.hq.load(Ordering::Relaxed);
         if best
@@ -687,8 +1293,9 @@ impl Backend {
         }
         // High quality needs the signed-in player's solver. Until it's prepared (a new
         // install, a new player version: ~5 s or more), play standard quality at once.
+        // Without Premium it's never prepared, and standard quality is all there is.
         let solver_ready = self.jsc.ready();
-        if hq && !solver_ready && self.api.account().is_some() {
+        if hq && !solver_ready && self.api.account().is_some() && !self.known_not_premium() {
             log::info!("{video_id}: solver not ready yet, standard quality for now");
             self.warm_signed_in();
         }
@@ -697,40 +1304,42 @@ impl Backend {
             && let Some(session) = self.api.account()
             && self.is_premium(&session).await
         {
-            match self.resolve_from(Source::WebMusic, video_id).await {
+            match self.resolve_from(Source::WebMusic, video_id, false).await {
                 Ok(s) => return Ok((Source::WebMusic, s)),
                 // Not fatal: the usual 128 kbps stream still plays.
                 Err(e) => log::warn!("high quality stream failed for {video_id} ({e:#}); using standard quality"),
             }
         }
-        match self.resolve_from(Source::VisionOs, video_id).await {
+        match self.resolve_from(Source::VisionOs, video_id, !best).await {
             Ok(s) => Ok((Source::VisionOs, s)),
             // Age-restricted or Premium-only: only signed-in web players get it.
             Err(e) if needs_account(&e) => {
                 log::info!("{video_id} needs a signed-in player ({e:#})");
                 let session = self.api.account().ok_or_else(|| anyhow::anyhow!("sign in to play this song"))?;
                 if self.is_premium(&session).await {
-                    match self.resolve_from(Source::WebMusic, video_id).await {
+                    match self.resolve_from(Source::WebMusic, video_id, false).await {
                         Ok(s) => return Ok((Source::WebMusic, s)),
                         Err(e) => log::warn!("web music player failed ({e:#}); using yt-dlp"),
                     }
                 }
-                Ok((Source::YtDlp, self.resolve_from(Source::YtDlp, video_id).await?))
+                Ok((Source::YtDlp, self.resolve_from(Source::YtDlp, video_id, false).await?))
             }
             Err(e) => Err(e),
         }
     }
 
-    async fn resolve_from(&self, source: Source, video_id: &str) -> anyhow::Result<ResolvedStream> {
+    /// `opus`: the visionOS player's Opus stream where there is one (the others are AAC).
+    async fn resolve_from(&self, source: Source, video_id: &str, opus: bool) -> anyhow::Result<ResolvedStream> {
         let plain = |s: innertube::Stream, ua: &str| ResolvedStream {
             url: s.url,
             size: s.size,
             duration_ms: s.duration_ms,
             user_agent: ua.to_owned(),
             loudness_db: s.loudness_db,
+            opus: s.opus,
         };
         Ok(match source {
-            Source::VisionOs => plain(self.visionos_stream(video_id).await?, innertube::UA),
+            Source::VisionOs => plain(self.visionos_stream(video_id, opus).await?, innertube::UA),
             Source::WebMusic => {
                 let session = self.api.account().ok_or_else(|| anyhow::anyhow!("signed out"))?;
                 plain(session.audio_stream(&self.http(), &self.jsc, video_id).await?, webmusic::UA)
@@ -738,8 +1347,10 @@ impl Backend {
             Source::YtDlp => {
                 let session = self.api.account().ok_or_else(|| anyhow::anyhow!("sign in to play this song"))?;
                 let s = ytdlp::resolve(&self.http(), &self.data_dir, &session.cookie, video_id).await?;
+                // Cookies Google replaced while yt-dlp used the session.
+                self.api.keep(&session, s.replaced.iter().map(String::as_str));
                 // yt-dlp's JSON doesn't carry YouTube's loudness figure.
-                ResolvedStream { url: s.url, size: s.size, duration_ms: s.duration_ms, user_agent: s.user_agent, loudness_db: None }
+                ResolvedStream { url: s.url, size: s.size, duration_ms: s.duration_ms, user_agent: s.user_agent, loudness_db: None, opus: false }
             }
         })
     }
@@ -757,6 +1368,12 @@ impl Backend {
                 log::warn!("solver warm-up failed: {e:#}");
             }
         });
+    }
+
+    /// The Premium check has answered, and the account doesn't have it. Doesn't ask or
+    /// wait: while a check is running, it's not known yet.
+    fn known_not_premium(&self) -> bool {
+        self.premium.try_lock().is_ok_and(|p| matches!(*p, Ok(false)))
     }
 
     /// Premium accounts can stream signed-in web player URLs without a PO token.
@@ -782,16 +1399,16 @@ impl Backend {
         }
     }
 
-    async fn visionos_stream(&self, video_id: &str) -> anyhow::Result<innertube::Stream> {
+    async fn visionos_stream(&self, video_id: &str, opus: bool) -> anyhow::Result<innertube::Stream> {
         let vd = self.api.visitor_data(false).await?;
-        match innertube::audio_stream(&self.http(), video_id, &vd).await {
+        match innertube::audio_stream(&self.http(), video_id, &vd, opus).await {
             Ok(s) => Ok(s),
             Err(e) if needs_account(&e) => Err(e),
             Err(e) => {
                 // A stale/flagged visitor ID is the usual cause; retry once with a fresh one.
                 log::info!("visionOS player: {e:#}; retrying with new visitor data");
                 let vd = self.api.visitor_data(true).await?;
-                innertube::audio_stream(&self.http(), video_id, &vd).await
+                innertube::audio_stream(&self.http(), video_id, &vd, opus).await
             }
         }
     }
@@ -813,6 +1430,40 @@ impl Backend {
 
     pub fn set_high_quality(&self, on: bool) {
         self.hq.store(on, Ordering::Relaxed);
+    }
+
+    /// Like or unlike a selection, one at a time, then check Liked Music and try again
+    /// what didn't take. Unlikes still listed after that count as refused; likes aren't
+    /// counted so (songs that can't be played are liked but not listed).
+    async fn like_many(&self, ids: Vec<String>, like: bool) -> anyhow::Result<Resp> {
+        let total = ids.len();
+        let (done, failed) = like_many(&self.api, ids, like, |taken, n| {
+            let _ = self.tx.send(Resp::LikeProgress { taken: taken.into_iter().map(str::to_owned).collect(), done: n, total, like });
+            self.wake();
+        })
+        .await;
+        // Even when all were refused: the app stops waiting on them and shows them as they are.
+        Ok(Resp::LikedMany { video_ids: done, failed, like })
+    }
+
+    /// Send a playlist's first page right away, then each next page as it arrives
+    /// (YouTube takes about half a second per page of 100). The last one is returned.
+    async fn stream_playlist(&self, id: String, load: u64, me: bool) -> anyhow::Result<Resp> {
+        let (c, mut token, limit) = ytm::playlist_start(&self.api, &id, me, None).await?;
+        let mut have = c.tracks.len();
+        let mut resp = Resp::Collection { load, c, more: token.is_some() && have < limit };
+        while let Some(t) = token.take().filter(|_| have < limit) {
+            let _ = self.tx.send(resp);
+            self.wake();
+            // Failing here, the page keeps what came.
+            let (mut tracks, mut set_ids, next) = ytm::playlist_more(&self.api, &t, me).await?;
+            tracks.truncate(limit - have);
+            set_ids.truncate(limit - have);
+            have += tracks.len();
+            token = next.filter(|_| !tracks.is_empty());
+            resp = Resp::CollectionMore { id: id.clone(), load, more: token.is_some() && have < limit, tracks, set_ids };
+        }
+        Ok(resp)
     }
 
     pub fn is_logged_in(&self) -> bool {
@@ -839,6 +1490,8 @@ struct ResolvedStream {
     duration_ms: u64,
     user_agent: String,
     loudness_db: Option<f32>,
+    /// Opus in WebM; otherwise AAC in MP4.
+    opus: bool,
 }
 
 /// The anonymous visionOS player refused because the song needs an account:

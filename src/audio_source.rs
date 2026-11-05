@@ -114,6 +114,7 @@ mod tests {
         rate: SampleRate,
         channels: ChannelCount,
         change: Option<usize>,
+        channel_change: Option<usize>,
     }
     impl Iterator for Packet {
         type Item = f32;
@@ -135,7 +136,11 @@ mod tests {
             }
         }
         fn channels(&self) -> ChannelCount {
-            self.channels
+            if self.channel_change.is_some_and(|n| self.n >= n) {
+                ch(1)
+            } else {
+                self.channels
+            }
         }
         fn total_duration(&self) -> Option<Duration> {
             None
@@ -155,6 +160,7 @@ mod tests {
             rate: nz(44100),
             channels: ch(2),
             change: None,
+            channel_change: None,
         };
         let actual: Vec<_> = convert(packet, ch(2), nz(48000), flag()).collect();
         let expected: Vec<_> = rodio::conversions::SampleRateConverter::new(
@@ -191,11 +197,49 @@ mod tests {
             rate: nz(44100),
             channels: ch(2),
             change: Some(8),
+            channel_change: None,
         };
         let out: Vec<_> = convert(input, ch(2), nz(48000), f.clone()).collect();
         assert!(f.load(Ordering::Acquire));
         assert_eq!(out.len() % 2, 0);
         assert!(out.len() < 100);
+    }
+    #[test]
+    fn channel_change_discards_the_whole_affected_frame() {
+        let f = flag();
+        let data = vec![0.25, -0.5, 0.75, -0.9, 0.1, -0.2, 0.8, -0.7];
+        let input = Packet {
+            data: data.clone(),
+            n: 0,
+            rate: nz(48000),
+            channels: ch(2),
+            change: None,
+            // The decoder changes metadata while loading the first sample of
+            // the fourth frame. Neither channel of that frame may escape.
+            channel_change: Some(7),
+        };
+        let mut source = convert(input, ch(2), nz(48000), f.clone());
+        assert_eq!(source.by_ref().collect::<Vec<_>>(), data[..6]);
+        assert!(f.load(Ordering::Acquire));
+        assert_eq!(source.next(), None);
+        assert_eq!(source.next(), None);
+    }
+    #[test]
+    fn truncated_input_frame_is_rejected_before_conversion() {
+        for input_rate in [44100, 48000] {
+            let f = flag();
+            let mut source = convert(
+                SamplesBuffer::new(ch(2), nz(input_rate), vec![0.25, -0.5, 0.9]),
+                ch(2),
+                nz(48000),
+                f.clone(),
+            );
+            let out: Vec<_> = source.by_ref().collect();
+            assert!(f.load(Ordering::Acquire));
+            assert_eq!(out.len() % 2, 0);
+            assert!(out.chunks_exact(2).all(|frame| frame == [0.25, -0.5]));
+            assert_eq!(source.next(), None);
+        }
     }
     #[test]
     fn new_track_and_seek_replacement_have_no_previous_samples() {
@@ -242,5 +286,26 @@ mod tests {
         assert!(out.iter().any(|&s| s == 0.25));
         assert!(out.iter().any(|&s| s == -0.5));
         assert!(player.empty());
+    }
+    #[test]
+    fn player_keepalive_accepts_a_different_format_after_eof() {
+        let (mixer, mut output) = rodio::mixer::mixer(ch(2), nz(48000));
+        let player = rodio::Player::connect_new(&mixer);
+        // Opus-like stereo at 48 kHz, followed after idle silence by AAC-like
+        // mono at 44.1 kHz. The keepalive queue must retain its span boundaries.
+        for (channels, rate, data, expected) in [
+            (ch(2), nz(48000), vec![0.25; 9600], 0.25),
+            (ch(1), nz(44100), vec![-0.5; 4410], -0.5),
+        ] {
+            let f = flag();
+            player.append(convert(SamplesBuffer::new(channels, rate, data), ch(2), nz(48000), f.clone()));
+            let out: Vec<_> = (0..16000).map(|_| output.next().unwrap()).collect();
+            // Each 100 ms song occupies exactly 4800 stereo output frames,
+            // regardless of the input format or the preceding idle silence.
+            assert_eq!(out.iter().filter(|&&s| s == expected).count(), 9600);
+            assert!(player.empty());
+            assert!(!f.load(Ordering::Acquire));
+            assert!((0..1000).all(|_| output.next() == Some(0.0)));
+        }
     }
 }

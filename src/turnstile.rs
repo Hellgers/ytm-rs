@@ -17,6 +17,8 @@ use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::WindowBuilder;
 use wry::{WebContext, WebViewBuilder};
 
+use crate::login::BuildIn;
+
 pub const FLAG: &str = "--turnstile";
 const CHALLENGE: &str = "https://lyrics.api.dacubeking.com/challenge";
 /// How long to wait for an invisible pass before showing the window.
@@ -66,6 +68,12 @@ pub fn child_main(profile_dir: PathBuf) {
 
 fn run(profile_dir: PathBuf) -> anyhow::Result<String> {
     let mut event_loop = EventLoopBuilder::<String>::with_user_event().build();
+    // macOS: no Dock icon for a window that's usually never shown.
+    #[cfg(target_os = "macos")]
+    {
+        use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+        event_loop.set_activation_policy(ActivationPolicy::Accessory);
+    }
     let window = WindowBuilder::new()
         .with_title("Verifying lyrics access")
         .with_inner_size(tao::dpi::LogicalSize::new(360.0, 120.0))
@@ -74,13 +82,13 @@ fn run(profile_dir: PathBuf) -> anyhow::Result<String> {
 
     let proxy = event_loop.create_proxy();
     let mut context = WebContext::new(Some(profile_dir));
-    let webview = crate::proxy::webview(WebViewBuilder::new_with_web_context(&mut context))
+    let webview = crate::proxy::webview(WebViewBuilder::new_with_web_context(&mut context), false)
         .with_initialization_script(BRIDGE)
         .with_ipc_handler(move |req| {
             let _ = proxy.send_event(req.body().clone());
         })
         .with_url(CHALLENGE)
-        .build(&window)?;
+        .build_in(&window)?;
 
     let started = Instant::now();
     let mut result: anyhow::Result<String> = Err(anyhow::anyhow!("closed before verification finished"));

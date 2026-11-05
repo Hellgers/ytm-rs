@@ -45,6 +45,9 @@ pub struct Track {
     /// Album art, about 64 px.
     #[serde(default)]
     pub art: Option<String>,
+    /// Length in seconds, when Spotify gives one.
+    #[serde(default)]
+    pub duration: Option<u32>,
 }
 
 impl Track {
@@ -410,7 +413,7 @@ fn parse_track(item: &Value) -> Option<Track> {
     let name = track["name"].as_str()?.trim();
     if track["__typename"] == "LocalTrack" {
         let artists = split_artists(track["artistName"].as_str().unwrap_or_default());
-        return (!name.is_empty()).then(|| Track { name: name.to_owned(), artists, local: true, art: None });
+        return (!name.is_empty()).then(|| Track { name: name.to_owned(), artists, local: true, art: None, duration: None });
     }
     let artists = track["artists"]["items"].as_array().or(track["artists"].as_array())?;
     let artists: Vec<String> = artists
@@ -421,7 +424,11 @@ fn parse_track(item: &Value) -> Option<Track> {
         .map(str::to_owned)
         .collect();
     let art = art(&track["albumOfTrack"]["coverArt"]["sources"]);
-    (!name.is_empty() && !artists.is_empty()).then(|| Track { name: name.to_owned(), artists, local: false, art })
+    let duration = [&track["trackDuration"]["totalMilliseconds"], &track["duration"]["totalMilliseconds"], &track["duration_ms"]]
+        .into_iter()
+        .find_map(Value::as_u64)
+        .map(|ms| ((ms + 500) / 1000) as u32);
+    (!name.is_empty() && !artists.is_empty()).then(|| Track { name: name.to_owned(), artists, local: false, art, duration })
 }
 
 /// A local file's artist field, which lists every artist in one string.
@@ -642,6 +649,7 @@ mod tests {
         println!("{}: {} songs, first {} by {:?} art {:?}", p.name, p.tracks.len(), p.tracks[0].name, p.tracks[0].artists, p.tracks[0].art);
         assert!(p.tracks.len() > 20);
         assert!(p.tracks[0].art.is_some());
+        assert!(p.tracks.iter().all(|t| t.duration.is_some()), "every song has a length");
     }
 }
 

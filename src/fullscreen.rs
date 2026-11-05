@@ -9,6 +9,7 @@
 //! whole screen for a frame each time they switch in or out of that mode.
 
 /// The main window, from `main`.
+#[cfg_attr(not(windows), allow(unused_variables))]
 pub fn set_hwnd(hwnd: *mut std::ffi::c_void) {
     #[cfg(windows)]
     imp::init(hwnd as usize);
@@ -26,19 +27,40 @@ pub fn set(on: bool) -> bool {
     }
 }
 
+/// The work area (the monitor less the taskbar) of the monitor the window is on, in
+/// physical pixels. None where the app can't ask (not Windows, no window handle yet).
+pub fn work_area() -> Option<egui::Rect> {
+    #[cfg(windows)]
+    return imp::work_area();
+    #[cfg(not(windows))]
+    None
+}
+
+/// Whether some of `rect` (physical pixels) is on a connected monitor. True where the
+/// app can't ask.
+pub fn on_a_monitor(rect: egui::Rect) -> bool {
+    #[cfg(windows)]
+    return imp::on_a_monitor(rect);
+    #[cfg(not(windows))]
+    {
+        let _ = rect;
+        true
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::sync::{Mutex, OnceLock};
 
-    use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
+    use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        CreateSolidBrush, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE,
+        CreateSolidBrush, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromRect, MonitorFromWindow, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE,
         RedrawWindow,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GCLP_HBRBACKGROUND, GWL_EXSTYLE, GWL_STYLE, GetWindowLongW, GetWindowPlacement, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        GCLP_HBRBACKGROUND, GWL_EXSTYLE, GWL_STYLE, GetWindowLongW, GetWindowPlacement, IsZoomed, SW_RESTORE, ShowWindow, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
         SendMessageW, SetClassLongPtrW, SetWindowLongW, SetWindowPlacement, SetWindowPos, WINDOWPLACEMENT, WM_SETREDRAW, WS_CAPTION, WS_EX_CLIENTEDGE,
-        WS_EX_DLGMODALFRAME, WS_EX_STATICEDGE, WS_EX_WINDOWEDGE, WS_THICKFRAME,
+        WS_EX_DLGMODALFRAME, WS_EX_STATICEDGE, WS_EX_WINDOWEDGE, WS_MAXIMIZE, WS_THICKFRAME,
     };
 
     static WINDOW: OnceLock<usize> = OnceLock::new();
@@ -67,6 +89,22 @@ mod imp {
         }
     }
 
+    pub fn work_area() -> Option<egui::Rect> {
+        let &h = WINDOW.get()?;
+        let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        // SAFETY: the app's own window; `info` is ours and sized.
+        unsafe { GetMonitorInfoW(MonitorFromWindow(HWND(h as *mut _), MONITOR_DEFAULTTONEAREST), &mut info) }.as_bool().then(|| {
+            let r = info.rcWork;
+            egui::Rect::from_min_max(egui::pos2(r.left as f32, r.top as f32), egui::pos2(r.right as f32, r.bottom as f32))
+        })
+    }
+
+    pub fn on_a_monitor(rect: egui::Rect) -> bool {
+        let r = RECT { left: rect.left() as i32, top: rect.top() as i32, right: rect.right() as i32, bottom: rect.bottom() as i32 };
+        // SAFETY: plain query.
+        !unsafe { MonitorFromRect(&r, MONITOR_DEFAULTTONULL) }.is_invalid()
+    }
+
     pub fn set(on: bool) -> bool {
         let Some(&h) = WINDOW.get() else { return false };
         let hwnd = HWND(h as *mut _);
@@ -85,7 +123,13 @@ mod imp {
                 let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
                 let _ = GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info);
                 let r = info.rcMonitor;
-                SetWindowLongW(hwnd, GWL_STYLE, style & !((WS_CAPTION | WS_THICKFRAME).0 as i32));
+                // winit keeps a maximized window without the system frame (the app's own
+                // title bar) to the work area, which would leave the taskbar's strip out:
+                // restore it first. The saved placement maximizes it again on the way out.
+                if IsZoomed(hwnd).as_bool() {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                }
+                SetWindowLongW(hwnd, GWL_STYLE, style & !((WS_CAPTION | WS_THICKFRAME | WS_MAXIMIZE).0 as i32));
                 let edges = WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE;
                 SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style & !(edges.0 as i32));
                 // No copying the old picture to its old spot: until the app draws a frame

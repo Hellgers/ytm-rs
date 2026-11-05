@@ -16,6 +16,8 @@ pub struct Stream {
     pub duration_ms: u64,
     /// dB above YouTube's -14 LUFS loudness target (positive = louder).
     pub loudness_db: Option<f32>,
+    /// Opus in WebM; otherwise AAC in MP4.
+    pub opus: bool,
 }
 
 /// A format's loudness relative to YouTube's target, falling back to the track-level
@@ -28,7 +30,45 @@ pub fn loudness(resp: &Value, format: &Value) -> Option<f32> {
     })
 }
 
-pub async fn audio_stream(http: &reqwest::Client, video_id: &str, visitor_data: &str) -> anyhow::Result<Stream> {
+/// The Android VR client's queue for an album's playlist (`OLAK5uy_…`). Unlike the web
+/// clients, which list a track's music video when it has one, it lists the album's songs.
+/// Needs no sign-in or PO token. Mirrors Morphe's "Play albums songs" patch
+/// (github.com/MorpheApp/morphe-patches, `PlaylistRequest.java`); update together.
+pub async fn album_queue(http: &reqwest::Client, playlist_id: &str) -> anyhow::Result<Value> {
+    const VERSION: &str = "1.73.21";
+    let body = json!({
+        "context": {"client": {
+            "clientName": "ANDROID_VR",
+            "clientVersion": VERSION,
+            "deviceMake": "Pico",
+            "deviceModel": "A8110",
+            "osName": "Android",
+            "osVersion": "10",
+            "androidSdkVersion": 29,
+            // English, so the playlist's title says "Album - …".
+            "hl": "en",
+            "gl": "US",
+        }},
+        "playlistId": playlist_id,
+        "contentCheckOk": true,
+        "racyCheckOk": true,
+    });
+    Ok(http
+        .post("https://youtubei.googleapis.com/youtubei/v1/next?prettyPrint=false")
+        .header("User-Agent", format!("com.google.android.apps.youtube.vr.pico/{VERSION} (Linux; U; Android 10; A8110 Build/QKQ1) gzip"))
+        .header("X-YouTube-Client-Name", "28")
+        .header("X-YouTube-Client-Version", VERSION)
+        .timeout(std::time::Duration::from_secs(8))
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+/// `opus`: Opus (itag 251, about 130-160 kbps) when the song has it, else AAC.
+pub async fn audio_stream(http: &reqwest::Client, video_id: &str, visitor_data: &str, opus: bool) -> anyhow::Result<Stream> {
     let body = json!({
         "context": {"client": {
             "clientName": "VISIONOS",
@@ -69,18 +109,21 @@ pub async fn audio_stream(http: &reqwest::Client, video_id: &str, visitor_data: 
             status["reason"].as_str().unwrap_or("no reason given")
         );
     }
-    // AAC-LC in MP4 (itag 140) decodes in pure Rust; HE-AAC (139) as a fallback.
+    // Opus in WebM (251) when asked for; AAC-LC in MP4 (140), HE-AAC (139) as fallbacks.
     let formats = resp["streamingData"]["adaptiveFormats"].as_array().map(Vec::as_slice).unwrap_or_default();
-    [140, 139]
+    let itags: &[u64] = if opus { &[251, 140, 139] } else { &[140, 139] };
+    itags
         .iter()
         .find_map(|itag| {
             let f = formats.iter().find(|f| f["itag"] == *itag)?;
+            log::info!("visionOS: {video_id} itag {itag} ({} kbps)", f["averageBitrate"].as_u64().or(f["bitrate"].as_u64()).unwrap_or(0) / 1000);
             Some(Stream {
                 url: f["url"].as_str()?.to_owned(),
                 size: f["contentLength"].as_str()?.parse().ok()?,
                 duration_ms: f["approxDurationMs"].as_str().and_then(|d| d.parse().ok()).unwrap_or(0),
                 loudness_db: loudness(&resp, f),
+                opus: *itag == 251,
             })
         })
-        .ok_or_else(|| anyhow::anyhow!("no AAC stream in visionOS player response"))
+        .ok_or_else(|| anyhow::anyhow!("no audio stream in visionOS player response"))
 }

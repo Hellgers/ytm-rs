@@ -2,16 +2,27 @@
 ; Build: cargo build --release, then
 ;   iscc installer\ytm-rs.iss
 ; Output: installer\Output\ytm-rs-setup-<version>.exe
+; ARM64: cargo build --release --target aarch64-pc-windows-msvc, then
+;   iscc /DArm64 installer\ytm-rs.iss  ->  ytm-rs-setup-<version>-arm64.exe
 
 #define AppName "ytm-rs"
-#define AppVersion "0.2.21"
+#define AppVersion "0.2.32"
 #define AppExe "ytm-rs.exe"
+#ifdef Arm64
+  #define Arch "arm64"
+  #define Suffix "-arm64"
+  #define BinDir "..\target\aarch64-pc-windows-msvc\release"
+#else
+  #define Arch "x64compatible"
+  #define Suffix ""
+  #define BinDir "..\target\release"
+#endif
 
 [Setup]
 AppId={{6E0B7C4A-2D1F-4C8E-9B3A-7F5D1E2A9C40}
 AppName={#AppName}
 AppVersion={#AppVersion}
-AppPublisher=ytm-rs audio continuity fork
+AppPublisher=ytm-rs maintainers
 AppPublisherURL=https://github.com/Hellgers/ytm-rs
 AppSupportURL=https://github.com/Hellgers/ytm-rs/issues
 DefaultDirName={autopf}\{#AppName}
@@ -20,10 +31,10 @@ DisableProgramGroupPage=yes
 ; Per-user install by default (no UAC prompt); the user can pick all-users instead.
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
-ArchitecturesAllowed=x64compatible
-ArchitecturesInstallIn64BitMode=x64compatible
+ArchitecturesAllowed={#Arch}
+ArchitecturesInstallIn64BitMode={#Arch}
 MinVersion=10.0
-OutputBaseFilename=ytm-rs-setup-{#AppVersion}
+OutputBaseFilename=ytm-rs-setup-{#AppVersion}{#Suffix}
 Compression=lzma2/ultra
 SolidCompression=yes
 WizardStyle=modern
@@ -35,10 +46,9 @@ CloseApplications=yes
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BinDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\docs\AUDIO_CONTINUITY_FIX.md"; DestDir: "{app}\docs"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"

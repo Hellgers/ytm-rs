@@ -4,8 +4,13 @@
 //! every few hours, downloads a newer installer in the background, and runs it
 //! silently when the app closes, or right away when the user picks "Restart to
 //! update". The portable build (a `portable.txt` beside the exe) downloads the new
-//! portable zip instead and swaps the exe in place as it closes. Dev builds never
-//! update themselves.
+//! portable zip instead and swaps the exe in place as it closes. On Linux, a copy
+//! put in place by `install.sh` (an `install.txt` beside the binary) downloads the new
+//! tarball and renames the new binary over itself as it closes. On macOS, the copy
+//! installed from the disk image downloads the new one and puts the app from it in
+//! place of its own as it closes. Every platform has a portable build too (a
+//! `portable.txt` marker; inside the app bundle on macOS), which updates from the
+//! portable download. Dev builds never update themselves.
 //!
 //! Release notes (the release's Markdown body) are kept per version: the one a check
 //! finds, and any other on request ([`Updater::notes`]), for the update dialog, the
@@ -52,16 +57,59 @@ pub fn current_version() -> String {
 }
 
 /// Whether this copy was installed by the installer (which leaves its uninstaller
-/// beside the exe), so it's safe to update in place.
+/// beside the exe, or on Linux `install.sh` its `install.txt`), or on macOS runs from
+/// an app bundle that isn't the portable one, so it's safe to update in place.
 pub fn installed() -> bool {
-    std::env::var_os("YTM_UPDATE_FORCE").is_some()
-        || std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("unins000.exe").exists())).unwrap_or(false)
+    if std::env::var_os("YTM_UPDATE_FORCE").is_some() {
+        return true;
+    }
+    let Ok(exe) = std::env::current_exe() else { return false };
+    if cfg!(target_os = "macos") {
+        return bundle_of(&exe).is_some() && portable_dir().is_none();
+    }
+    let marker = if cfg!(windows) { "unins000.exe" } else { "install.txt" };
+    exe.parent().is_some_and(|d| d.join(marker).exists())
 }
 
-/// The portable build's folder: the zip ships a `portable.txt` beside the exe, which
-/// keeps settings in `data` next to it and has updates replace the exe in place.
+/// The `.app` bundle a binary is in (`X.app/Contents/MacOS/ytm-rs`).
+fn bundle_of(exe: &Path) -> Option<&Path> {
+    exe.ancestors().nth(3).filter(|a| a.extension().is_some_and(|x| x == "app"))
+}
+
+/// The release asset this copy updates from.
+fn asset_name(version: &str) -> String {
+    let portable = portable_dir().is_some();
+    let arch = std::env::consts::ARCH;
+    if cfg!(target_os = "linux") {
+        let kind = if portable { "portable-" } else { "" };
+        return format!("ytm-rs-{kind}{version}-linux-{arch}.tar.gz");
+    }
+    // ARM64 Windows builds have their own assets; x64 keeps the original names.
+    let (suffix, setup) = if cfg!(target_os = "macos") {
+        (format!("-macos-{arch}"), "dmg")
+    } else {
+        (if cfg!(target_arch = "aarch64") { "-arm64" } else { "" }.to_owned(), "exe")
+    };
+    if portable { format!("ytm-rs-portable-{version}{suffix}.zip") } else { format!("ytm-rs-setup-{version}{suffix}.{setup}") }
+}
+
+/// The portable build's folder: the download ships a `portable.txt` beside the exe
+/// (on macOS inside the app bundle, where code signing allows it), which keeps
+/// settings in `data` next to it (next to the bundle) and has updates replace it in place.
 pub fn portable_dir() -> Option<PathBuf> {
-    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let exe = std::env::current_exe().ok()?;
+    if let Some(app) = bundle_of(&exe) {
+        // Opened without being moved out of quarantine, macOS runs the app from a
+        // random read-only copy; there's no folder beside it to keep data in.
+        if app.to_string_lossy().contains("/AppTranslocation/") {
+            return None;
+        }
+        if !app.join("Contents/Resources/portable.txt").exists() {
+            return None;
+        }
+        return app.parent().map(Path::to_path_buf);
+    }
+    let dir = exe.parent()?.to_path_buf();
     dir.join("portable.txt").exists().then_some(dir)
 }
 
@@ -208,7 +256,7 @@ impl Updater {
         }
         let version = tag.trim_start_matches('v').to_owned();
         let portable = portable_dir().is_some();
-        let want = if portable { format!("ytm-rs-portable-{version}.zip") } else { format!("ytm-rs-setup-{version}.exe") };
+        let want = asset_name(&version);
         // A release published before its installer was built: nothing to install
         // yet, so this isn't an error. The next check picks it up.
         let Some(asset) = release["assets"].as_array().and_then(|a| a.iter().find(|x| x["name"] == want.as_str())) else {
@@ -230,7 +278,7 @@ impl Updater {
             while let Some(chunk) = resp.chunk().await? {
                 std::io::Write::write_all(&mut file, &chunk)?;
                 got += chunk.len() as u64;
-                let percent = if size > 0 { (got * 100 / size).min(100) as u8 } else { 0 };
+                let percent = (got * 100).checked_div(size).map_or(0, |p| p.min(100) as u8);
                 if percent != shown {
                     shown = percent;
                     self.set(State::Downloading { version: version.clone(), percent });
@@ -253,7 +301,14 @@ impl Updater {
                 }
             }
         }
-        let ready = if portable { unzip_exe(&path, &self.dir.join(format!("ytm-rs-{version}")))? } else { path };
+        let unpacked = self.dir.join(format!("ytm-rs-{version}"));
+        let ready = if cfg!(target_os = "macos") && !portable {
+            open_dmg(&path, &unpacked)?
+        } else if portable || cfg!(unix) {
+            unzip_exe(&path, &unpacked)?
+        } else {
+            path
+        };
         log::info!("update: {version} ready at {}", ready.display());
         Ok(State::Ready { version, installer: ready })
     }
@@ -263,8 +318,20 @@ impl Updater {
     pub fn install(&self, relaunch: bool) {
         let State::Ready { installer, .. } = self.state() else { return };
         let exe = std::env::current_exe().unwrap_or_default();
+        #[cfg(target_os = "macos")]
+        if let (Some(new), Some(app)) = (bundle_of(&installer), bundle_of(&exe)) {
+            return replace_bundle(new, app, relaunch);
+        }
+        #[cfg(unix)]
+        replace_binary(&installer, &exe, relaunch);
+        #[cfg(windows)]
+        self.run_installer(&installer, &exe, relaunch);
+    }
+
+    #[cfg(windows)]
+    fn run_installer(&self, installer: &Path, exe: &Path, relaunch: bool) {
         if portable_dir().is_some() {
-            return swap_exe(&installer, &exe, relaunch);
+            return swap_exe(installer, exe, relaunch);
         }
         // Update the copy that's running: an all-users install lives under Program Files
         // (and the installer will ask for admin rights); otherwise it's per-user.
@@ -276,7 +343,7 @@ impl Updater {
             installer.display()
         );
         if relaunch {
-            script += &format!(" & start \"\" \"{}\"", exe.display());
+            script += &format!(" & start \"\" \"{}\" {}", exe.display(), crate::deeplink::RELAUNCH_FLAG);
         }
         if std::env::var_os("YTM_UPDATE_DRYRUN").is_some() {
             log::info!("update (dry run): cmd /C {script}");
@@ -289,6 +356,7 @@ impl Updater {
 
 /// The portable update: Windows lets a running exe be renamed, so move this one aside
 /// and put the new one in its place (the next launch deletes the old one).
+#[cfg(windows)]
 fn swap_exe(new: &Path, exe: &Path, relaunch: bool) {
     let old = exe.with_extension("exe.old");
     if std::env::var_os("YTM_UPDATE_DRYRUN").is_some() {
@@ -307,16 +375,98 @@ fn swap_exe(new: &Path, exe: &Path, relaunch: bool) {
     log::info!("update: replaced {}", exe.display());
     if relaunch {
         // Once this process has saved and exited.
-        run_detached(&format!("ping -n 3 127.0.0.1 >NUL & start \"\" \"{}\"", exe.display()));
+        run_detached(&format!("ping -n 3 127.0.0.1 >NUL & start \"\" \"{}\" {}", exe.display(), crate::deeplink::RELAUNCH_FLAG));
     }
 }
 
-/// `ytm-rs.exe` from a downloaded portable zip, unpacked into `dir` with Windows' own tar.
+/// Linux: rename the new binary over this one. The running process keeps its copy
+/// open until it exits; the next launch runs the new one.
+#[cfg(unix)]
+fn replace_binary(new: &Path, exe: &Path, relaunch: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = exe.with_file_name(".ytm-rs.new");
+    if std::env::var_os("YTM_UPDATE_DRYRUN").is_some() {
+        log::info!("update (dry run): {} over {}", new.display(), exe.display());
+        return;
+    }
+    let done = std::fs::copy(new, &tmp)
+        .and_then(|_| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)))
+        .and_then(|_| std::fs::rename(&tmp, exe));
+    if let Err(e) = done {
+        let _ = std::fs::remove_file(&tmp);
+        return log::warn!("update: couldn't replace {}: {e}", exe.display());
+    }
+    log::info!("update: replaced {}", exe.display());
+    if relaunch {
+        // Once this process has saved and exited.
+        let quoted = exe.display().to_string().replace('\'', r"'\''");
+        run_detached(&format!("sleep 2; exec '{quoted}'"));
+    }
+}
+
+/// macOS: put the new app bundle where this one is, so its Info.plist and icon update
+/// too. A running app's bundle can be moved; this process keeps running from the old
+/// one until it exits.
+#[cfg(target_os = "macos")]
+fn replace_bundle(new: &Path, app: &Path, relaunch: bool) {
+    let parent = app.parent().unwrap_or(Path::new("/"));
+    let (tmp, old) = (parent.join(".ytm-rs.app.new"), parent.join(".ytm-rs.app.old"));
+    if std::env::var_os("YTM_UPDATE_DRYRUN").is_some() {
+        log::info!("update (dry run): {} in place of {}", new.display(), app.display());
+        return;
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_dir_all(&old);
+    // ditto copies a bundle whole: symlinks, permissions, signature.
+    let copied = std::process::Command::new("ditto").arg(new).arg(&tmp).status().is_ok_and(|s| s.success());
+    if !copied {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return log::warn!("update: couldn't copy {} beside {}", new.display(), app.display());
+    }
+    if let Err(e) = std::fs::rename(app, &old) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return log::warn!("update: couldn't move {} aside: {e}", app.display());
+    }
+    if let Err(e) = std::fs::rename(&tmp, app) {
+        let _ = std::fs::rename(&old, app);
+        let _ = std::fs::remove_dir_all(&tmp);
+        return log::warn!("update: couldn't put the new version in place: {e}");
+    }
+    let _ = std::fs::remove_dir_all(&old);
+    log::info!("update: replaced {}", app.display());
+    if relaunch {
+        // Once this process has saved and exited.
+        let quoted = app.display().to_string().replace('\'', r"'\''");
+        run_detached(&format!("sleep 2; open '{quoted}'"));
+    }
+}
+
+/// macOS: the app from a downloaded installer disk image, copied out into `dir`.
+fn open_dmg(dmg: &Path, dir: &Path) -> anyhow::Result<PathBuf> {
+    let _ = std::fs::remove_dir_all(dir);
+    let mnt = dir.join("mnt");
+    std::fs::create_dir_all(&mnt)?;
+    let attached = std::process::Command::new("hdiutil").args(["attach", "-nobrowse", "-readonly", "-noautoopen", "-quiet", "-mountpoint"]).arg(&mnt).arg(dmg).status()?;
+    anyhow::ensure!(attached.success(), "couldn't open {}", dmg.display());
+    let copied = std::process::Command::new("ditto").arg(mnt.join("ytm-rs.app")).arg(dir.join("ytm-rs.app")).status();
+    let _ = std::process::Command::new("hdiutil").args(["detach", "-quiet"]).arg(&mnt).status();
+    let exe = dir.join("ytm-rs.app/Contents/MacOS/ytm-rs");
+    anyhow::ensure!(copied.is_ok_and(|s| s.success()) && exe.exists(), "couldn't copy the app out of {}", dmg.display());
+    Ok(exe)
+}
+
+/// The new binary from a downloaded update (the portable zip, or on Linux the
+/// tarball), unpacked into `dir` with tar (on Windows, its own; macOS's reads zips).
 fn unzip_exe(zip: &Path, dir: &Path) -> anyhow::Result<PathBuf> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir)?;
-    let system = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-    let mut cmd = std::process::Command::new(system.join(r"System32\tar.exe"));
+    #[cfg(windows)]
+    let mut cmd = {
+        let system = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        std::process::Command::new(system.join(r"System32\tar.exe"))
+    };
+    #[cfg(not(windows))]
+    let mut cmd = std::process::Command::new("tar");
     cmd.arg("-xf").arg(zip).arg("-C").arg(dir);
     #[cfg(windows)]
     {
@@ -325,7 +475,15 @@ fn unzip_exe(zip: &Path, dir: &Path) -> anyhow::Result<PathBuf> {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     let status = cmd.status()?;
+    #[cfg(windows)]
     let exe = dir.join("ytm-rs.exe");
+    // Everything is in one top-level folder: the binary, or on macOS the app bundle.
+    #[cfg(not(windows))]
+    let exe = std::fs::read_dir(dir)?
+        .flatten()
+        .flat_map(|e| [e.path().join("ytm-rs"), e.path().join("ytm-rs.app/Contents/MacOS/ytm-rs")])
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| dir.join("ytm-rs"));
     anyhow::ensure!(status.success() && exe.exists(), "couldn't unpack {}", zip.display());
     Ok(exe)
 }
@@ -341,8 +499,14 @@ fn run_detached(script: &str) {
             log::warn!("update: couldn't run the update: {e}");
         }
     }
-    #[cfg(not(windows))]
-    let _ = script;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Its own process group, so it isn't taken down with this one.
+        if let Err(e) = std::process::Command::new("sh").arg("-c").arg(script).process_group(0).spawn() {
+            log::warn!("update: couldn't run the update: {e}");
+        }
+    }
 }
 
 fn client() -> anyhow::Result<reqwest::Client> {
@@ -352,6 +516,16 @@ fn client() -> anyhow::Result<reqwest::Client> {
 #[cfg(test)]
 mod tests {
     use super::newer;
+
+    #[test]
+    fn fork_update_endpoints_and_version_stay_on_fork() {
+        assert_eq!(super::LATEST, "https://api.github.com/repos/Hellgers/ytm-rs/releases/latest");
+        assert_eq!(super::ALL_RELEASES, "https://api.github.com/repos/Hellgers/ytm-rs/releases");
+        assert_eq!(super::BY_TAG, "https://api.github.com/repos/Hellgers/ytm-rs/releases/tags/v");
+        assert_eq!(super::RELEASES, "https://github.com/Hellgers/ytm-rs/releases");
+        assert!(newer(env!("CARGO_PKG_VERSION"), "0.2.31"));
+        assert!(newer(env!("CARGO_PKG_VERSION"), "0.2.21"));
+    }
 
     #[test]
     fn version_order() {

@@ -45,6 +45,10 @@ pub struct Track {
     pub track_nr: Option<u16>,
     /// Play count, as YouTube Music shows it on artist pages and in search.
     pub plays: Option<u64>,
+    /// An official music video (not the song), which plays its song version instead
+    /// when one is found and that's switched on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub music_video: bool,
 }
 
 impl Track {
@@ -69,12 +73,41 @@ pub fn pick(thumbs: &[Thumb], min_px: u32) -> Option<&str> {
 /// Ask Google's image CDN for a specific size (`=w226-h226…` / `=s120` suffixes), so
 /// thumbnails are sharp at the size drawn without downloading huge originals.
 pub fn sized(url: &str, px: u32) -> String {
-    if url.contains("googleusercontent.com") || url.contains("ggpht.com") {
-        if let Some(i) = url.rfind('=') {
-            return format!("{}=w{px}-h{px}-l90-rj", &url[..i]);
-        }
+    if (url.contains("googleusercontent.com") || url.contains("ggpht.com"))
+        && let Some(i) = url.rfind('=')
+    {
+        // A square one that asked to be cropped to fill (`-p`, `-c`; artist photos are
+        // often portrait) keeps that, or it comes back its own shape and is drawn
+        // stretched into the square.
+        let crop = square_crop(&url[i + 1..]);
+        return format!("{}=w{px}-h{px}{}-l90-rj", &url[..i], if crop { "-p" } else { "" });
     }
     url.to_owned()
+}
+
+/// Whether image options like `w120-h120-p-l90-rj` or `s120-c-k-no` ask for a square crop.
+fn square_crop(opts: &str) -> bool {
+    let parts: Vec<&str> = opts.split('-').collect();
+    if !parts.iter().any(|p| *p == "p" || *p == "c") {
+        return false;
+    }
+    let num = |prefix: char| parts.iter().find_map(|p| p.strip_prefix(prefix)?.parse::<u32>().ok());
+    parts.iter().any(|p| p.strip_prefix('s').is_some_and(|n| n.parse::<u32>().is_ok())) || matches!((num('w'), num('h')), (Some(w), Some(h)) if w == h)
+}
+
+#[cfg(test)]
+mod sized_tests {
+    use super::sized;
+
+    #[test]
+    fn square_crops_stay_cropped() {
+        let base = "https://yt3.ggpht.com/abc";
+        assert_eq!(sized(&format!("{base}=w120-h120-p-l90-rj"), 544), format!("{base}=w544-h544-p-l90-rj"));
+        assert_eq!(sized(&format!("{base}=s88-c-k-c0x00ffffff-no-rj"), 544), format!("{base}=w544-h544-p-l90-rj"));
+        // Album art doesn't ask, and a wide banner isn't squared.
+        assert_eq!(sized("https://lh3.googleusercontent.com/x=w120-h120-l90-rj", 544), "https://lh3.googleusercontent.com/x=w544-h544-l90-rj");
+        assert_eq!(sized("https://lh3.googleusercontent.com/x=w1440-h600-p-l90-rj", 544), "https://lh3.googleusercontent.com/x=w544-h544-l90-rj");
+    }
 }
 
 /// What a card or shelf item opens.

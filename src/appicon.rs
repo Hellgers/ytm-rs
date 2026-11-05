@@ -94,12 +94,14 @@ pub fn save(data_dir: &Path, id: &str) {
 
 /// Show `v` on the window: its title bar (small icon) and taskbar button (big icon).
 /// egui's icon command only sets the small one, so the taskbar kept the old icon.
+#[cfg_attr(not(windows), allow(unused_variables))]
 pub fn set_window_icon(v: &Variant) {
     #[cfg(windows)]
     window::set(v);
 }
 
 /// The main window's handle, from `main`.
+#[cfg_attr(not(windows), allow(unused_variables))]
 pub fn set_hwnd(hwnd: *mut std::ffi::c_void) {
     #[cfg(windows)]
     let _ = window::WINDOW.set(hwnd as usize);
@@ -161,6 +163,7 @@ pub fn sync_shortcuts(id: &'static str, data_dir: &Path) {
 }
 
 /// Where the shortcuts' icon file lives: next to the settings, so updates keep it.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn icon_file(v: &Variant, data_dir: &Path) -> anyhow::Result<PathBuf> {
     let dir = data_dir.join("icons");
     std::fs::create_dir_all(&dir)?;

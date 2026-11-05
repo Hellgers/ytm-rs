@@ -7,20 +7,80 @@ use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId};
 // ------------------------------------------------------------------ colours
 
 /// Base surface under the animated background (seen while it fades in).
-pub const BG: Color32 = Color32::from_rgb(12, 10, 14);
-pub const TEXT: Color32 = Color32::from_rgb(242, 240, 245);
-pub const TEXT_DIM: Color32 = Color32::from_rgb(178, 172, 186);
-pub const TEXT_FAINT: Color32 = Color32::from_rgb(130, 124, 140);
+const BG: Color32 = Color32::from_rgb(12, 10, 14);
+const TEXT: Color32 = Color32::from_rgb(242, 240, 245);
+const TEXT_DIM: Color32 = Color32::from_rgb(178, 172, 186);
+const TEXT_FAINT: Color32 = Color32::from_rgb(130, 124, 140);
+/// Light mode's counterparts.
+const BG_LIGHT: Color32 = Color32::from_rgb(246, 244, 248);
+const TEXT_LIGHT: Color32 = Color32::from_rgb(22, 20, 26);
+const TEXT_DIM_LIGHT: Color32 = Color32::from_rgb(86, 82, 94);
+const TEXT_FAINT_LIGHT: Color32 = Color32::from_rgb(124, 118, 132);
 /// Default accent until a cover provides one (YouTube Music red, slightly warm).
 pub const RED: Color32 = Color32::from_rgb(255, 48, 72);
+
+/// Light or dark, as the app picked it for what's being drawn (see `set_mode`): the
+/// colours below follow it. Now playing always draws dark, over the album art.
+static LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn light() -> bool {
+    LIGHT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Draw what follows light or dark: the colours here and egui's style (menus, fields,
+/// text) change together. Returns the mode before, to go back to.
+pub fn set_mode(ctx: &egui::Context, light: bool) -> bool {
+    let was = LIGHT.swap(light, std::sync::atomic::Ordering::Relaxed);
+    if was != light {
+        ctx.global_style_mut(|s| s.visuals = visuals());
+    }
+    was
+}
+
+/// Main text.
+pub fn text() -> Color32 {
+    if light() { TEXT_LIGHT } else { TEXT }
+}
+
+/// Text and icons on a fill of the main text colour (a primary button, a selected chip).
+pub fn on_text() -> Color32 {
+    if light() { Color32::WHITE } else { Color32::from_gray(15) }
+}
+
+/// Least important text: counts, hints, placeholders.
+pub fn text_faint() -> Color32 {
+    if light() { TEXT_FAINT_LIGHT } else { TEXT_FAINT }
+}
+
+/// The window's base colour, under the background.
+pub fn bg() -> Color32 {
+    if light() { BG_LIGHT } else { BG }
+}
+
+/// Menus and popups.
+pub fn menu_fill() -> Color32 {
+    if light() { Color32::WHITE } else { Color32::from_rgb(38, 34, 42) }
+}
+
+/// Dialogs and cards that float over the page.
+pub fn surface_fill() -> Color32 {
+    if light() { Color32::from_rgb(252, 251, 253) } else { Color32::from_rgb(28, 24, 32) }
+}
 
 /// Theme preset multiplier for every glass surface (f32 bits; 1.0 by default).
 static GLASS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f80_0000);
 
-/// White at `a` opacity, for glassy surfaces over the background.
+/// White at `a` opacity, for glassy surfaces over the background (black in light mode).
 pub fn glass(a: f32) -> Color32 {
     let k = f32::from_bits(GLASS.load(std::sync::atomic::Ordering::Relaxed));
-    Color32::from_white_alpha(((a * k).min(1.0) * 255.0) as u8)
+    let a = ((a * k).min(1.0) * 255.0) as u8;
+    if light() { Color32::from_black_alpha(a) } else { Color32::from_white_alpha(a) }
+}
+
+/// A panel over the background (sidebar, player bar, queue): darker than the page at
+/// `a`, or in light mode lighter.
+pub fn panel(a: f32) -> Color32 {
+    if light() { Color32::from_white_alpha((a.clamp(0.0, 1.0) * 255.0) as u8) } else { shade(a) }
 }
 
 /// The active theme's secondary text colour, set with its chrome (read very often).
@@ -28,8 +88,133 @@ static DIM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32
 
 /// Secondary text colour (themes may tint it).
 pub fn text_dim() -> Color32 {
+    if light() {
+        return TEXT_DIM_LIGHT;
+    }
     let [r, g, b, a] = DIM.load(std::sync::atomic::Ordering::Relaxed).to_le_bytes();
     Color32::from_rgba_premultiplied(r, g, b, a)
+}
+
+/// Light, dark, or whichever the system uses (Settings › Appearance › Mode).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Self {
+        Self::ALL.into_iter().find(|a| a.key() == s).unwrap_or_default()
+    }
+
+    /// Whether this means light, given the system's mode as eframe reports it.
+    pub fn is_light(self, ctx: &egui::Context) -> bool {
+        match self {
+            Self::Light => true,
+            Self::Dark => false,
+            Self::System => system_light().unwrap_or_else(|| ctx.system_theme() == Some(egui::Theme::Light)),
+        }
+    }
+}
+
+/// Windows' "app mode" (Settings › Personalization › Colors), read again every couple
+/// of seconds so switching it there shows without a restart. `None` off Windows.
+fn system_light() -> Option<bool> {
+    use std::time::{Duration, Instant};
+    static MODE: std::sync::Mutex<Option<(Instant, Option<bool>)>> = std::sync::Mutex::new(None);
+    let mut cached = MODE.lock().unwrap();
+    match *cached {
+        Some((at, m)) if at.elapsed() < Duration::from_secs(2) => m,
+        _ => {
+            let m = read_system_light();
+            *cached = Some((Instant::now(), m));
+            m
+        }
+    }
+}
+
+#[cfg(windows)]
+fn read_system_light() -> Option<bool> {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+    use windows::core::w;
+    let mut v = 0u32;
+    let mut size = 4u32;
+    // SAFETY: a DWORD out-buffer of the size passed; the strings are static.
+    unsafe {
+        RegGetValueW(HKEY_CURRENT_USER, w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"), w!("AppsUseLightTheme"), RRF_RT_REG_DWORD, None, Some(&mut v as *mut u32 as *mut _), Some(&mut size))
+            .is_ok()
+            .then_some(v != 0)
+    }
+}
+
+#[cfg(not(windows))]
+fn read_system_light() -> Option<bool> {
+    None
+}
+
+/// The Windows accent colour, in the lighter shade Windows itself uses on dark
+/// surfaces (`AccentPalette`'s second entry), or the base accent if there's no palette.
+/// Read again every couple of seconds, so a new colour picked in Windows' settings
+/// shows without a restart. `None` off Windows or when the setting can't be read.
+pub fn system_accent() -> Option<Color32> {
+    use std::time::{Duration, Instant};
+    static ACCENT: std::sync::Mutex<Option<(Instant, Option<Color32>)>> = std::sync::Mutex::new(None);
+    let mut cached = ACCENT.lock().unwrap();
+    match *cached {
+        Some((at, c)) if at.elapsed() < Duration::from_secs(2) => c,
+        _ => {
+            let c = read_system_accent();
+            *cached = Some((Instant::now(), c));
+            c
+        }
+    }
+}
+
+#[cfg(windows)]
+fn read_system_accent() -> Option<Color32> {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD, RegGetValueW};
+    use windows::core::w;
+    // SAFETY: out-buffers sized to what we pass; the strings are static.
+    unsafe {
+        // Eight RGBA swatches, lightest first; the second is "light 2".
+        let mut palette = [0u8; 32];
+        let mut size = palette.len() as u32;
+        let key = w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent");
+        if RegGetValueW(HKEY_CURRENT_USER, key, w!("AccentPalette"), RRF_RT_REG_BINARY, None, Some(palette.as_mut_ptr() as *mut _), Some(&mut size)).is_ok() && size >= 8 {
+            return Some(Color32::from_rgb(palette[4], palette[5], palette[6]));
+        }
+        // 0xAABBGGRR.
+        let mut abgr = 0u32;
+        let mut size = 4u32;
+        RegGetValueW(HKEY_CURRENT_USER, w!(r"Software\Microsoft\Windows\DWM"), w!("AccentColor"), RRF_RT_REG_DWORD, None, Some(&mut abgr as *mut u32 as *mut _), Some(&mut size))
+            .is_ok()
+            .then(|| Color32::from_rgb(abgr as u8, (abgr >> 8) as u8, (abgr >> 16) as u8))
+    }
+}
+
+#[cfg(not(windows))]
+fn read_system_accent() -> Option<Color32> {
+    None
 }
 
 /// Corner radius of album/playlist art in cards.
@@ -87,11 +272,11 @@ pub const SPEED: f32 = 0.65;
 
 /// Animate toward `target` (eased), keyed by `id`. Requests repaints while moving.
 pub fn anim(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug, target: f32, secs: f32) -> f32 {
-    ctx.animate_value_with_time(egui::Id::new(id), target, secs * SPEED)
+    ctx.animate_value_with_time(egui::Id::unique(id), target, secs * SPEED)
 }
 
 pub fn anim_bool(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug, on: bool, secs: f32) -> f32 {
-    ease_out(ctx.animate_bool_with_time(egui::Id::new(id), on, secs * SPEED))
+    ease_out(ctx.animate_bool_with_time(egui::Id::unique(id), on, secs * SPEED))
 }
 
 // ------------------------------------------------------------------ type
@@ -140,8 +325,12 @@ pub mod icon {
     pub const LIST_MUSIC: char = '\u{e2e0}';
     pub const MIC_VOCAL: char = '\u{e349}';
     pub const X: char = '\u{e1b2}';
+    pub const HISTORY: char = '\u{e1f5}';
+    pub const TRASH_2: char = '\u{e18e}';
     pub const ELLIPSIS_VERTICAL: char = '\u{e0b7}';
     pub const LIST_PLUS: char = '\u{e23f}';
+    pub const LIST_MINUS: char = '\u{e23e}';
+    pub const LIST_CHECKS: char = '\u{e1d0}';
     pub const RADIO: char = '\u{e142}';
     pub const DISC_3: char = '\u{e494}';
     pub const USER: char = '\u{e19f}';
@@ -161,6 +350,10 @@ pub mod icon {
     pub const HEADPHONES: char = '\u{e0f1}';
     pub const DOWNLOAD: char = '\u{e0b2}';
     pub const FOLDER_OPEN: char = '\u{e247}';
+    pub const PIN: char = '\u{e259}';
+    pub const PIN_OFF: char = '\u{e2b6}';
+    pub const PICTURE_IN_PICTURE: char = '\u{e3af}';
+    pub const MAXIMIZE_2: char = '\u{e113}';
 }
 
 /// Inter (SIL OFL 1.1), the default face: regular / semibold / extra bold, subset to
@@ -222,7 +415,7 @@ fn lyric_key(name: &str) -> Option<&'static str> {
 /// interface and the lyrics. Empty: the theme's own.
 static FONT_CHOICE: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
 
-/// An installed font the listener picked, once its faces are loaded. Drawn through the
+/// An installed font the listener (or the theme) picked, once its faces are loaded. Drawn through the
 /// "choice-<weight>" families, which always exist (Inter until something is loaded), so
 /// a frame laid out before egui swaps fonts in never names a missing family.
 static CHOICE: std::sync::RwLock<Option<Chosen>> = std::sync::RwLock::new(None);
@@ -417,7 +610,6 @@ fn scan_fonts() -> Vec<SysFamily> {
 /// The closest face to each of the three weights the app draws: regular, semibold, and
 /// bold, leaning to 700 over 900 where a family has both.
 fn choose_faces(family: &SysFamily) -> Option<[Face; 3]> {
-    static MAPPED: std::sync::Mutex<Vec<(std::path::PathBuf, &'static [u8])>> = std::sync::Mutex::new(Vec::new());
     let mut faces = Vec::new();
     for target in [400.0, 600.0, 750.0] {
         let best = family.faces.iter().min_by_key(|f| match f.wght {
@@ -425,23 +617,17 @@ fn choose_faces(family: &SysFamily) -> Option<[Face; 3]> {
             Some((lo, hi)) => (target - target.clamp(lo, hi)).abs() as i32,
             None => (f.weight - target).abs() as i32,
         })?;
-        let mut mapped = MAPPED.lock().unwrap();
-        let bytes = match mapped.iter().find(|(p, _)| *p == best.path) {
-            Some((_, b)) => *b,
-            None => {
-                let b = map(best.path.to_str()?)?;
-                mapped.push((best.path.clone(), b));
-                b
-            }
-        };
+        let bytes = map(&best.path)?;
         faces.push(Face { bytes, index: best.index, wght: best.wght.map(|(lo, hi)| target.clamp(lo, hi)) });
     }
     faces.try_into().ok()
 }
 
-/// Load the faces of the installed font the listener picked, if that's what it is.
-fn load_choice() {
-    let name = font_choice();
+/// Load the faces of the installed font in use, if that's what it is: the listener's
+/// pick, else one the theme names for its interface (Fluent's Segoe UI Variable). A
+/// name can list fallbacks, "Segoe UI Variable, Segoe UI", tried in order.
+fn load_choice(ui_font: &str) {
+    let name = effective_font(ui_font);
     if name.is_empty() || lyric_key(&name).is_some() || name.eq_ignore_ascii_case("inter") {
         *CHOICE.write().unwrap() = None;
         return;
@@ -451,7 +637,7 @@ fn load_choice() {
     }
     // Only when an installed font is set: a one-off scan, the first time.
     let all = INSTALLED_FONTS.get_or_init(scan_fonts);
-    let faces = all.iter().find(|f| f.name.eq_ignore_ascii_case(&name)).and_then(choose_faces);
+    let faces = name.split(',').map(str::trim).find_map(|n| all.iter().find(|f| f.name.eq_ignore_ascii_case(n)).and_then(choose_faces));
     if faces.is_none() {
         log::warn!("font {name:?} isn't installed; using Inter");
     }
@@ -541,7 +727,7 @@ fn font_data(face: Face, y_offset_factor: f32) -> FontData {
 /// sit visibly higher than Latin ones in the same line. Each fallback therefore gets a
 /// y offset computed from both fonts' metrics, once per primary font it backs.
 pub fn install_fonts(ctx: &egui::Context, ui_font: &str) {
-    load_choice();
+    load_choice(ui_font);
     let ui_key = font_key(ui_font);
     // Installing rebuilds the font atlas; most themes share a UI font, so skip repeats.
     static INSTALLED: std::sync::Mutex<Option<(&'static str, String)>> = std::sync::Mutex::new(None);
@@ -575,12 +761,11 @@ pub fn install_fonts(ctx: &egui::Context, ui_font: &str) {
                 .collect()
         })
     });
-    // Primary fonts: Inter, each lyric font, and the installed font picked in Settings
-    // (Inter again when there's none, so the "choice" families always exist).
+    // Primary fonts: Inter, each lyric font, and the installed font picked in Settings.
     let choice = CHOICE.read().unwrap().as_ref().map(|c| c.faces);
     let mut groups: Vec<(&str, [Face; 3])> = vec![("inter", INTER.map(Face::of))];
     groups.extend(LYRIC_FONTS.iter().map(|(k, w)| (*k, w.map(Face::of))));
-    groups.push(("choice", choice.unwrap_or(INTER.map(Face::of))));
+    groups.extend(choice.map(|faces| ("choice", faces)));
     for (key, faces) in &groups {
         let (asc_p, h_p) = em_metrics(faces[0].bytes, faces[0].index).unwrap_or((0.97, 1.21));
         for (w, face) in faces.iter().enumerate() {
@@ -597,10 +782,10 @@ pub fn install_fonts(ctx: &egui::Context, ui_font: &str) {
                 }
                 chain.push(id);
             }
-            if *key == "inter" && w == 0 {
-                if let Some(mono) = defs.families.get_mut(&FontFamily::Monospace) {
-                    mono.extend(chain[1..].iter().cloned());
-                }
+            if *key == "inter" && w == 0
+                && let Some(mono) = defs.families.get_mut(&FontFamily::Monospace)
+            {
+                mono.extend(chain[1..].iter().cloned());
             }
             // egui's bundled emoji/icon font stays as a last resort.
             chain.extend(egui_default.iter().filter(|n| n.as_str() != "Ubuntu-Light").cloned());
@@ -615,15 +800,55 @@ pub fn install_fonts(ctx: &egui::Context, ui_font: &str) {
             }
         }
     }
+    // With no installed font picked, the "choice" families are Inter's, so they always
+    // exist without a second copy of Inter and its fallbacks.
+    if choice.is_none() {
+        for w in 0..3 {
+            let inter = defs.families[&FontFamily::Name(format!("inter-{w}").into())].clone();
+            defs.families.insert(FontFamily::Name(format!("choice-{w}").into()), inter);
+        }
+    }
+    // The same bytes get the same `Arc` on every install, so comparing these definitions
+    // with the installed ones is a pointer check per font instead of reading every file.
+    for data in defs.font_data.values_mut() {
+        let font = shared_bytes(&data.font);
+        if !Arc::ptr_eq(&font, &data.font) {
+            *data = Arc::new(FontData { font, ..(**data).clone() });
+        }
+    }
     ctx.set_fonts(defs);
 }
 
-fn map(path: &str) -> Option<&'static [u8]> {
-    let file = std::fs::File::open(path).ok()?;
+/// The first `Blob` seen for these bytes. Font bytes here are all `'static` (bundled, or
+/// mapped for the rest of the process), so the address identifies them for good.
+fn shared_bytes(blob: &egui::epaint::text::Blob) -> egui::epaint::text::Blob {
+    static SEEN: std::sync::Mutex<Vec<egui::epaint::text::Blob>> = std::sync::Mutex::new(Vec::new());
+    let bytes = (**blob).as_ref();
+    let mut seen = SEEN.lock().unwrap();
+    if let Some(b) = seen.iter().find(|b| std::ptr::eq((***b).as_ref(), bytes)) {
+        return b.clone();
+    }
+    seen.push(blob.clone());
+    blob.clone()
+}
+
+/// Map a font file for the rest of the process. Kept by canonical path, so a file is
+/// mapped once however many weights, faces or installed-font picks use it, and whichever
+/// spelling names it (the installed-font scan's C:\WINDOWS, the fallback list's C:\Windows).
+fn map(path: impl AsRef<std::path::Path>) -> Option<&'static [u8]> {
+    static MAPPED: std::sync::Mutex<Vec<(std::path::PathBuf, &'static [u8])>> = std::sync::Mutex::new(Vec::new());
+    let path = std::fs::canonicalize(path).ok()?;
+    let mut mapped = MAPPED.lock().unwrap();
+    if let Some((_, bytes)) = mapped.iter().find(|(p, _)| *p == path) {
+        return Some(bytes);
+    }
+    let file = std::fs::File::open(&path).ok()?;
     // SAFETY: system font files aren't modified while in use; the mapping is
     // read-only and intentionally lives for the rest of the process.
     let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
-    Some(Box::leak(Box::new(mmap)))
+    let bytes: &'static [u8] = Box::leak(Box::new(mmap));
+    mapped.push((path, bytes));
+    Some(bytes)
 }
 
 /// Apply a theme preset's chrome: how strong glass surfaces are and how round
@@ -634,15 +859,6 @@ pub fn apply_chrome(ctx: &egui::Context, p: &crate::preset::Preset) {
     DIM.store(u32::from_le_bytes(dim.to_array()), std::sync::atomic::Ordering::Relaxed);
     install_style(ctx);
     install_fonts(ctx, &p.app.font);
-    let r = p.chrome.radius.clamp(2.0, 28.0) as u8;
-    let pr = egui::CornerRadius::same(p.app.panel_radius.clamp(0.0, 32.0) as u8);
-    ctx.global_style_mut(|s| {
-        s.visuals.window_corner_radius = pr;
-        s.visuals.menu_corner_radius = pr;
-        for w in [&mut s.visuals.widgets.inactive, &mut s.visuals.widgets.hovered, &mut s.visuals.widgets.active, &mut s.visuals.widgets.open] {
-            w.corner_radius = egui::CornerRadius::same(r);
-        }
-    });
 }
 
 pub fn install_style(ctx: &egui::Context) {
@@ -655,32 +871,42 @@ pub fn install_style(ctx: &egui::Context) {
         s.text_styles.insert(egui::TextStyle::Button, semibold(14.0));
         s.text_styles.insert(egui::TextStyle::Heading, bold(22.0));
         s.text_styles.insert(egui::TextStyle::Small, regular(12.0));
-        let v = &mut s.visuals;
-        v.panel_fill = BG;
-        v.window_fill = Color32::from_rgb(28, 24, 32);
-        v.extreme_bg_color = glass(0.08);
-        v.override_text_color = Some(TEXT);
-        v.selection.bg_fill = with_alpha(RED, 0.5);
-        v.hyperlink_color = TEXT;
-        v.window_corner_radius = egui::CornerRadius::same(14);
-        v.menu_corner_radius = egui::CornerRadius::same(12);
-        v.window_stroke = egui::Stroke::new(1.0, glass(0.08));
-        v.popup_shadow = egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: shade(0.5) };
-        for (w, fill) in [
-            (&mut v.widgets.inactive, glass(0.08)),
-            (&mut v.widgets.hovered, glass(0.14)),
-            (&mut v.widgets.active, glass(0.2)),
-            (&mut v.widgets.open, glass(0.14)),
-        ] {
-            w.bg_fill = fill;
-            w.weak_bg_fill = fill;
-            w.bg_stroke = egui::Stroke::NONE;
-            w.corner_radius = egui::CornerRadius::same(18);
-            w.fg_stroke.color = TEXT;
-        }
-        v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, glass(0.08));
+        s.visuals = visuals();
         s.interaction.selectable_labels = false;
         s.animation_time = 0.18 * SPEED;
     });
+}
+
+/// egui's colours and shapes for the current mode and the active preset's chrome.
+fn visuals() -> egui::Visuals {
+    let p = crate::preset::active();
+    let mut v = if light() { egui::Visuals::light() } else { egui::Visuals::dark() };
+    v.panel_fill = bg();
+    v.window_fill = surface_fill();
+    v.extreme_bg_color = glass(0.08);
+    v.override_text_color = Some(text());
+    v.selection.bg_fill = with_alpha(RED, if light() { 0.3 } else { 0.5 });
+    v.hyperlink_color = text();
+    v.interact_cursor = Some(egui::CursorIcon::PointingHand);
+    let pr = egui::CornerRadius::same(p.app.panel_radius.clamp(0.0, 32.0) as u8);
+    v.window_corner_radius = pr;
+    v.menu_corner_radius = pr;
+    v.window_stroke = egui::Stroke::new(1.0, glass(0.08));
+    v.popup_shadow = egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: shade(if light() { 0.16 } else { 0.5 }) };
+    let r = egui::CornerRadius::same(p.chrome.radius.clamp(2.0, 28.0) as u8);
+    for (w, fill) in [
+        (&mut v.widgets.inactive, glass(0.08)),
+        (&mut v.widgets.hovered, glass(0.14)),
+        (&mut v.widgets.active, glass(0.2)),
+        (&mut v.widgets.open, glass(0.14)),
+    ] {
+        w.bg_fill = fill;
+        w.weak_bg_fill = fill;
+        w.bg_stroke = egui::Stroke::NONE;
+        w.corner_radius = r;
+        w.fg_stroke.color = text();
+    }
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, glass(0.08));
+    v
 }
 

@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::mixer::{Mixer, MixerSource};
-use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
+use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player};
 
-use crate::stream::{self, Shared, StreamReader};
+use crate::stream::{self, Shared};
 
-pub type TrackDecoder = Decoder<StreamReader>;
+pub use crate::stream::TrackDecoder;
 
 pub enum AudioCmd {
     /// A decoder is ready for playback generation `generation`; stale generations are dropped.
@@ -70,6 +70,8 @@ pub struct AudioStatus {
     volume: AtomicU32,
     /// Turn loud tracks down to YouTube's loudness target.
     pub normalize: AtomicBool,
+    /// The volume slider follows loudness (cubic) rather than amplitude.
+    log_volume: AtomicBool,
     /// Smoothed output loudness 0..1 (f32 bits), for audio-reactive visuals.
     level: AtomicU32,
     /// How far the output device runs behind the position (its buffer), in ms.
@@ -245,6 +247,15 @@ impl AudioHandle {
         self.send(AudioCmd::Volume(self.volume()));
     }
 
+    /// Switches the slider's curve, moving it so the music stays as loud as it was.
+    pub fn set_log_volume(&self, on: bool) {
+        if self.status.log_volume.swap(on, Ordering::Relaxed) != on {
+            let v = self.volume();
+            self.status.volume.store(if on { v.cbrt() } else { v.powi(3) }.to_bits(), Ordering::Relaxed);
+        }
+        self.send(AudioCmd::Volume(self.volume()));
+    }
+
     pub fn set_crossfade(&self, secs: u32) {
         self.status.crossfade_ms.store(secs * 1000, Ordering::Relaxed);
     }
@@ -331,6 +342,13 @@ const QUICK_FADE_MS: u32 = 40;
 /// fades out anyway.
 const HANDOFF_WAIT: Duration = Duration::from_secs(3);
 
+/// Gain for a volume slider position. Ears hear amplitude roughly logarithmically,
+/// so on a linear slider nearly all the change is in its bottom few pixels; the cubic
+/// curve (PulseAudio's) spreads it out: half way is -18 dB.
+fn slider_gain(status: &AudioStatus, v: f32) -> f32 {
+    if status.log_volume.load(Ordering::Relaxed) { v.powi(3) } else { v }
+}
+
 fn norm_gain(status: &AudioStatus, shared: Option<&Shared>) -> f32 {
     match shared.and_then(|s| s.loudness_db) {
         Some(db) if db > 0.0 && status.normalize.load(Ordering::Relaxed) => 10f32.powf(-db / 20.0),
@@ -344,6 +362,8 @@ fn norm_gain(status: &AudioStatus, shared: Option<&Shared>) -> f32 {
 /// without touching the players or the songs in them.
 struct Output {
     mixer: Mixer,
+    // Fixed for this mixer's lifetime, including device recovery. Each track
+    // converts to these values; Bridge handles a new device's own format.
     channels: rodio::ChannelCount,
     rate: rodio::SampleRate,
     /// Our mixer's output while no device has it; the device's `Bridge` holds it.
@@ -467,7 +487,7 @@ pub fn output_devices() -> Vec<OutputDevice> {
             Some(OutputDevice { id, name })
         })
         .collect();
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     out
 }
 
@@ -508,7 +528,7 @@ impl rodio::Source for Bridge {
 impl Drop for Bridge {
     fn drop(&mut self) {
         if let Some(mut source) = self.inner.take() {
-            while self.n % self.channels.max(1) as u64 != 0 {
+            while !self.n.is_multiple_of(self.channels.max(1) as u64) {
                 source.next();
                 self.n += 1;
             }
@@ -520,10 +540,11 @@ impl Drop for Bridge {
 /// How often to look for a new default device while playing.
 const DEVICE_CHECK: Duration = Duration::from_secs(1);
 
-pub fn spawn(volume: f32, device: Option<String>, events: Sender<AudioEvent>, wake: impl Fn() + Send + 'static) -> AudioHandle {
+pub fn spawn(volume: f32, log_volume: bool, device: Option<String>, events: Sender<AudioEvent>, wake: impl Fn() + Send + 'static) -> AudioHandle {
     let (tx, rx) = unbounded();
     let status = Arc::new(AudioStatus::default());
     status.volume.store(volume.to_bits(), Ordering::Relaxed);
+    status.log_volume.store(log_volume, Ordering::Relaxed);
     let st = status.clone();
     std::thread::Builder::new()
         .name("audio".into())
@@ -550,7 +571,7 @@ fn run(
         wake();
     }
     let mut player = Player::connect_new(&output.mixer);
-    player.set_volume(volume);
+    player.set_volume(slider_gain(&status, volume));
     // The playing source's fade-out control (see `Meter`).
     let mut fade_out = Arc::new(AtomicU32::new(0));
     // Songs fading out under the current one (more than one only for a moment).
@@ -593,7 +614,7 @@ fn run(
                 player.clear();
                 let gain = norm_gain(&status, Some(&s));
                 log::info!("audio: loudness {:?} dB, normalization gain {gain:.3}", s.loudness_db);
-                player.set_volume(f32::from_bits(status.volume.load(Ordering::Relaxed)) * gain);
+                player.set_volume(slider_gain(&status, f32::from_bits(status.volume.load(Ordering::Relaxed))) * gain);
                 // Fade in only over a song still playing, both over the same length.
                 fading.retain(|f| !f.player.empty());
                 let crossfade = status.crossfade_ms.load(Ordering::Relaxed);
@@ -772,6 +793,7 @@ fn run(
                 }
             }
             Ok(AudioCmd::Volume(v)) => {
+                let v = slider_gain(&status, v);
                 player.set_volume(v * norm_gain(&status, shared.as_deref()));
                 for f in &fading {
                     f.player.set_volume(v * norm_gain(&status, f.shared.as_deref()));
@@ -795,10 +817,9 @@ fn run(
             && !player.is_paused()
             && output.checked.elapsed() >= DEVICE_CHECK
             && !output.lost.load(Ordering::Relaxed)
+            && (output.sink.is_none() || output.default_changed())
         {
-            if output.sink.is_none() || output.default_changed() {
-                output.open(tx.clone(), &status);
-            }
+            output.open(tx.clone(), &status);
         }
         if !fading.is_empty() {
             // The next song is taking too long: don't hold this one up any longer.
@@ -830,7 +851,7 @@ fn run(
             if player.empty() {
                 // A failed download ends the decoder early: that's not the song ending.
                 let failure = if format_error.load(Ordering::Acquire) {
-                    Some("Audio format changed within the track; playback stopped".into())
+                    Some("Audio format changed or ended inside a frame; playback stopped".into())
                 } else {
                     shared.as_ref().and_then(|s| s.error())
                 };
@@ -851,6 +872,66 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn converted_tracks_crossfade_in_the_fixed_mixer_format() {
+        use std::num::NonZero;
+        use rodio::Source;
+        let channels = NonZero::new(2).unwrap();
+        let rate = NonZero::new(44100).unwrap();
+        let status = Arc::new(AudioStatus::default());
+        let outgoing_flag = Arc::new(AtomicBool::new(false));
+        let incoming_flag = Arc::new(AtomicBool::new(false));
+        // Opus-like 48 kHz stereo and AAC-like 44.1 kHz mono, converted
+        // independently before Meter, exactly as Start / Replace do.
+        let outgoing = crate::audio_source::convert(
+            rodio::buffer::SamplesBuffer::new(channels, NonZero::new(48000).unwrap(), vec![1.0; 19200]),
+            channels, rate, outgoing_flag.clone(),
+        );
+        let incoming = crate::audio_source::convert(
+            rodio::buffer::SamplesBuffer::new(NonZero::new(1).unwrap(), rate, vec![1.0; 8820]),
+            channels, rate, incoming_flag.clone(),
+        );
+        let out = Arc::new(AtomicU32::new(100));
+        let mut outgoing = Meter::new(outgoing, status.clone(), 0, out);
+        let mut incoming = Meter::new(incoming, status, 100, Arc::new(AtomicU32::new(0)));
+        assert_eq!(outgoing.sample_rate(), rate);
+        assert_eq!(incoming.channels(), channels);
+        for _ in 0..8820 {
+            let sum = incoming.next().unwrap() + outgoing.next().unwrap();
+            assert!((sum - 1.0).abs() < 1e-5);
+        }
+        assert_eq!(outgoing.next(), None);
+        assert_eq!(incoming.next(), Some(1.0));
+        assert!(!outgoing_flag.load(Ordering::Acquire));
+        assert!(!incoming_flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn output_bridge_recovery_preserves_fixed_format_and_channel_alignment() {
+        use std::num::NonZero;
+        use rodio::Source;
+        let channels = NonZero::new(2).unwrap();
+        let rate = NonZero::new(44100).unwrap();
+        let (mixer, source) = rodio::mixer::mixer(channels, rate);
+        mixer.add(rodio::buffer::SamplesBuffer::new(channels, rate, vec![0.25, -0.5, 0.75, -0.9]));
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let mut old = Bridge { inner: Some(source), slot: slot.clone(), channels: 2, n: 0 };
+        assert_eq!(old.next(), Some(0.25));
+        // Dropping an output device after its left sample must discard only
+        // that frame's right sample, then return the original mixer.
+        drop(old);
+        let source = slot.lock().unwrap().take().unwrap();
+        assert_eq!(source.channels(), channels);
+        assert_eq!(source.sample_rate(), rate);
+        let mut recovered = Bridge { inner: Some(source), slot: slot.clone(), channels: 2, n: 0 };
+        assert_eq!(recovered.next(), Some(0.75));
+        assert_eq!(recovered.next(), Some(-0.9));
+        assert_eq!(recovered.next(), Some(0.0));
+        assert_eq!(recovered.sample_rate(), rate);
+        drop(recovered);
+        assert!(slot.lock().unwrap().is_some());
+    }
 
     #[test]
     fn crossfade_ramps_mirror_each_other_and_end_the_fading_song() {
@@ -878,9 +959,9 @@ mod tests {
     #[test]
     fn normalization_only_turns_loud_tracks_down() {
         let status = AudioStatus::default();
-        let loud = Shared::new(1, 0, Some(7.29), false);
-        let quiet = Shared::new(1, 0, Some(-4.0), false);
-        let unknown = Shared::new(1, 0, None, false);
+        let loud = Shared::new(1, 0, Some(7.29), false, false);
+        let quiet = Shared::new(1, 0, Some(-4.0), false, false);
+        let unknown = Shared::new(1, 0, None, false, false);
         status.normalize.store(true, Ordering::Relaxed);
         assert!((norm_gain(&status, Some(&loud)) - 0.432).abs() < 0.001);
         assert_eq!(norm_gain(&status, Some(&quiet)), 1.0);
@@ -888,5 +969,19 @@ mod tests {
         assert_eq!(norm_gain(&status, None), 1.0);
         status.normalize.store(false, Ordering::Relaxed);
         assert_eq!(norm_gain(&status, Some(&loud)), 1.0);
+    }
+
+    #[test]
+    fn log_volume_keeps_loudness_when_switched() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let audio = AudioHandle { tx, status: Arc::new(AudioStatus::default()) };
+        audio.set_volume(0.125);
+        audio.set_log_volume(true);
+        assert!((audio.volume() - 0.5).abs() < 1e-6);
+        assert!((slider_gain(&audio.status, audio.volume()) - 0.125).abs() < 1e-6);
+        audio.set_log_volume(true);
+        assert!((audio.volume() - 0.5).abs() < 1e-6);
+        audio.set_log_volume(false);
+        assert!((audio.volume() - 0.125).abs() < 1e-6);
     }
 }

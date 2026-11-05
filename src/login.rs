@@ -1,8 +1,8 @@
 //! "Sign in with Google" and "Sign in to Spotify" windows.
 //!
 //! Opens the service's normal sign-in page in the system webview (WebView2 on Windows,
-//! which ships with the OS), waits until the flow lands on the app's site, then hands the
-//! session cookies (HttpOnly ones included) to the app.
+//! WKWebView on macOS, WebKitGTK on Linux), waits until the flow lands on the app's
+//! site, then hands the session cookies (HttpOnly ones included) to the app.
 //!
 //! The window runs in a child process (`ytm-rs --login <dir>`): tao and winit crash
 //! when both pump windows in one process (STATUS_FATAL_USER_CALLBACK_EXCEPTION), and a
@@ -71,6 +71,10 @@ pub enum Outcome {
     Failed(String),
 }
 
+/// Safari's user agent (macOS always reports 10_15_7 here, whatever the version).
+#[cfg(target_os = "macos")]
+const SAFARI_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+
 /// Command-line flags that make the binary run only a sign-in window.
 pub const FLAG: &str = "--login";
 pub const SPOTIFY_FLAG: &str = "--login-spotify";
@@ -119,9 +123,82 @@ pub fn child_main(site: Site, profile_dir: PathBuf) {
     }
 }
 
-/// Delete the webview profile so the next sign-in starts fresh (used on sign-out).
+/// Put the webview in its window. On Linux it goes in the GTK box tao made for it:
+/// wry's plain `build` only works with an X11 window that already exists, and these
+/// start hidden (and Wayland has no such window at all).
+pub trait BuildIn<'a> {
+    fn build_in(self, window: &'a tao::window::Window) -> wry::Result<wry::WebView>;
+}
+
+impl<'a> BuildIn<'a> for WebViewBuilder<'a> {
+    fn build_in(self, window: &'a tao::window::Window) -> wry::Result<wry::WebView> {
+        #[cfg(target_os = "linux")]
+        {
+            use tao::platform::unix::WindowExtUnix;
+            use wry::WebViewBuilderExtUnix;
+            self.build_gtk(window.default_vbox().expect("tao makes a vbox by default"))
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.build(window)
+    }
+}
+
+/// The cookies the browser would send to `url`.
+#[cfg(not(target_os = "macos"))]
+fn cookies_for(webview: &wry::WebView, url: &str) -> wry::Result<Vec<wry::cookie::Cookie<'static>>> {
+    webview.cookies_for_url(url)
+}
+
+/// On macOS wry's `cookies_for_url` keeps only cookies set for exactly the page's host, so
+/// Google's, set for `.youtube.com`, never came back and signing in never finished.
+#[cfg(target_os = "macos")]
+fn cookies_for(webview: &wry::WebView, url: &str) -> wry::Result<Vec<wry::cookie::Cookie<'static>>> {
+    let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_default();
+    Ok(webview.cookies()?.into_iter().filter(|c| c.domain().is_some_and(|d| domain_matches(&host, d))).collect())
+}
+
+/// Whether a cookie for `domain` (".youtube.com", "youtube.com", "music.youtube.com")
+/// goes to `host`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn domain_matches(host: &str, domain: &str) -> bool {
+    let domain = domain.trim_start_matches('.').to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
+    !domain.is_empty() && (host == domain || host.ends_with(&format!(".{domain}")))
+}
+
+/// Delete the webview profile so the next sign-in starts fresh (on sign-out, and after
+/// signing in). The browser processes can hold its files for a moment after the
+/// window closes, so it tries again for a few seconds; blocks meanwhile.
 pub fn forget(profile_dir: &std::path::Path) {
-    let _ = std::fs::remove_dir_all(profile_dir);
+    for tries in 1..=10 {
+        match std::fs::remove_dir_all(profile_dir) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) if tries == 10 => log::warn!("couldn't delete the sign-in window's profile {}: {e}", profile_dir.display()),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(500)),
+        }
+    }
+}
+
+/// WKWebView has no profile folder (wry ignores the context's on macOS), so each
+/// profile gets a data store of its own (macOS 14+; older ones share the default),
+/// named by an id kept in the folder. `forget` deletes the folder, so the next sign-in
+/// starts from a fresh store.
+#[cfg(target_os = "macos")]
+fn store_id(profile_dir: &std::path::Path) -> [u8; 16] {
+    use sha1::Digest;
+    let file = profile_dir.join("store-id");
+    if let Ok(saved) = std::fs::read(&file)
+        && let Ok(id) = <[u8; 16]>::try_from(saved.as_slice())
+    {
+        return id;
+    }
+    let seed = format!("{} {:?} {}", profile_dir.display(), std::time::SystemTime::now(), std::process::id());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&sha1::Sha1::digest(seed)[..16]);
+    let _ = std::fs::create_dir_all(profile_dir);
+    let _ = std::fs::write(&file, id);
+    id
 }
 
 fn run(site: Site, profile_dir: PathBuf) -> anyhow::Result<Outcome> {
@@ -133,21 +210,36 @@ fn run(site: Site, profile_dir: PathBuf) -> anyhow::Result<Outcome> {
         .build(&event_loop)?;
 
     let proxy = event_loop.create_proxy();
+    #[cfg(target_os = "macos")]
+    let store = store_id(&profile_dir);
     let mut context = WebContext::new(Some(profile_dir));
-    let webview = crate::proxy::webview(WebViewBuilder::new_with_web_context(&mut context))
+    let builder = WebViewBuilder::new_with_web_context(&mut context);
+    #[cfg(target_os = "macos")]
+    let builder = {
+        use wry::WebViewBuilderExtDarwin;
+        // WKWebView's own user agent has no "Version/… Safari/…", so YouTube Music takes it
+        // for an unknown browser and shows "not optimized for your browser" instead of the
+        // site. Say it's Safari, which is the engine it is.
+        builder.with_data_store_identifier(store).with_user_agent(SAFARI_UA)
+    };
+    // Google binds a sign-in from a browser that offers device-bound sessions to a key
+    // only that browser holds (`__Secure-1PSIDRTS`, renewed every 10 minutes), so the
+    // copy the app takes stops working after some hours. Without them Google signs in
+    // the way it does Firefox and Safari, and the copy lasts.
+    let webview = crate::proxy::webview(builder, matches!(site, Site::Google))
         .with_url(site.start())
         .with_on_page_load_handler(move |ev, url| {
             if matches!(ev, PageLoadEvent::Finished) && url.starts_with(site.home()) {
                 let _ = proxy.send_event(());
             }
         })
-        .build(&window)?;
+        .build_in(&window)?;
 
     let mut outcome = Outcome::Cancelled;
     event_loop.run_return(|event, _, flow| {
         *flow = ControlFlow::Wait;
         match event {
-            Event::UserEvent(()) => match webview.cookies_for_url(site.home()) {
+            Event::UserEvent(()) => match cookies_for(&webview, site.home()) {
                 Ok(cookies) => {
                     // Landing there while signed out also fires this; only a signed-in
                     // session has the session cookie (SAPISID, sp_dc).
@@ -170,4 +262,19 @@ fn run(site: Site, profile_dir: PathBuf) -> anyhow::Result<Outcome> {
     });
     drop(webview);
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::domain_matches;
+
+    #[test]
+    fn parent_domain_cookies_go_to_subdomains() {
+        assert!(domain_matches("music.youtube.com", ".youtube.com"));
+        assert!(domain_matches("music.youtube.com", "youtube.com"));
+        assert!(domain_matches("music.youtube.com", "music.youtube.com"));
+        assert!(!domain_matches("music.youtube.com", "accounts.google.com"));
+        assert!(!domain_matches("music.youtube.com", "tube.com"));
+        assert!(!domain_matches("evilyoutube.com", ".youtube.com"));
+    }
 }

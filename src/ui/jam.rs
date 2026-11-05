@@ -113,6 +113,9 @@ fn start_with(app: &mut App, code: String) {
     leave(app);
     fresh(app, true);
     app.jam.conn = Some(Jam::start(&app.backend, code, true, my_name(app)));
+    // Guests get the host's exact upload: a song version standing in for a music video
+    // goes back to the video, from the same point.
+    app.play_listed_upload();
 }
 
 pub fn join(app: &mut App, code: &str) {
@@ -126,6 +129,7 @@ pub fn join(app: &mut App, code: &str) {
     leave(app);
     fresh(app, false);
     app.jam.conn = Some(Jam::start(&app.backend, code, false, my_name(app)));
+    app.play_listed_upload();
 }
 
 /// Leave the room (the host ends it for everyone). Playback carries on locally.
@@ -177,7 +181,7 @@ pub fn dev_script(app: &mut App, ctx: &egui::Context, now: f64) {
             "queue=on" => set_control(app, app.jam.control, true),
             "queue=off" => set_control(app, app.jam.control, false),
             a if a.starts_with("add=") => {
-                let track = crate::model::Track { id: a[4..].to_owned(), title: "Test song".into(), artists: vec![], album: None, duration: None, thumbs: vec![], track_nr: None, plays: None };
+                let track = crate::model::Track { id: a[4..].to_owned(), title: "Test song".into(), artists: vec![], album: None, duration: None, thumbs: vec![], track_nr: None, plays: None, music_video: false };
                 app.apply(Action::Enqueue(track));
             }
             a if a.starts_with("seek=") => {
@@ -290,16 +294,16 @@ fn on_event(app: &mut App, e: Event) {
 /// of what would be sent: it runs every frame, so the state itself is only built
 /// (`host_state`) when the signature changed.
 fn host_tick(app: &App) -> (std::ops::Range<usize>, Tick, u64) {
-    let index = app.index.unwrap_or(0);
+    let index = app.queue.index.unwrap_or(0);
     let from = index.saturating_sub(BEFORE);
-    let to = (index + AFTER).min(app.queue.len()).max(from);
+    let to = (index + AFTER).min(app.queue.tracks.len()).max(from);
     let vid = app.current().map(|t| t.id.clone()).unwrap_or_default();
     let (pos, playing) = match app.resume_at {
         Some(at) => (at, false),
         None => (app.audio.status.position(), app.playing()),
     };
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    for t in app.queue.get(from..to).unwrap_or_default() {
+    for t in app.queue.tracks.get(from..to).unwrap_or_default() {
         t.id.hash(&mut h);
     }
     (index - from).hash(&mut h);
@@ -310,8 +314,8 @@ fn host_tick(app: &App) -> (std::ops::Range<usize>, Tick, u64) {
 }
 
 fn host_state(app: &App, range: std::ops::Range<usize>, tick: &Tick) -> RoomState {
-    let index = app.index.unwrap_or(0) - range.start;
-    let queue = app.queue.get(range).map(<[_]>::to_vec).unwrap_or_default();
+    let index = app.queue.index.unwrap_or(0) - range.start;
+    let queue = app.queue.tracks.get(range).map(<[_]>::to_vec).unwrap_or_default();
     let ids: std::collections::HashSet<&str> = queue.iter().map(|t| t.id.as_str()).collect();
     let pick = |m: &HashMap<String, String>| m.iter().filter(|(id, _)| ids.contains(id.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
     let (by, owner) = (pick(&app.jam.by), pick(&app.jam.owner));
@@ -342,7 +346,7 @@ fn host_send(app: &mut App) {
         );
         conn.send_state(&state);
         s.sent_sig = sig;
-        s.sent_from = app.index.unwrap_or(0).saturating_sub(BEFORE);
+        s.sent_from = app.queue.index.unwrap_or(0).saturating_sub(BEFORE);
         s.sent = Some((tick, now));
         return;
     }
@@ -359,8 +363,8 @@ fn host_send(app: &mut App) {
 
 /// Songs `member` added that haven't played yet.
 fn waiting(app: &App, member: &str) -> usize {
-    let start = app.index.map_or(0, |i| i + 1);
-    app.queue.get(start..).unwrap_or_default().iter().filter(|t| app.jam.owner.get(&t.id).is_some_and(|m| m == member)).count()
+    let start = app.queue.index.map_or(0, |i| i + 1);
+    app.queue.tracks.get(start..).unwrap_or_default().iter().filter(|t| app.jam.owner.get(&t.id).is_some_and(|m| m == member)).count()
 }
 
 fn host_request(app: &mut App, from: String, name: String, cmd: Cmd) {
@@ -380,27 +384,27 @@ fn host_request(app: &mut App, from: String, name: String, cmd: Cmd) {
         Cmd::Add { track } => {
             app.toast(format!("{name} added \"{}\"", track.title));
             app.jam.by.insert(track.id.clone(), name);
-            let Some(i) = app.index else {
-                app.queue.push(track);
-                app.index = Some(app.queue.len() - 1);
+            let Some(i) = app.queue.index else {
+                app.queue.tracks.push(track);
+                app.queue.index = Some(app.queue.tracks.len() - 1);
                 app.play_current();
                 return;
             };
             // After the current song and the other songs people added, ahead of autoplay.
             let mut at = i + 1;
-            while app.queue.get(at).is_some_and(|t| app.jam.by.contains_key(&t.id)) {
+            while app.queue.tracks.get(at).is_some_and(|t| app.jam.by.contains_key(&t.id)) {
                 at += 1;
             }
-            app.queue.insert(at.min(app.queue.len()), track);
+            app.queue.tracks.insert(at.min(app.queue.tracks.len()), track);
             app.prefetch_next();
         }
         Cmd::Next { track } => {
             app.toast(format!("{name} queued \"{}\" next", track.title));
             app.jam.by.insert(track.id.clone(), name);
-            let at = app.index.map_or(0, |i| i + 1).min(app.queue.len());
-            app.queue.insert(at, track);
-            if app.index.is_none() {
-                app.index = Some(0);
+            let at = app.queue.index.map_or(0, |i| i + 1).min(app.queue.tracks.len());
+            app.queue.tracks.insert(at, track);
+            if app.queue.index.is_none() {
+                app.queue.index = Some(0);
                 app.play_current();
             } else {
                 app.prefetch_next();
@@ -413,8 +417,8 @@ fn host_request(app: &mut App, from: String, name: String, cmd: Cmd) {
         Cmd::Seek { pos } => app.apply(Action::Seek(pos as f32 / 1000.0)),
         Cmd::Jump { index } => {
             let i = app.jam.sent_from + index;
-            if i < app.queue.len() {
-                app.index = Some(i);
+            if i < app.queue.tracks.len() {
+                app.queue.index = Some(i);
                 app.play_current();
             }
         }
@@ -436,17 +440,19 @@ fn apply_state(app: &mut App, state: RoomState, at: Instant) {
     let tick = Tick { vid: state.vid.clone(), pos: state.pos, playing: state.playing };
     app.jam.by = state.by;
     app.jam.owner = state.owner;
+    app.queue_source = None;
+    app.queue.fill = None;
+    app.play_pending = None;
     if state.queue.is_empty() {
-        app.queue.clear();
-        app.index = None;
+        app.queue.tracks.clear();
+        app.queue.index = None;
         app.jam.loaded = None;
         app.audio.send(AudioCmd::Stop);
         app.jam.last = None;
         return;
     }
-    app.index = Some(state.index.min(state.queue.len() - 1));
-    app.queue = state.queue;
-    app.queue_source = None;
+    app.queue.index = Some(state.index.min(state.queue.len() - 1));
+    app.queue.tracks = state.queue;
     app.jam.last = Some((tick, at));
     sync(app);
 }
@@ -459,8 +465,8 @@ fn sync(app: &mut App) {
     }
     // A tick can name a song before its state arrives: wait for the state then.
     if app.current_id() != Some(tick.vid.as_str()) {
-        match app.queue.iter().position(|t| t.id == tick.vid) {
-            Some(i) => app.index = Some(i),
+        match app.queue.tracks.iter().position(|t| t.id == tick.vid) {
+            Some(i) => app.queue.index = Some(i),
             None => return,
         }
     }
@@ -604,11 +610,11 @@ fn lobby(app: &mut App, ui: &mut Ui) {
             ui.put(
                 inner,
                 egui::TextEdit::singleline(&mut app.jam.name)
-                    .hint_text(RichText::new(hint).color(theme::TEXT_FAINT))
+                    .hint_text(RichText::new(hint).color(theme::text_faint()))
                     .font(theme::regular(14.0))
                     .char_limit(32)
                     .frame(egui::Frame::NONE)
-                    .vertical_align(egui::Align::Center)
+                    .align(egui::Align2::LEFT_CENTER)
                     .desired_width(inner.width()),
             );
         });
@@ -635,11 +641,11 @@ fn lobby(app: &mut App, ui: &mut Ui) {
             let edit = ui.put(
                 inner,
                 egui::TextEdit::singleline(&mut app.jam.code_input)
-                    .hint_text(RichText::new("ABC234").color(theme::TEXT_FAINT))
+                    .hint_text(RichText::new("ABC234").color(theme::text_faint()))
                     .font(theme::semibold(16.0))
                     .char_limit(8)
                     .frame(egui::Frame::NONE)
-                    .vertical_align(egui::Align::Center)
+                    .align(egui::Align2::LEFT_CENTER)
                     .desired_width(inner.width()),
             );
             if edit.changed() {
@@ -674,7 +680,7 @@ fn room(app: &mut App, ui: &mut Ui) {
         dim(ui, if host { "Share this code or link with friends" } else { "You're in the jam" });
         ui.add_space(6.0);
         let spaced: String = code.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
-        ui.label(RichText::new(spaced).font(theme::bold(40.0)).color(theme::TEXT));
+        ui.label(RichText::new(spaced).font(theme::bold(40.0)).color(theme::text()));
         if let Some(s) = status {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -742,7 +748,7 @@ fn room(app: &mut App, ui: &mut Ui) {
             let is_host = m.id == app.jam.host;
             icon_at(ui, pos2(rect.left() + 12.0, rect.center().y), if is_host { icon::CROWN } else { icon::HEADPHONES }, 17.0, if is_host { app.accent } else { theme::text_dim() });
             let you = if m.id == app.jam.you { " (you)" } else { "" };
-            ui.painter().text(pos2(rect.left() + 34.0, rect.center().y), Align2::LEFT_CENTER, format!("{}{you}", m.name), theme::semibold(14.5), theme::TEXT);
+            ui.painter().text(pos2(rect.left() + 34.0, rect.center().y), Align2::LEFT_CENTER, format!("{}{you}", m.name), theme::semibold(14.5), theme::text());
             if is_host {
                 ui.painter().text(pos2(rect.right() - 4.0, rect.center().y), Align2::RIGHT_CENTER, "Host", theme::regular(12.5), theme::text_dim());
             }
