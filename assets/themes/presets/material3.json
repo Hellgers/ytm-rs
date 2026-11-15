@@ -1,0 +1,100 @@
+{
+  "id": "material3",
+  "name": "Material 3",
+  "creators": [
+    "adidotzip"
+  ],
+  "blurb": "Google's Material 3 Expressive look: a warm dark palette, Google Sans Flex, pill search and rounded cards, with soft blurred past lines.",
+  "source": "Better Lyrics: adidotzip/Material3 1.2.0",
+  "accent": "#ffb4a9",
+  "background": {
+    "solid": "#1a1110"
+  },
+  "lyrics": {
+    "font": "Google Sans Flex",
+    "letter_spacing_em": -0.012,
+    "dim_alpha": 0.2,
+    "past": [
+      [
+        0.5,
+        2.5
+      ]
+    ],
+    "opacity_transition": {
+      "frac": 0,
+      "secs": 0.5,
+      "delay": 0
+    },
+    "blur_transition": {
+      "frac": 0,
+      "secs": 0.5,
+      "delay": 0
+    },
+    "past_opacity_transition": {
+      "frac": 0,
+      "secs": 0.5,
+      "delay": 0.35
+    },
+    "past_blur_transition": {
+      "frac": 0,
+      "secs": 0.5,
+      "delay": 0.35
+    },
+    "instrumental": "ring",
+    "balance": true,
+    "instrumental_rem": 5.6,
+    "ring_wave": true
+  },
+  "now_playing": {
+  },
+  "chrome": {
+    "play_button": "bare"
+  },
+  "app": {
+    "font": "Google Sans Flex",
+    "bar_alpha": 0.0,
+    "card_radius": 20,
+    "hover": 0.0,
+    "search_radius": 28,
+    "menu_color": "#271d1c",
+    "page_rise_px": 8,
+    "morph_loader": true,
+    "text_dim": "#d8c2bf",
+    "glass": { "top_bar": [24, 1.4, 1] },
+    "menu_look": { "pop": [0.98, 0.24], "item_slide": 6 },
+    "row_look": { "radius": 20 },
+    "page_wash": [
+      0.24,
+      900
+    ],
+    "page_wash_color": "#8b4b2e",
+    "search_alpha": 1.0,
+    "search_look": {
+      "height": 48,
+      "color": "#322826",
+      "drop_radius": 28,
+      "open_color": "#3d3231",
+      "attached": true
+    },
+    "nav_item": {
+      "radius": 24,
+      "height": 48,
+      "hover": 0.08,
+      "selected": 1,
+      "press": 0.12,
+      "selected_fill": "#5d3f3c"
+    },
+    "chip_look": {
+      "fill": 0.1,
+      "hover": 0.05,
+      "selected_fill": "#4b5429",
+      "selected_alpha": 1.0,
+      "selected_text": "#e1e4b9"
+    },
+    "text_color": "#f1dedc",
+    "top_bar": {
+      "band": [0.78, 76],
+      "band_color": "#1a1110"
+    }
+  }
+}

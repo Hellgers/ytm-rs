@@ -1,6 +1,6 @@
 [package]
 name = "ytm-rs"
-version = "0.2.33"
+version = "0.3.4"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/Hellgers/ytm-rs"
@@ -13,9 +13,9 @@ bytes = "1.12.1"
 crossbeam-channel = "0.5.17"
 directories = "6.0.0"
 discord-rich-presence = "1.1.0"
-eframe = { version = "0.37", default-features = false, features = ["glow", "wgpu_no_default_features", "default_fonts", "links", "clipboard", "accesskit", "persistence", "wayland", "x11"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "wgpu_no_default_features", "default_fonts", "system_fonts", "links", "clipboard", "accesskit", "persistence", "wayland", "x11"] }
 egui = { version = "0.37.0", features = ["monochrome_emoji_fonts"] }
-futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std", "sink"] }
 egui_extras = { version = "0.37.0", default-features = false, features = ["image"] }
 env_logger = { version = "0.11.11", default-features = false, features = ["humantime"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
@@ -24,18 +24,20 @@ log = "0.4.34"
 memmap2 = "0.9.11"
 raw-window-handle = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["default-tls", "gzip", "json", "socks"] }
-rodio = { version = "0.22.2", default-features = false, features = ["playback", "symphonia-aac", "symphonia-isomp4"] }
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "symphonia-aac", "symphonia-isomp4", "symphonia-mp3"] }
 rquickjs = "0.14.0"
 roxmltree = "0.21.1"
 serde = { version = "1.0.229", features = ["derive"] }
 skrifa = "0.44.0"
+# Music videos: YouTube's H.264, decoded on the CPU. Built from source; faster with nasm installed.
+openh264 = "0.8"
 sha1 = "0.10.7"
 sha2 = "0.10.9"
 hmac = "0.12.1"
 serde_json = "1.0.151"
 souvlaki = "0.8.3"
 tao = "0.37.1"
-tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 wry = "0.57.0"
 rfd = "0.17.2"
 tray-icon = "0.26.1"
@@ -46,20 +48,24 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 mp4ameta = "0.13.0"
 md-5 = "0.10"
 unicode-normalization = "0.1.26"
-symphonia = { version = "0.5.5", default-features = false, features = ["mkv"] }
+symphonia = { version = "0.5.5", default-features = false, features = ["mkv", "aac"] }
 rusty-opus = "1.0.2"
 unicode-bidi = "0.3"
+# System-wide media shortcuts (hotkeys.rs).
+global-hotkey = "0.9"
 
 [target.'cfg(windows)'.dependencies]
 # Windows Credential Manager, for the Google and Spotify sign-ins.
 keyring = { version = "3.6.3", features = ["windows-native"] }
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Registry", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62.2", features = ["Data_Xml_Dom", "Foundation", "UI_Notifications", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Power", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # The Secret Service (GNOME Keyring, KWallet) for the sign-ins.
 keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust"] }
 # The tray icon needs GTK running on a thread of its own.
 gtk = "0.18"
+# Keeping the computer awake while playing (awake.rs); souvlaki's MPRIS uses it already.
+dbus = "0.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # The login Keychain for the sign-ins.
@@ -81,5 +87,16 @@ panic = "unwind"
 [profile.dev.package."*"]
 opt-level = 2
 
+[dev-dependencies]
+egui_system_font_provider = "0.37.0"
+
 [build-dependencies]
 winresource = "0.1.31"
+
+# egui's text layout with one change for right-to-left text (#141): see the ytm-rs notes
+# in vendor/epaint/src/text/text_layout.rs.
+# souvlaki with its Linux media controls sending changes as they happen, not one a
+# second (#144): see the ytm-rs notes in vendor/souvlaki/src/platform/mpris/dbus/controls.rs.
+[patch.crates-io]
+epaint = { path = "vendor/epaint" }
+souvlaki = { path = "vendor/souvlaki" }

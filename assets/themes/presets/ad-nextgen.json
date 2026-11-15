@@ -1,0 +1,258 @@
+{
+  "id": "ad-nextgen",
+  "name": "AppleTify",
+  "creators": [
+    "a-dogann"
+  ],
+  "blurb": "Minimal dark skin mixing Apple Music and Spotify: right-leaning bold lyrics with a depth blur, a dark blurred still cover backdrop on now playing, a floating pill player bar and a red accent.",
+  "source": "Better Lyrics: a-dogann/-ADNEXTGEN-THEME 1.0.1",
+  "accent": "#fa243c",
+  "background": {
+    "mode": "cover_static",
+    "solid": "#000000",
+    "saturation": 0.8,
+    "np_dim": 0.45,
+    "np_contrast": 1.1
+  },
+  "lyrics": {
+    "font": "SF Pro Display",
+    "agent_align": "only_v1_left",
+    "font_rem": [
+      [
+        0,
+        4.2
+      ]
+    ],
+    "dim_alpha": 0.2,
+    "past": [
+      [
+        0.0,
+        4.0
+      ]
+    ],
+    "upcoming": [
+      [
+        1.0,
+        1.5
+      ],
+      [
+        1.0,
+        3.0
+      ],
+      [
+        1.0,
+        5.0
+      ],
+      [
+        1.0,
+        8.0
+      ]
+    ],
+    "opacity_transition": {
+      "secs": 0.4
+    },
+    "blur_transition": {
+      "secs": 0.4
+    },
+    "wobble": false,
+    "letter_wave": {
+      "on": false
+    },
+    "glow_alpha": 0.0001,
+    "long_glow_alpha": 1.0,
+    "scroll_secs": 0.4,
+    "word_rise_px": 3.0,
+    "word_rise_secs": 0.2,
+    "word_rise_ratio": 1.0,
+    "line_ease": [0.0, 0.0, 0.58, 1.0],
+    "line_fade_secs": 0.4,
+    "past_opacity_transition": {
+      "secs": 0.6
+    },
+    "past_blur_transition": {
+      "secs": 0.2
+    }
+  },
+  "cover": {
+    "radius": 20,
+    "fullscreen": { "top_only": true, "max_px": 640 },
+    "shadow": 0.2,
+    "shadow_blur": 48,
+    "shadow_offset": 24,
+    "outline": [
+      1,
+      0.08
+    ],
+    "shadow2": [
+      4,
+      8,
+      0.1
+    ]
+  },
+  "now_playing": {
+    "panel_frac": [0.42, 0.5],
+    "title_align": "left",
+    "title_px": 25,
+    "artist_alpha": 0.82,
+    "fullscreen_title_card": {
+      "fill": 0.04,
+      "stroke": 0.08,
+      "radius": 20,
+      "shadow": [16, 32, 0.15],
+      "attached": true,
+      "pad": 24
+    }
+  },
+  "chrome": {
+    "radius": 16,
+    "player_bar": "floating",
+    "bar_height": 58,
+    "bar_radius": 50,
+    "bar_color": "#1e1e1e",
+    "bar_margin": [
+      14,
+      20
+    ],
+    "progress_at": "bottom",
+    "progress_px": 2,
+    "progress_color": "white",
+    "play_button": "bare",
+    "play_scale": 1.1,
+    "bar_layout": "song_middle",
+    "bar_pad": [24, 0],
+    "progress_inset": 60,
+    "like_on_hover": true,
+    "bar_max_px": 1200.0,
+    "thumb_px": 40,
+    "thumb_radius": 10,
+    "bar_title_px": 14,
+    "bar_byline_alpha": 1.0,
+    "bar_shadow": [
+      8,
+      32,
+      0.4
+    ],
+    "bar_border_alpha": 0.08,
+    "icon_scale": 0.75,
+    "icon_alpha": 0.75
+  },
+  "app": {
+    "font": "SF Pro Display",
+    "page_bg": "solid",
+    "sidebar": "transparent",
+    "bar_alpha": 0.8,
+    "bar_border": true,
+    "nav": "text",
+    "chip_radius": 20,
+    "card_radius": 12,
+    "thumb_radius": 6,
+    "panel_radius": 16,
+    "menu_radius": 16,
+    "menu_border": 0.08,
+    "text_dim": "#8c8c8c",
+    "search_radius": 100,
+    "search_border": 0,
+    "hide_scrollbars": true,
+    "tabular_digits": true,
+    "queue_upper": true,
+    "heading_tracking_em": -0.015,
+    "header_title_weight": "extra_bold",
+    "glass": {
+      "top_bar": [12, 1.8, 1],
+      "bar": [30, 1.6, 1],
+      "menu": [80, 2.5, 1],
+      "search_drop": [60, 2.2, 1.1],
+      "title_card": [6, 1, 1]
+    },
+    "all_bold": true,
+    "heading_px": 26,
+    "heading_weight": "bold",
+    "menu_color": "#121212",
+    "search_alpha": 0.5,
+    "controls": {
+      "press_scale": 0.95,
+      "button_fill": 0.06,
+      "button_hover": 0.06,
+      "ghost_outline": 0.12,
+      "hover_border": 0.2,
+      "accent_primary": true
+    },
+    "nav_item": {
+      "rail": true,
+      "rail_px": 125,
+      "rail_labels": true,
+      "hover": 0.1,
+      "radius": 6,
+      "hide_divider": true,
+      "rail_height": 72
+    },
+    "chip_look": {
+      "height": 34,
+      "fill": 0.1,
+      "hover": 0.05,
+      "selected_fill": "white",
+      "selected_text": "#000000",
+      "weight": "medium",
+      "selected_weight": "semibold",
+      "border": 0.08
+    },
+    "card_look": {
+      "hover_scale": 1.03,
+      "shadow": [
+        8,
+        24,
+        0.45
+      ],
+      "title_px": 14,
+      "title_weight": "semibold",
+      "subtitle_alpha": 0.7,
+      "image_outline": 0.12
+    },
+    "row_look": {
+      "height": 52,
+      "radius": 6,
+      "hover": 0.06,
+      "current": 0.08,
+      "current_color": "accent",
+      "separator": 0.04,
+      "hover_menu": true,
+      "pad": 8,
+      "byline_alpha": 1.0,
+      "thumb_radius": 10
+    },
+    "menu_look": {
+      "row_px": 36,
+      "hover": 0.1,
+      "alpha": 0.3,
+      "icon_right": true,
+      "shadow": [
+        12,
+        40,
+        0.5
+      ],
+      "row_radius": 0
+    },
+    "search_look": {
+      "height": 40,
+      "max_px": 800,
+      "color": "#141414",
+      "drop_radius": 12,
+      "drop_ring": 0.1
+    },
+    "top_bar": {
+      "capsule_px": 1400.0,
+      "capsule": [
+        0.7,
+        26
+      ],
+      "logo_text": "YouTube Music",
+      "logo_color": "accent",
+      "logo_color2": "#ffffff",
+      "logo_in_bar": true
+    },
+    "header_title_px": 32.0,
+    "header_art_shadow": [20, 50, 0.6],
+    "header_art_hover": 1.03,
+    "header_play_shadow": [8, 24, 0.45]
+  }
+}

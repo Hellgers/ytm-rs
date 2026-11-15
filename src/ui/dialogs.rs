@@ -30,9 +30,11 @@ impl App {
             Dialog::NewPlaylist { .. } => "New playlist",
             Dialog::EditPlaylist { .. } => "Edit playlist",
             Dialog::ConfirmDelete { .. } => "Delete playlist",
+            Dialog::ConfirmDownload { .. } => "Download",
             Dialog::Collaborate { .. } => "Collaborate",
         };
         // The same modal card as "Delete playlist?" and the update dialog.
+        widgets::modal_extras(ctx, egui::Id::unique("playlist-dialog"));
         let modal = egui::Modal::new(egui::Id::unique("playlist-dialog")).frame(notes::surface()).backdrop_color(theme::shade(0.55)).show(ctx, |ui| {
             ui.set_width(440.0_f32.min(ctx.content_rect().width() - 48.0));
             egui::Frame::new().inner_margin(egui::Margin { left: 26, right: 26, top: 24, bottom: 22 }).show(ui, |ui| {
@@ -54,8 +56,7 @@ impl App {
                                 if let Target::Playlist(id) = card.target {
                                     if !id.starts_with("PL") { continue; }
                                     if dialog_row(ui, Some(&card.thumbs), None, &card.title) {
-                                        let video_ids = tracks.iter().map(|t| t.id.clone()).collect();
-                                        self.backend.request(Req::AddToPlaylist { playlist_id: id, video_ids });
+                                        self.add_to_playlist(id, tracks);
                                         done = true;
                                     }
                                 }
@@ -90,6 +91,18 @@ impl App {
                             done = true;
                         }
                         done |= cancel;
+                    }
+                    Dialog::ConfirmDownload { target, title, tracks, count } => {
+                        let what = if target.is_some() { format!("\u{201c}{title}\u{201d} has {count} songs") } else { format!("{count} songs are") };
+                        let body = format!("{what} not downloaded yet. They download in the background, and the song that's playing goes first.");
+                        ui.add(egui::Label::new(egui::RichText::new(body).font(theme::regular(14.0)).color(theme::text_dim())).wrap());
+                        ui.add_space(22.0);
+                        let (ok, cancel) = dialog_buttons(ui, &format!("Download {count} songs"), true, accent);
+                        if ok {
+                            let (target, title, tracks) = (target.clone(), title.clone(), Some(std::mem::take(tracks)));
+                            self.backend.request(Req::DownloadMany { target, title, tracks, confirmed: true });
+                        }
+                        done = ok || cancel;
                     }
                     Dialog::Collaborate { info, busy, confirm_off, .. } => done = self.collaborate_dialog(ui, info, busy, confirm_off, accent),
                     Dialog::ConfirmDelete { .. } => unreachable!("drawn by confirm_delete"),
@@ -235,7 +248,7 @@ fn dialog_buttons(ui: &mut Ui, primary: &str, enabled: bool, accent: Color32) ->
     let (mut ok, mut cancel) = (false, false);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
-        let fg = if accent.r() as u32 + accent.g() as u32 + accent.b() as u32 > 480 { Color32::from_gray(15) } else { Color32::WHITE };
+        let fg = theme::on_fill(accent);
         let g = ui.painter().layout_no_wrap(primary.to_owned(), theme::semibold(14.0), fg);
         let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 40.0, 38.0), if enabled { Sense::click() } else { Sense::hover() });
         let resp = widgets::named(resp, primary);
@@ -266,7 +279,7 @@ fn dialog_row(ui: &mut Ui, thumbs: Option<&[crate::model::Thumb]>, glyph: Option
     match (thumbs, glyph) {
         (Some(t), _) => widgets::paint_cover(ui, art, t, 6.0, 1.0),
         (None, Some(g)) => {
-            ui.painter().rect_filled(art, 6.0, theme::glass(0.1));
+            ui.painter().rect_filled(art, 6.0, theme::glass_panel(0.1));
             widgets::icon_at(ui, art.center(), g, 18.0, theme::text());
         }
         _ => {}
@@ -279,6 +292,7 @@ fn dialog_row(ui: &mut Ui, thumbs: Option<&[crate::model::Thumb]>, glyph: Option
 /// "Delete playlist?" as a modal card: Some(true) delete, Some(false) cancel, None still open.
 fn confirm_delete(ctx: &egui::Context, title: &str, _accent: Color32) -> Option<bool> {
     let mut answer = None;
+    widgets::modal_extras(ctx, egui::Id::unique("confirm-delete"));
     let modal = egui::Modal::new(egui::Id::unique("confirm-delete")).frame(notes::surface()).backdrop_color(theme::shade(0.55)).show(ctx, |ui| {
         ui.set_width(400.0_f32.min(ctx.content_rect().width() - 48.0));
         egui::Frame::new().inner_margin(egui::Margin { left: 26, right: 26, top: 24, bottom: 22 }).show(ui, |ui| {

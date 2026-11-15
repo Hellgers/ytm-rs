@@ -1,0 +1,136 @@
+{
+  "id": "minimalism-music",
+  "name": "Minimalism Music",
+  "creators": [
+    "notacoderlols"
+  ],
+  "blurb": "An Apple Music-inspired look: very large SF Pro lyrics, sung lines that vanish, a flat 75% for the lines ahead and a still, dimmed blurred cover behind.",
+  "source": "Better Lyrics: notacoderlols/Minimalisic-Music 1.0.0",
+  "background": {
+    "mode": "cover_static",
+    "np_dim": 0.5
+  },
+  "lyrics": {
+    "weight": "semibold",
+    "font": "SF Pro Display",
+    "font_rem": [
+      [
+        0,
+        3.0
+      ],
+      [
+        1400,
+        4.0
+      ],
+      [
+        1600,
+        5.0
+      ],
+      [
+        1800,
+        6.0
+      ]
+    ],
+    "line_padding_rem": 0.5,
+    "padding_inline": [
+      20,
+      10
+    ],
+    "past": [
+      [
+        0.0,
+        0.0
+      ]
+    ],
+    "upcoming": [
+      [
+        0.75,
+        0.0
+      ]
+    ],
+    "opacity_transition": {
+      "frac": 0.5,
+      "secs": 0.0,
+      "delay": 0.166
+    },
+    "blur_transition": {
+      "frac": 0.3333,
+      "secs": 0.0,
+      "delay": 0.4
+    },
+    "hover_reveal": true,
+    "hover_scale": 1.01,
+    "letter_wave": {
+      "on": false
+    },
+    "wobble": false,
+    "glow_alpha": 0.0,
+    "long_glow_alpha": 1.0,
+    "background_em": 1.0,
+    "background_alpha": 0.75,
+    "background_weight": "bold",
+    "instrumental": "dots",
+    "instrumental_breathe": [
+      1,
+      1.14,
+      3
+    ],
+    "line_fade_secs": 2.25,
+    "padding_top": 10,
+    "dot_em": [0.36, 0.32]
+  },
+  "cover": {
+    "radius": 10,
+    "size_vh": 0.5,
+    "outline": [
+      1,
+      0.1
+    ],
+    "fullscreen": {
+      "size_vh": 0.6,
+      "enter": [0.9, 1.1],
+      "leave": [1.08, 0.9],
+      "enter_shift_vh": 0.015,
+      "leave_shift_vh": -0.01,
+      "settle_fade": 0.35
+    },
+    "open_scale": 0.9,
+    "open_secs": 0.9,
+    "open_fade": true
+  },
+  "now_playing": {
+    "switch": {
+      "back": 0,
+      "selected": 0.1,
+      "plain": true
+    },
+    "panel_frac": [
+      0.4,
+      0.4
+    ],
+    "video_lyrics": true,
+    "video_panel_frac": [0.6, 0.6],
+    "no_lyrics_text": "You'll have to guess the lyrics for this one.",
+    "no_lyrics": {
+      "rem": 5,
+      "center_after": 1.4
+    }
+  },
+  "chrome": {
+    "hide_volume": true,
+    "progress_color": "white",
+    "progress_radius": 100,
+    "bar_layout": "song_left",
+    "byline_marquee": true,
+    "marquee_secs": 7
+  },
+  "app": {
+    "font": "SF Pro Display",
+    "all_bold": true,
+    "hide_scrollbars": true,
+    "icons": {
+      "up_next": { "view": [16, 16], "d": "M12 13c0 1.105-1.12 2-2.5 2S7 14.105 7 13s1.12-2 2.5-2s2.5.895 2.5 2 M12 3v10h-1V3z M11 2.82a1 1 0 0 1 .804-.98l3-.6A1 1 0 0 1 16 2.22V4l-5 1z M0 11.5a.5.5 0 0 1 .5-.5H4a.5.5 0 0 1 0 1H.5a.5.5 0 0 1-.5-.5m0-4A.5.5 0 0 1 .5 7H8a.5.5 0 0 1 0 1H.5a.5.5 0 0 1-.5-.5m0-4A.5.5 0 0 1 .5 3H8a.5.5 0 0 1 0 1H.5a.5.5 0 0 1-.5-.5" },
+      "lyrics": { "view": [56, 56], "d": "M16.094 52.316c.937 0 1.594-.468 2.695-1.5l8.484-7.734l15.82.023c6.985.024 10.735-3.867 10.735-10.734V14.418c0-6.867-3.75-10.734-10.734-10.734H12.906c-6.96 0-10.734 3.843-10.734 10.734v17.953c0 6.89 3.773 10.734 10.734 10.711h1.102v6.82c0 1.453.773 2.414 2.086 2.414m.586-30.375c0-2.835 2.18-4.804 5.015-4.804c3.094 0 5.18 2.46 5.18 5.672c0 6.023-4.805 8.882-7.219 8.882c-.68 0-1.172-.492-1.172-1.101c0-.563.258-.938 1.149-1.195c1.547-.422 3.351-1.641 4.219-3.586h-.188c-.633.773-1.594.937-2.601.937c-2.672 0-4.383-2.11-4.383-4.805m12.797 0c0-2.835 2.18-4.804 5.015-4.804c3.094 0 5.18 2.46 5.18 5.672c0 6.023-4.805 8.882-7.219 8.882c-.68 0-1.172-.492-1.172-1.101c0-.563.258-.938 1.149-1.195c1.547-.422 3.351-1.641 4.218-3.586h-.187c-.633.773-1.594.937-2.602.937c-2.671 0-4.382-2.11-4.382-4.805" }
+    }
+  }
+}

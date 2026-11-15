@@ -3,7 +3,7 @@
 //! The UI talks to it through `AudioHandle`; status flows back through `AudioStatus`
 //! (lock-free reads for the progress bar) plus a `Finished` event for auto-advance.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,10 @@ use crate::stream::{self, ReadInterrupt, Shared};
 
 pub use crate::stream::TrackDecoder;
 
+pub mod eq;
+pub mod limiter;
+pub mod tempo;
+
 pub enum AudioCmd {
     /// A decoder is ready for playback generation `generation`; stale generations are dropped.
     /// A decoder started mid-song (`at` > 0) is the seekable kind.
@@ -26,10 +30,14 @@ pub enum AudioCmd {
     Pause,
     Resume,
     Stop,
+    /// Stop every source like Stop, retaining the recovery position while reopening.
+    StopAt(Duration),
     /// Another song is on its way: with crossfade on, fade this one out instead of
     /// stopping it, and fade the next one in when it starts.
     Handoff,
     Seek(Duration),
+    /// A song was asked for: open the device now, while its stream is still on the way.
+    Warm,
     /// Seek to where `pos` will have moved on to by the time the seek lands (`pos` was
     /// current at `at`): following someone else's playback (listen together).
     SeekLive { pos: Duration, at: std::time::Instant },
@@ -67,10 +75,19 @@ pub struct AudioStatus {
     pub playing: AtomicBool,
     /// Generation the UI most recently asked for; the engine ignores older decoders.
     pub wanted_gen: AtomicU64,
+    /// Generation the engine last started, set once its length is in.
+    started_gen: AtomicU64,
+    /// The length its stream gave, 0 when it gave none (`duration_ms` then keeps the UI's).
+    stream_ms: AtomicU64,
     /// f32 bits
     volume: AtomicU32,
-    /// Turn loud tracks down to YouTube's loudness target.
-    pub normalize: AtomicBool,
+    /// The `Normalize` level songs are brought to.
+    normalize: AtomicU8,
+    /// The limiter's on, for songs normalization turns up.
+    limit: Arc<AtomicBool>,
+    /// What normalization does to the playing song, in dB (f32 bits); NaN when it does
+    /// nothing (off, or YouTube gave no loudness for it).
+    norm_db: AtomicU32,
     /// The volume slider follows loudness (cubic) rather than amplitude.
     log_volume: AtomicBool,
     /// Smoothed output loudness 0..1 (f32 bits), for audio-reactive visuals.
@@ -79,9 +96,17 @@ pub struct AudioStatus {
     latency_ms: AtomicU32,
     /// Crossfade length in ms; 0 = off.
     crossfade_ms: AtomicU32,
+    /// The equalizer's settings, applied to everything on its way to the device.
+    eq: Arc<eq::EqParams>,
+    /// Playback speed, applied to each song as it plays.
+    speed: Arc<tempo::Speed>,
 }
 
 impl AudioStatus {
+    pub fn speed(&self) -> f32 {
+        self.speed.get()
+    }
+
     pub fn position(&self) -> Duration {
         Duration::from_millis(self.position_ms.load(Ordering::Relaxed))
     }
@@ -94,7 +119,7 @@ impl AudioStatus {
             return Duration::from_millis(pos);
         }
         let age = now_ms().saturating_sub(self.sampled_at.load(Ordering::Relaxed)).min(250);
-        Duration::from_millis(pos + age)
+        Duration::from_millis(pos + (age as f32 * self.speed()) as u64)
     }
 
     pub fn duration(&self) -> Option<Duration> {
@@ -102,9 +127,26 @@ impl AudioStatus {
         (d > 0).then(|| Duration::from_millis(d))
     }
 
-    /// How long audio takes from the player to the speakers (the output buffer).
+    /// Whether the song asked for as `generation` is playing, not the one before it still
+    /// going until the engine gets to the new one.
+    pub fn started(&self, generation: u64) -> bool {
+        self.started_gen.load(Ordering::Acquire) == generation && self.playing.load(Ordering::Relaxed)
+    }
+
+    /// The length the song asked for as `generation` has by its stream, once started.
+    pub fn stream_duration(&self, generation: u64) -> Option<Duration> {
+        // Read after `started`, so the length is that song's, not the one before.
+        if !self.started(generation) {
+            return None;
+        }
+        let d = self.stream_ms.load(Ordering::Relaxed);
+        (d > 0).then(|| Duration::from_millis(d))
+    }
+
+    /// How far the speakers run behind the position (the output buffer), on the song's
+    /// clock: more of the song at a faster speed.
     pub fn latency(&self) -> Duration {
-        Duration::from_millis(self.latency_ms.load(Ordering::Relaxed) as u64)
+        Duration::from_millis(self.latency_ms.load(Ordering::Relaxed) as u64).mul_f32(self.speed())
     }
 
     pub fn level(&self) -> f32 {
@@ -243,9 +285,16 @@ impl AudioHandle {
         f32::from_bits(self.status.volume.load(Ordering::Relaxed))
     }
 
-    pub fn set_normalize(&self, on: bool) {
-        self.status.normalize.store(on, Ordering::Relaxed);
+    pub fn set_normalize(&self, level: Normalize) {
+        self.status.normalize.store(level as u8, Ordering::Relaxed);
+        self.status.limit.store(level != Normalize::Off, Ordering::Relaxed);
         self.send(AudioCmd::Volume(self.volume()));
+    }
+
+    /// How far normalization turns the playing song up (positive) or down, in dB; None
+    /// when it leaves it as it is (off, or there's no loudness figure for it).
+    pub fn normalization(&self) -> Option<f32> {
+        Some(f32::from_bits(self.status.norm_db.load(Ordering::Relaxed))).filter(|d| !d.is_nan())
     }
 
     /// Switches the slider's curve, moving it so the music stays as loud as it was.
@@ -265,11 +314,19 @@ impl AudioHandle {
         self.status.volume.store(v.to_bits(), Ordering::Relaxed);
         self.send(AudioCmd::Volume(v));
     }
+
+    /// Takes effect at once, gliding there. `no_clip` turns everything down by the
+    /// curve's highest boost, leaving room for it in loud songs.
+    pub fn set_eq(&self, on: bool, gains: &eq::Gains, no_clip: bool) {
+        self.status.eq.set(on, gains, no_clip);
+    }
+
+    /// Takes effect at once; the pitch goes with it.
+    pub fn set_speed(&self, speed: f32) {
+        self.status.speed.set(speed);
+    }
 }
 
-/// Volume normalization the way YouTube Music does it: tracks mastered louder than
-/// the -14 LUFS target are turned down by the difference; quieter ones are left alone
-/// (boosting would clip).
 /// A seek that needs a new decoder built over the stream buffer (off the audio thread).
 struct SeekJob {
     shared: Arc<Shared>,
@@ -281,27 +338,28 @@ struct SeekJob {
     seek: u64,
 }
 
+
 /// Build a decoder for `j` (it may wait for the download) and hand it to the audio thread.
 fn build_seek(j: SeekJob, tx: &Sender<AudioCmd>) {
-    build_seek_using(j, tx, |shared, seekable, interrupt| {
-        stream::decoder_with_interrupt(shared, seekable, interrupt).map_err(|e| e.to_string())
+    build_seek_using(j, tx, |shared, at, interrupt| {
+        stream::decoder_at_with_interrupt(shared, at, interrupt).map_err(|e| e.to_string())
     });
 }
 
 fn build_seek_using(
     j: SeekJob, tx: &Sender<AudioCmd>,
-    decode: impl FnOnce(Arc<Shared>, bool, ReadInterrupt) -> Result<TrackDecoder, String>,
+    decode: impl FnOnce(Arc<Shared>, Duration, ReadInterrupt) -> Result<TrackDecoder, String>,
 ) {
     let SeekJob { shared, interrupt, pos, live, generation, seek } = j;
     let seekable = !pos.is_zero();
-    let res = catch_decoder(|| decode(shared.clone(), seekable, interrupt).and_then(|mut d| {
-        // Building it may have waited for the download: catch up.
-        let pos = live.map_or(pos, |(p, at)| p + at.elapsed());
-        if seekable {
-            rodio::Source::try_seek(&mut d, pos).map_err(|e| e.to_string())?;
-        }
-        Ok((d, pos))
-    }));
+    let res = catch_decoder(|| {
+        let requested = live.map_or(pos, |(p, at)| p + at.elapsed());
+        let mut decoder = decode(shared.clone(), requested, interrupt)?;
+        let landed = live.map_or(requested, |(p, at)| p + at.elapsed());
+        if landed > requested { decoder.advance(landed - requested).map_err(|e| e.to_string())?; }
+        decoder.prime_frame().map_err(|e| e.to_string())?;
+        Ok((decoder, landed))
+    });
     match res {
         Ok((decoder, pos)) => {
             let _ = tx.send(AudioCmd::Replace { generation, seek, decoder, at: pos, seekable });
@@ -416,6 +474,17 @@ fn abort_player(output: &Output, player: &mut Player, interrupt: &mut Option<Rea
     crate::audio_source::replace_player(player, &output.mixer, output.channels, output.rate);
 }
 
+/// Shared by the completed Stop/StopAt path, after readers and queues retire.
+fn finish_stop_status(status: &AudioStatus, command: &AudioCmd) {
+    let at = match command {
+        AudioCmd::StopAt(at) => *at,
+        AudioCmd::Stop | AudioCmd::Handoff => Duration::ZERO,
+        _ => unreachable!("only stop commands reach the stopped status path"),
+    };
+    status.playing.store(false, Ordering::Relaxed);
+    status.set_position(at.as_millis() as u64);
+}
+
 /// Release every decoder wait before CPAL drops/joins the old device thread.
 /// Rebuilding is asynchronous and keeps the same Shared download alive.
 struct ReopenState<'a> {
@@ -425,7 +494,7 @@ struct ReopenState<'a> {
     fading: &'a mut Vec<Fading>,
     shared: Option<&'a Arc<Shared>>,
     current: u64,
-    offset: &'a mut Duration,
+    at: Duration,
 }
 
 fn reopen_output(
@@ -436,11 +505,9 @@ fn reopen_output(
 }
 
 fn prepare_reopen(output: &Output, state: ReopenState<'_>, tx: &Sender<AudioCmd>) {
-    let ReopenState { player, interrupt, jobs, fading, shared, current, offset } = state;
+    let ReopenState { player, interrupt, jobs, fading, shared, current, at } = state;
     if current != 0 && let Some(shared) = shared {
-        let pos = *offset + player.get_pos();
-        jobs.submit(shared.clone(), pos, None, current, tx);
-        *offset = pos;
+        jobs.submit(shared.clone(), at, None, current, tx);
     }
     abort_player(output, player, interrupt);
     fading.clear();
@@ -461,11 +528,74 @@ fn slider_gain(status: &AudioStatus, v: f32) -> f32 {
     if status.log_volume.load(Ordering::Relaxed) { v.powi(3) } else { v }
 }
 
-fn norm_gain(status: &AudioStatus, shared: Option<&Shared>) -> f32 {
-    match shared.and_then(|s| s.loudness_db) {
-        Some(db) if db > 0.0 && status.normalize.load(Ordering::Relaxed) => 10f32.powf(-db / 20.0),
-        _ => 1.0,
+/// The level volume normalization brings songs to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Normalize {
+    Off,
+    /// YouTube's (and Spotify's) -14 LUFS.
+    #[default]
+    Normal,
+    /// -19 LUFS, like Spotify's Quiet: more songs line up without being turned up.
+    Quiet,
+}
+
+impl Normalize {
+    pub const ALL: [Self; 3] = [Self::Off, Self::Normal, Self::Quiet];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Normal => "Normal",
+            Self::Quiet => "Quiet",
+        }
     }
+
+    /// As saved: "1" and "0" are what the on/off switch saved before.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Off => "0",
+            Self::Normal => "1",
+            Self::Quiet => "quiet",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Self {
+        Self::ALL.into_iter().find(|l| l.key() == key).unwrap_or_default()
+    }
+
+    fn from_u8(v: u8) -> Self {
+        Self::ALL.get(v as usize).copied().unwrap_or(Self::Off)
+    }
+
+    /// The level, in dB from YouTube's -14 LUFS target.
+    fn offset_db(self) -> f32 {
+        if self == Self::Quiet { -5.0 } else { 0.0 }
+    }
+}
+
+/// The most normalization turns a quiet song up. Past this the limiter would be holding
+/// it down all the time, which flattens it.
+const MAX_BOOST_DB: f32 = 6.0;
+
+/// What volume normalization does to a song, in dB: brings it from the loudness YouTube
+/// measured to the level picked, turning loud songs down and quiet ones up (up to
+/// `MAX_BOOST_DB`; the limiter keeps their peaks from clipping). None when it leaves it
+/// as it is: off, or no loudness figure (yt-dlp's streams, podcast feeds).
+fn norm_db(status: &AudioStatus, shared: Option<&Shared>) -> Option<f32> {
+    let level = Normalize::from_u8(status.normalize.load(Ordering::Relaxed));
+    if level == Normalize::Off {
+        return None;
+    }
+    Some((level.offset_db() - shared?.loudness_db?).min(MAX_BOOST_DB))
+}
+
+fn norm_gain(status: &AudioStatus, shared: Option<&Shared>) -> f32 {
+    norm_db(status, shared).map_or(1.0, |db| 10f32.powf(db / 20.0))
+}
+
+/// Keeps what normalization does to the playing song, for the UI to show.
+fn show_norm(status: &AudioStatus, shared: Option<&Shared>) {
+    status.norm_db.store(norm_db(status, shared).unwrap_or(f32::NAN).to_bits(), Ordering::Relaxed);
 }
 
 /// The output device. Players play into a mixer of our own that the device pulls
@@ -491,16 +621,17 @@ struct Output {
 }
 
 impl Output {
-    fn new(tx: Sender<AudioCmd>, status: &AudioStatus, preferred: Option<String>) -> Self {
+    /// Doesn't open the device: the first song does. Also whether there's one to open.
+    fn new(preferred: Option<String>) -> (Self, bool) {
         // Mix at the device's own format, so the usual case needs no conversion.
-        let config = target(preferred.as_deref()).and_then(|d| d.default_output_config().ok());
+        let device = target(preferred.as_deref());
+        let found = device.is_some();
+        let config = device.and_then(|d| d.default_output_config().ok());
         let channels = config.as_ref().and_then(|c| std::num::NonZero::new(c.channels())).unwrap_or(std::num::NonZero::new(2).unwrap());
         let rate = config.as_ref().and_then(|c| std::num::NonZero::new(c.sample_rate())).unwrap_or(std::num::NonZero::new(48_000).unwrap());
         let (mixer, source) = rodio::mixer::mixer(channels, rate);
         let lost = Arc::new(AtomicBool::new(false));
-        let mut out = Self { mixer, channels, rate, slot: Arc::new(std::sync::Mutex::new(Some(source))), sink: None, device: None, preferred, lost, checked: Instant::now() };
-        out.open(tx, status);
-        out
+        (Self { mixer, channels, rate, slot: Arc::new(std::sync::Mutex::new(Some(source))), sink: None, device: None, preferred, lost, checked: Instant::now() }, found)
     }
 
     /// Opens the picked device, or the default one. False if there's none to open.
@@ -544,15 +675,19 @@ impl Output {
         let mut sink = sink;
         sink.log_on_drop(false);
         let channels = rodio::Source::channels(&source).get();
-        sink.mixer().add(Bridge { inner: Some(source), slot: self.slot.clone(), channels, n: 0 });
+        let rate = rodio::Source::sample_rate(&source).get();
+        let eq = eq::Eq::new(status.eq.clone(), rate, channels);
+        let limiter = limiter::Limiter::new(status.limit.clone(), rate, channels);
+        sink.mixer().add(Bridge { inner: Some(source), slot: self.slot.clone(), channels, n: 0, eq, limiter });
         // The position counts samples handed to the device; it plays them a buffer later
-        // (rodio asks for ~50 ms), plus the shared-mode device period (~10 ms).
+        // (rodio asks for ~50 ms), plus the shared-mode device period (~10 ms) and the
+        // limiter's lookahead.
         let rate = sink.config().sample_rate().get().max(1);
         let buffer_ms = match sink.config().buffer_size() {
             rodio::cpal::BufferSize::Fixed(n) => *n as u64 * 1000 / rate as u64,
             rodio::cpal::BufferSize::Default => 0,
         };
-        status.latency_ms.store((buffer_ms + 10) as u32, Ordering::Relaxed);
+        status.latency_ms.store((buffer_ms + 10) as u32 + limiter::LOOKAHEAD_MS, Ordering::Relaxed);
         log::info!("audio: output device {:?} at {} Hz", id, rate);
         self.sink = Some(sink);
         self.device = id;
@@ -566,6 +701,19 @@ impl Output {
         let want = target(self.preferred.as_deref()).and_then(|d| d.id().ok()).map(|i| i.to_string());
         want.is_some() && want != self.device
     }
+}
+
+/// Empties the player without waiting on the device. rodio's `clear` waits for the device
+/// to skip what's in it, which never happens while the device is let go (a song paused that
+/// long), nor while a device that's gone still looks open (until `DeviceLost` arrives): a new
+/// player instead, at the same volume and paused, as `clear` leaves it. The old one's song
+/// ends the next time the mixer is pulled.
+#[cfg(test)]
+fn clear(player: &mut Player, output: &Output) {
+    let fresh = crate::audio_source::connect_player(&output.mixer, output.channels, output.rate);
+    fresh.set_volume(player.volume());
+    fresh.pause();
+    *player = fresh;
 }
 
 /// The picked device if it's connected, else the system default.
@@ -612,13 +760,20 @@ struct Bridge {
     /// Samples handed out, to give the mixer back on a frame boundary (else the next
     /// device would get the channels swapped).
     n: u64,
+    /// Here, after the mixer, so one equalizer covers both songs in a crossfade and a
+    /// new song or a seek doesn't restart it.
+    eq: eq::Eq,
+    /// Last, after the volume, so it only acts on what would really clip.
+    limiter: limiter::Limiter,
 }
 
 impl Iterator for Bridge {
     type Item = rodio::Sample;
     fn next(&mut self) -> Option<Self::Item> {
+        let channel = (self.n % self.channels.max(1) as u64) as usize;
         self.n += 1;
-        Some(self.inner.as_mut().and_then(Iterator::next).unwrap_or(0.0))
+        let s = self.inner.as_mut().and_then(Iterator::next).unwrap_or(0.0);
+        Some(self.limiter.process(self.eq.process(s, channel), channel))
     }
 }
 
@@ -652,6 +807,10 @@ impl Drop for Bridge {
 /// How often to look for a new default device while playing.
 const DEVICE_CHECK: Duration = Duration::from_secs(1);
 
+/// How long nothing plays before the output device is let go. An open stream counts as
+/// audio playing to the OS (on Windows it keeps the computer from sleeping), even paused.
+const IDLE_CLOSE: Duration = Duration::from_secs(30);
+
 pub fn spawn(volume: f32, log_volume: bool, device: Option<String>, events: Sender<AudioEvent>, wake: impl Fn() + Send + 'static) -> AudioHandle {
     let (tx, rx) = unbounded();
     let status = Arc::new(AudioStatus::default());
@@ -677,8 +836,10 @@ fn run(
     events: Sender<AudioEvent>,
     wake: impl Fn(),
 ) {
-    let mut output = Output::new(tx.clone(), &status, device);
-    if output.sink.is_none() {
+    // An open device costs CPU even while silent, and keeps Windows awake: it waits for
+    // the first song, as after `IDLE_CLOSE`.
+    let (mut output, found) = Output::new(device);
+    if !found {
         let _ = events.send(AudioEvent::Error("No audio output device".into()));
         wake();
     }
@@ -697,21 +858,33 @@ fn run(
     // Generation of the source currently in the player (0 = nothing loaded).
     let mut current: u64 = 0;
     let mut shared: Option<Arc<Shared>> = None;
+    // Where the playing song is up to, on its own clock (see `Tempo`).
+    let mut song_ms = Arc::new(AtomicU64::new(0));
+    let song_pos = |ms: &AtomicU64| Duration::from_millis(ms.load(Ordering::Relaxed));
+    let tempo = |source, from, ms: &Arc<AtomicU64>| {
+        let channels = rodio::Source::channels(&source);
+        let rate = rodio::Source::sample_rate(&source);
+        let duration = rodio::Source::total_duration(&source);
+        let (speed, ms) = (status.speed.clone(), ms.clone());
+        crate::audio_source::defer(channels, rate, duration, move || tempo::Tempo::new(source, speed, from, ms))
+    };
     let mut interrupt: Option<ReadInterrupt> = None;
-    // The player counts position from when a source was appended; a swapped-in
-    // seeked decoder starts at `offset`.
-    let mut offset = Duration::ZERO;
-    // Each finite decoder is converted before Player's keepalive queue. Never
-    // seek that converter in place: its interpolation cache must be rebuilt.
     let mut format_error = Arc::new(AtomicBool::new(false));
     // Latest seek; a slower, older seek's decoder must not land after a newer one.
     let mut jobs = DecoderJobs::default();
     // Dev hook: YTM_DEVICE_LOST=<secs> acts as if the output device disconnected that
     // long into the first song (the error callback firing for a device that's gone).
     let mut dev_lost = std::env::var("YTM_DEVICE_LOST").ok().and_then(|v| v.parse::<f32>().ok()).map(Duration::from_secs_f32);
+    // Since when nothing has played, to let go of the device after `IDLE_CLOSE`.
+    let mut idle_since: Option<Instant> = Some(Instant::now());
     loop {
-        // Poll while playing so the position stays fresh and the end is noticed; idle otherwise.
-        let timeout = if !fading.is_empty() || (current != 0 && !player.is_paused()) { Duration::from_millis(100) } else { Duration::from_secs(3600) };
+        // Poll while playing so the position stays fresh and the end is noticed; idle otherwise,
+        // waking to let go of the device.
+        let timeout = match idle_since {
+            None => Duration::from_millis(100),
+            Some(since) if output.sink.is_some() => IDLE_CLOSE.saturating_sub(since.elapsed()).max(Duration::from_millis(10)),
+            Some(_) => Duration::from_secs(3600),
+        };
         match rx.recv_timeout(timeout) {
             Ok(AudioCmd::Start { generation, decoder, shared: s, at }) => {
                 if generation != status.wanted_gen.load(Ordering::Relaxed) {
@@ -726,9 +899,13 @@ fn run(
                 if let Some(old) = shared.replace(s.clone()) && !Arc::ptr_eq(&old, &s) { old.cancel(); }
                 if output.sink.is_none() || output.default_changed() {
                     fading.clear();
-                    output.open(tx.clone(), &status);
+                    if !output.open(tx.clone(), &status) {
+                        let _ = events.send(AudioEvent::Error("No audio output device".into()));
+                        wake();
+                    }
                 }
                 let gain = norm_gain(&status, Some(&s));
+                show_norm(&status, Some(&s));
                 log::info!("audio: loudness {:?} dB, normalization gain {gain:.3}", s.loudness_db);
                 player.set_volume(slider_gain(&status, f32::from_bits(status.volume.load(Ordering::Relaxed))) * gain);
                 // Fade in only over a song still playing, both over the same length.
@@ -742,10 +919,10 @@ fn run(
                 }
                 fade_out = Arc::new(AtomicU32::new(0));
                 format_error = Arc::new(AtomicBool::new(false));
-                log::info!("audio: generation {generation}, source {} Hz / {} channels -> private mixer {} Hz / {} channels, continuous per-track resampler", rodio::Source::sample_rate(&decoder), rodio::Source::channels(&decoder), output.rate, output.channels);
                 interrupt = Some(decoder.interrupt_handle());
+                song_ms = Arc::new(AtomicU64::new(at.as_millis() as u64));
                 let source = crate::audio_source::convert(decoder, output.channels, output.rate, format_error.clone());
-                player.append(Meter::new(source, status.clone(), fade_in, fade_out.clone()));
+                player.append(Meter::new(tempo(source, at, &song_ms), status.clone(), fade_in, fade_out.clone()));
                 player.play();
                 // 0 means the stream didn't say; keep the length the UI already knows.
                 if s.duration_ms > 0 {
@@ -753,8 +930,9 @@ fn run(
                 }
                 length = status.duration();
                 current = generation;
-                offset = at;
                 ending_sent = false;
+                status.stream_ms.store(s.duration_ms, Ordering::Relaxed);
+                status.started_gen.store(generation, Ordering::Release);
                 status.playing.store(true, Ordering::Relaxed);
             }
             Ok(AudioCmd::Replace { generation, seek, decoder, at, seekable: s }) => {
@@ -770,11 +948,14 @@ fn run(
                 log::info!("audio: generation {generation}, fresh seek decoder, source {} Hz / {} channels -> private mixer {} Hz / {} channels, continuous per-track resampler", rodio::Source::sample_rate(&decoder), rodio::Source::channels(&decoder), output.rate, output.channels);
                 interrupt = Some(decoder.interrupt_handle());
                 let source = crate::audio_source::convert(decoder, output.channels, output.rate, format_error.clone());
-                player.append(Meter::new(source, status.clone(), 0, fade_out.clone()));
+                song_ms = Arc::new(AtomicU64::new(at.as_millis() as u64));
+                player.append(Meter::new(tempo(source, at, &song_ms), status.clone(), 0, fade_out.clone()));
                 if !paused {
                     player.play();
                 }
-                offset = at;
+                // Paused, nothing else tells the UI (and the system media controls) where it is now.
+                status.set_position(at.as_millis() as u64);
+                wake();
             }
             Ok(AudioCmd::SeekFailed { generation, seek, at, reason }) => {
                 if generation != current || seek != jobs.seq { continue; }
@@ -786,7 +967,7 @@ fn run(
                 wake();
             }
             Ok(AudioCmd::Pause) => {
-                log::debug!("audio: pause at {:?}", offset + player.get_pos());
+                log::debug!("audio: pause at {:?}", song_pos(&song_ms));
                 player.pause();
                 fading.iter().for_each(|f| f.player.pause());
                 status.playing.store(false, Ordering::Relaxed);
@@ -798,7 +979,7 @@ fn run(
                 if current != 0 {
                     // Headphones may have come back (or gone) while paused.
                     if output.sink.is_none() || output.default_changed() {
-                        reopen_output(&mut output, ReopenState { player: &mut player, interrupt: &mut interrupt, jobs: &mut jobs, fading: &mut fading, shared: shared.as_ref(), current, offset: &mut offset }, &status, &tx);
+                        reopen_output(&mut output, ReopenState { player: &mut player, interrupt: &mut interrupt, jobs: &mut jobs, fading: &mut fading, shared: shared.as_ref(), current, at: song_pos(&song_ms) }, &status, &tx);
                     }
                     player.play();
                     fading.iter().for_each(|f| f.player.play());
@@ -817,7 +998,8 @@ fn run(
                     && fading.iter().all(|f| f.player.empty()) =>
             {
                 // Keeps playing at full volume until the next song starts (see `Start`).
-                let left = length.map(|d| d.saturating_sub(offset + player.get_pos()));
+                // In real time, at the speed it's playing.
+                let left = length.map(|d| d.saturating_sub(song_pos(&song_ms)).div_f32(status.speed()));
                 log::debug!("audio: handing off from generation {current}, {left:?} left");
                 jobs.cancel();
                 let old = std::mem::replace(&mut player, crate::audio_source::connect_player(&output.mixer, output.channels, output.rate));
@@ -826,9 +1008,9 @@ fn run(
                 status.playing.store(false, Ordering::Relaxed);
                 status.set_position(0);
             }
-            Ok(cmd @ (AudioCmd::Stop | AudioCmd::Handoff)) => {
+            Ok(cmd @ (AudioCmd::Stop | AudioCmd::StopAt(_) | AudioCmd::Handoff)) => {
                 jobs.cancel();
-                if matches!(cmd, AudioCmd::Handoff) {
+                if matches!(&cmd, AudioCmd::Handoff) {
                     // Skipping again mid-crossfade: everything playing goes, quickly enough
                     // to sound like a cut but without a click, and the next song comes in
                     // at full volume.
@@ -854,8 +1036,7 @@ fn run(
                 // this queued Stop arrives. Only retire our reader; last-reader
                 // lifetime decides whether the download itself is still needed.
                 shared = None;
-                status.playing.store(false, Ordering::Relaxed);
-                status.set_position(0);
+                finish_stop_status(&status, &cmd);
             }
             Ok(cmd @ (AudioCmd::Seek(_) | AudioCmd::SeekLive { .. })) => {
                 let (pos, live) = match cmd {
@@ -876,13 +1057,20 @@ fn run(
                 if let Some(s) = shared.clone() {
                     jobs.submit(s, pos, live, current, &tx);
                     abort_player(&output, &mut player, &mut interrupt);
-                    offset = pos;
+                    song_ms = Arc::new(AtomicU64::new(pos.as_millis() as u64));
+                }
+            }
+            // Failing here is `Start`'s to report. Opened while idle, the device gets the
+            // full `IDLE_CLOSE` again, in case the song never comes.
+            Ok(AudioCmd::Warm) => {
+                if output.sink.is_none() && output.open(tx.clone(), &status) {
+                    idle_since = idle_since.map(|_| Instant::now());
                 }
             }
             Ok(AudioCmd::DeviceLost) => {
                 let was = output.device.clone();
                 let was_playing = !player.is_paused() && (current != 0 || !fading.is_empty());
-                reopen_output(&mut output, ReopenState { player: &mut player, interrupt: &mut interrupt, jobs: &mut jobs, fading: &mut fading, shared: shared.as_ref(), current, offset: &mut offset }, &status, &tx);
+                reopen_output(&mut output, ReopenState { player: &mut player, interrupt: &mut interrupt, jobs: &mut jobs, fading: &mut fading, shared: shared.as_ref(), current, at: song_pos(&song_ms) }, &status, &tx);
                 // The device itself went away, not a hiccup on the same one: pause, as
                 // unplugging headphones does, rather than carry on out of the speakers.
                 if output.device != was && was_playing {
@@ -896,13 +1084,18 @@ fn run(
             Ok(AudioCmd::SetDevice(id)) => {
                 log::info!("audio: output device set to {id:?}");
                 output.preferred = id;
-                if output.default_changed() || output.sink.is_none() {
-                    reopen_output(&mut output, ReopenState { player: &mut player, interrupt: &mut interrupt, jobs: &mut jobs, fading: &mut fading, shared: shared.as_ref(), current, offset: &mut offset }, &status, &tx);
+                // A device let go while idle opens again with the next song.
+                if (output.sink.is_some() || idle_since.is_none()) && (output.sink.is_none() || output.default_changed()) {
+                    reopen_output(&mut output, ReopenState { player: &mut player, interrupt: &mut interrupt, jobs: &mut jobs, fading: &mut fading, shared: shared.as_ref(), current, at: song_pos(&song_ms) }, &status, &tx);
                 }
             }
             Ok(AudioCmd::Volume(v)) => {
                 let v = slider_gain(&status, v);
                 player.set_volume(v * norm_gain(&status, shared.as_deref()));
+                // The level may be what changed.
+                if shared.is_some() {
+                    show_norm(&status, shared.as_deref());
+                }
                 for f in &fading {
                     f.player.set_volume(v * norm_gain(&status, f.shared.as_deref()));
                 }
@@ -918,7 +1111,7 @@ fn run(
         }
 
         retire_waiting_faders(&mut fading);
-        if current != 0 && dev_lost.is_some_and(|at| offset + player.get_pos() >= at) {
+        if current != 0 && dev_lost.is_some_and(|lost| song_pos(&song_ms) >= lost) {
             dev_lost = None;
             log::info!("audio: dev hook: output device lost");
             output.device = Some("dev-hook-gone".into());
@@ -933,7 +1126,15 @@ fn run(
             && !output.lost.load(Ordering::Relaxed)
             && (output.sink.is_none() || output.default_changed())
         {
-            reopen_output(&mut output, ReopenState { player: &mut player, interrupt: &mut interrupt, jobs: &mut jobs, fading: &mut fading, shared: shared.as_ref(), current, offset: &mut offset }, &status, &tx);
+            reopen_output(&mut output, ReopenState { player: &mut player, interrupt: &mut interrupt, jobs: &mut jobs, fading: &mut fading, shared: shared.as_ref(), current, at: song_pos(&song_ms) }, &status, &tx);
+        }
+        // Let go of the device once nothing has played for a while; playing opens it again.
+        if (current != 0 || !fading.is_empty()) && !player.is_paused() {
+            idle_since = None;
+        } else if idle_since.get_or_insert_with(Instant::now).elapsed() >= IDLE_CLOSE && output.sink.is_some() {
+            log::info!("audio: nothing playing, letting go of the output device");
+            output.sink = None;
+            output.device = None;
         }
         if !fading.is_empty() {
             // The next song is taking too long: don't hold this one up any longer.
@@ -946,17 +1147,19 @@ fn run(
             }
         }
         if current != 0 {
-            let pos = offset + player.get_pos();
+            let pos = song_pos(&song_ms);
             status.set_position(pos.as_millis() as u64);
             // Start the next song early, to crossfade into it. Not for songs barely
-            // longer than the fade.
-            let crossfade = Duration::from_millis(status.crossfade_ms.load(Ordering::Relaxed) as u64);
+            // longer than the fade. (The fade's in real time: more of the song when faster.)
+            let crossfade = Duration::from_millis(status.crossfade_ms.load(Ordering::Relaxed) as u64).mul_f32(status.speed());
             if jobs.pending.is_none() && !ending_sent
                 && !crossfade.is_zero()
                 && let Some(d) = length
                 && d > crossfade * 2
                 && pos + crossfade >= d
-                && shared.as_ref().is_some_and(|s| s.error().is_none())
+                // Not a podcast feed's file: the ads its host puts in make it run longer
+                // than YouTube Music's length, so it plays to its real end.
+                && shared.as_ref().is_some_and(|s| s.error().is_none() && !s.feed)
             {
                 ending_sent = true;
                 let _ = events.send(AudioEvent::Ending { generation: current });
@@ -970,7 +1173,7 @@ fn run(
                     shared.as_ref().and_then(|s| s.error())
                 };
                 let event = match failure {
-                    Some(reason) => AudioEvent::Interrupted { generation: current, at: offset + player.get_pos(), reason },
+                    Some(reason) => AudioEvent::Interrupted { generation: current, at: song_pos(&song_ms), reason },
                     None => AudioEvent::Finished { generation: current },
                 };
                 let _ = events.send(event);
@@ -987,6 +1190,63 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_song_counts_as_started_only_once_the_engine_starts_it() {
+        let status = AudioStatus::default();
+        status.started_gen.store(1, Ordering::Release);
+        status.playing.store(true, Ordering::Relaxed);
+        // The UI asked for 2, but the engine hasn't stopped 1 yet.
+        assert!(!status.started(2));
+        status.started_gen.store(2, Ordering::Release);
+        assert!(status.started(2));
+        status.playing.store(false, Ordering::Relaxed);
+        assert!(!status.started(2));
+    }
+
+    #[test]
+    fn only_a_length_the_stream_gave_counts_as_its_own() {
+        let status = AudioStatus::default();
+        // A music video's 5:00 the UI put in, for a song whose stream gives no length.
+        status.duration_ms.store(300_000, Ordering::Relaxed);
+        status.started_gen.store(2, Ordering::Release);
+        status.playing.store(true, Ordering::Relaxed);
+        assert_eq!(status.stream_duration(2), None);
+        status.stream_ms.store(181_000, Ordering::Relaxed);
+        assert_eq!(status.stream_duration(2), Some(Duration::from_secs(181)));
+        // Not for the next song, until the engine starts it, with its own (here none).
+        assert_eq!(status.stream_duration(3), None);
+        status.stream_ms.store(0, Ordering::Relaxed);
+        status.started_gen.store(3, Ordering::Release);
+        assert_eq!(status.stream_duration(3), None);
+    }
+
+    #[test]
+    fn stop_at_freezes_recovery_position_without_resetting_track_identity() {
+        let status = AudioStatus::default();
+        status.playing.store(true, Ordering::Relaxed);
+        status.duration_ms.store(197_508, Ordering::Relaxed);
+        status.wanted_gen.store(191, Ordering::Relaxed);
+        status.set_position(900);
+        finish_stop_status(&status, &AudioCmd::StopAt(Duration::from_millis(113_195)));
+        assert!(!status.playing.load(Ordering::Relaxed));
+        assert_eq!(status.position(), Duration::from_millis(113_195));
+        assert_eq!(status.position_smooth(), Duration::from_millis(113_195));
+        assert_eq!(status.duration(), Some(Duration::from_millis(197_508)));
+        assert_eq!(status.wanted_gen.load(Ordering::Relaxed), 191);
+    }
+
+    #[test]
+    fn ordinary_stop_and_unfaded_handoff_still_reset_position() {
+        for command in [AudioCmd::Stop, AudioCmd::Handoff] {
+            let status = AudioStatus::default();
+            status.playing.store(true, Ordering::Relaxed);
+            status.set_position(113_195);
+            finish_stop_status(&status, &command);
+            assert!(!status.playing.load(Ordering::Relaxed));
+            assert_eq!(status.position_smooth(), Duration::ZERO);
+        }
+    }
 
     #[test]
     fn decoder_worker_reports_a_typed_panic_and_accepts_the_next_job() {
@@ -1137,11 +1397,11 @@ mod tests {
             out: Arc::new(AtomicU32::new(0)), waiting: None,
         }];
         let mut jobs = DecoderJobs::default();
-        let mut offset = Duration::from_secs(3);
+        let at = Duration::from_secs(3);
         let (tx, rx) = unbounded();
         // This is exactly the preparation executed before Output::open drops
         // and joins a WASAPI stream. No real device is opened in this test.
-        prepare_reopen(&output, ReopenState { player: &mut player, interrupt: &mut interrupt, jobs: &mut jobs, fading: &mut fading, shared: Some(&shared), current: 7, offset: &mut offset }, &tx);
+        prepare_reopen(&output, ReopenState { player: &mut player, interrupt: &mut interrupt, jobs: &mut jobs, fading: &mut fading, shared: Some(&shared), current: 7, at }, &tx);
         assert!(old.is_cancelled());
         assert!(outgoing.is_cancelled());
         assert!(interrupt.is_none());
@@ -1149,7 +1409,6 @@ mod tests {
         assert!(player.empty());
         assert!(player.is_paused());
         assert_eq!(player.volume(), 0.375);
-        assert_eq!(offset, Duration::from_secs(3));
         assert!(!jobs.pending.as_ref().unwrap().is_cancelled());
         // Cancellation before the worker takes its queued job legitimately
         // produces no completion. Establish an actual reader wait first so
@@ -1215,17 +1474,21 @@ mod tests {
         let (mixer, source) = rodio::mixer::mixer(channels, rate);
         mixer.add(rodio::buffer::SamplesBuffer::new(channels, rate, vec![0.25, -0.5, 0.75, -0.9]));
         let slot = Arc::new(std::sync::Mutex::new(None));
-        let mut old = Bridge { inner: Some(source), slot: slot.clone(), channels: 2, n: 0 };
-        assert_eq!(old.next(), Some(0.25));
+        let mut old = Bridge { inner: Some(source), slot: slot.clone(), channels: 2, n: 0,
+            eq: eq::Eq::new(Default::default(), 44100, 2),
+            limiter: limiter::Limiter::new(Arc::new(AtomicBool::new(false)), 44100, 2) };
+        assert_eq!(old.next(), Some(0.0)); // The limiter retains its upstream lookahead.
         // Dropping an output device after its left sample must discard only
         // that frame's right sample, then return the original mixer.
         drop(old);
-        let source = slot.lock().unwrap().take().unwrap();
+        let mut source = slot.lock().unwrap().take().unwrap();
+        assert_eq!(source.next(), Some(0.75));
+        assert_eq!(source.next(), Some(-0.9));
         assert_eq!(source.channels(), channels);
         assert_eq!(source.sample_rate(), rate);
-        let mut recovered = Bridge { inner: Some(source), slot: slot.clone(), channels: 2, n: 0 };
-        assert_eq!(recovered.next(), Some(0.75));
-        assert_eq!(recovered.next(), Some(-0.9));
+        let mut recovered = Bridge { inner: Some(source), slot: slot.clone(), channels: 2, n: 0,
+            eq: eq::Eq::new(Default::default(), 44100, 2),
+            limiter: limiter::Limiter::new(Arc::new(AtomicBool::new(false)), 44100, 2) };
         assert_eq!(recovered.next(), Some(0.0));
         assert_eq!(recovered.sample_rate(), rate);
         drop(recovered);
@@ -1256,18 +1519,83 @@ mod tests {
     }
 
     #[test]
-    fn normalization_only_turns_loud_tracks_down() {
-        let status = AudioStatus::default();
+    fn emptying_the_player_doesnt_wait_on_a_device_let_go() {
+        use std::num::NonZero;
+        let (mixer, source) = rodio::mixer::mixer(NonZero::new(2).unwrap(), NonZero::new(48_000).unwrap());
+        // Let go of while paused: nothing pulls the mixer.
+        let output = Output { mixer, channels: NonZero::new(2).unwrap(), rate: NonZero::new(48_000).unwrap(), slot: Arc::new(std::sync::Mutex::new(Some(source))), sink: None, device: None, preferred: None, lost: Default::default(), checked: Instant::now() };
+        let mut player = crate::audio_source::connect_player(&output.mixer, output.channels, output.rate);
+        player.set_volume(0.5);
+        player.append(rodio::buffer::SamplesBuffer::new(NonZero::new(2).unwrap(), NonZero::new(48_000).unwrap(), vec![0.0; 96_000]));
+        player.pause();
+        let (done, finished) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            clear(&mut player, &output);
+            let _ = done.send((player.empty(), player.is_paused(), player.volume()));
+        });
+        assert_eq!(finished.recv_timeout(Duration::from_secs(2)).ok(), Some((true, true, 0.5)));
+    }
+
+    #[test]
+    fn emptying_the_player_doesnt_wait_on_a_stalled_device() {
+        use std::num::NonZero;
+        let (mixer, source) = rodio::mixer::mixer(NonZero::new(2).unwrap(), NonZero::new(48_000).unwrap());
+        // Playing, through a device that stopped pulling before it reported itself gone.
+        let output = Output { mixer, channels: NonZero::new(2).unwrap(), rate: NonZero::new(48_000).unwrap(), slot: Arc::new(std::sync::Mutex::new(None)), sink: None, device: None, preferred: None, lost: Default::default(), checked: Instant::now() };
+        let mut player = crate::audio_source::connect_player(&output.mixer, output.channels, output.rate);
+        player.set_volume(0.25);
+        player.append(rodio::buffer::SamplesBuffer::new(NonZero::new(2).unwrap(), NonZero::new(48_000).unwrap(), vec![0.5; 96_000]));
+        player.play();
+        let (done, finished) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            clear(&mut player, &output);
+            let _ = done.send((player.empty(), player.is_paused(), player.volume()));
+        });
+        assert_eq!(finished.recv_timeout(Duration::from_secs(2)).ok(), Some((true, true, 0.25)));
+        // Once the device pulls again, the old song is gone within rodio's 5 ms check.
+        let mut source = source;
+        let tail: Vec<f32> = source.by_ref().take(9_600).skip(4_800).collect();
+        assert!(tail.iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn normalization_brings_loud_and_quiet_songs_to_the_level() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let audio = AudioHandle { tx, status: Arc::new(AudioStatus::default()) };
+        let status = &audio.status;
         let loud = Shared::new(1, 0, Some(7.29), false, false);
         let quiet = Shared::new(1, 0, Some(-4.0), false, false);
+        let very_quiet = Shared::new(1, 0, Some(-15.0), false, false);
         let unknown = Shared::new(1, 0, None, false, false);
-        status.normalize.store(true, Ordering::Relaxed);
-        assert!((norm_gain(&status, Some(&loud)) - 0.432).abs() < 0.001);
-        assert_eq!(norm_gain(&status, Some(&quiet)), 1.0);
-        assert_eq!(norm_gain(&status, Some(&unknown)), 1.0);
-        assert_eq!(norm_gain(&status, None), 1.0);
-        status.normalize.store(false, Ordering::Relaxed);
-        assert_eq!(norm_gain(&status, Some(&loud)), 1.0);
+        audio.set_normalize(Normalize::Normal);
+        assert!(status.limit.load(Ordering::Relaxed));
+        assert!((norm_gain(status, Some(&loud)) - 0.432).abs() < 0.001);
+        assert!((norm_gain(status, Some(&quiet)) - 1.585).abs() < 0.001);
+        // Up by no more than 6 dB.
+        assert_eq!(norm_db(status, Some(&very_quiet)), Some(MAX_BOOST_DB));
+        assert_eq!(norm_gain(status, Some(&unknown)), 1.0);
+        assert_eq!(norm_gain(status, None), 1.0);
+        // Quiet: 5 dB lower, so a song 4 dB under the target comes down a little.
+        audio.set_normalize(Normalize::Quiet);
+        assert_eq!(norm_db(status, Some(&quiet)), Some(-1.0));
+        assert!((norm_db(status, Some(&loud)).unwrap() + 12.29).abs() < 1e-4);
+        audio.set_normalize(Normalize::Off);
+        assert!(!status.limit.load(Ordering::Relaxed));
+        assert_eq!(norm_gain(status, Some(&loud)), 1.0);
+        assert_eq!(norm_gain(status, Some(&quiet)), 1.0);
+        show_norm(status, Some(&loud));
+        assert_eq!(audio.normalization(), None);
+    }
+
+    #[test]
+    fn the_old_switch_keeps_its_meaning() {
+        assert_eq!(Normalize::from_key("1"), Normalize::Normal);
+        assert_eq!(Normalize::from_key("0"), Normalize::Off);
+        assert_eq!(Normalize::from_key("quiet"), Normalize::Quiet);
+        assert_eq!(Normalize::from_key(""), Normalize::Normal);
+        for l in Normalize::ALL {
+            assert_eq!(Normalize::from_u8(l as u8), l);
+        }
     }
 
     #[test]

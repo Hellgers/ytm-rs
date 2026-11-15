@@ -1,0 +1,154 @@
+{
+  "id": "minimal",
+  "name": "Minimal",
+  "creators": [
+    "semicolonhope"
+  ],
+  "blurb": "Calm line-by-line lyrics with no karaoke wipe, over a dim, unblurred cover backdrop.",
+  "source": "Better Lyrics: ramansg/Minimal 3.0.5",
+  "background": {
+    "mode": "cover_fullbleed",
+    "np_dim": 0.22,
+    "crossfade_secs": 2.5,
+    "crossfade_delay": 2.5
+  },
+  "accent": "#ffffff",
+  "lyrics": {
+    "font": "Google Sans Flex",
+    "weight": "semibold",
+    "font_rem": [
+      [
+        0,
+        3
+      ]
+    ],
+    "fullscreen_scale": 1.4,
+    "line_height": 1.5,
+    "line_padding_rem": 1.35,
+    "anchor": 0.4,
+    "rest_scale": 1,
+    "active_scale": 1,
+    "wobble": false,
+    "letter_wave": {
+      "on": false
+    },
+    "glow_alpha": 0,
+    "long_glow_alpha": 0,
+    "fill": "line",
+    "dim_alpha": 1,
+    "past": [
+      [
+        0.6,
+        0
+      ]
+    ],
+    "upcoming": [
+      [
+        0.35,
+        0
+      ]
+    ],
+    "opacity_transition": {
+      "frac": 0,
+      "secs": 0.4,
+      "delay": 0
+    },
+    "scroll_opacity": 0.5,
+    "scroll_secs": 0.7,
+    "scroll_ease": [
+      0.215,
+      0.61,
+      0.355,
+      1
+    ],
+    "scroll_offset": 0.133,
+    "instrumental": "glyph",
+    "instrumental_rem": 3.6,
+    "instrumental_glow": 0.6,
+    "instrumental_breathe": [
+      1.0,
+      1.05,
+      1.5
+    ],
+    "hover_opacity": 0.8
+  },
+  "cover": {
+    "radius_pct": 0.08,
+    "outline": [
+      1,
+      0.1
+    ]
+  },
+  "chrome": {
+    "play_button": "ghost",
+    "progress_color": "white",
+    "progress_thumb": false,
+    "progress_alpha": 0.6,
+    "progress_track": 0.1,
+    "time_alpha": 0.87,
+    "time_weight": "light",
+    "icon_alpha": 0.9,
+    "bar_cover_alpha": 0.22,
+    "tip_fill": "#ffffff",
+    "tip_text": "#000000"
+  },
+  "app": {
+    "font": "Google Sans Flex",
+    "page_bg": "solid",
+    "bar_alpha": 0,
+    "chip": "ghost",
+    "search_radius": 20,
+    "search_alpha": 0.1,
+    "search_border": 0.1,
+    "menu_radius": 13.92,
+    "text_dim": "#a3a3a3",
+    "controls": {
+      "idle_alpha": 0.9,
+      "ghost_outline": 0.12
+    },
+    "nav_item": {
+      "hover": 0.1,
+      "selected": 0.1
+    },
+    "row_look": {
+      "radius": 13.92,
+      "hover": 0.1,
+      "hover_border": 0.1
+    },
+    "menu_look": {
+      "hover": 0.1,
+      "row_radius": 13.92
+    },
+    "search_look": {
+      "drop_radius": 20,
+      "open_color": "#212121",
+      "attached": true,
+      "item_radius": 20
+    },
+    "toast_look": {
+      "color": "#212121",
+      "alpha": 1,
+      "border": [
+        0.1,
+        1.5
+      ],
+      "radius": 20.88,
+      "secs": 2.5
+    },
+    "scrollbar": [
+      5,
+      0.3
+    ],
+    "immersive_header": 0.6,
+    "squircle": true,
+    "scrollbar_home_hidden": true,
+    "queue_card": true
+  },
+  "now_playing": {
+    "switch": {
+      "back": 0.1,
+      "selected": 0.15,
+      "stroke": 0.1
+    }
+  }
+}

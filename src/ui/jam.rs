@@ -141,6 +141,8 @@ pub fn leave(app: &mut App) {
         c.leave();
     }
     fresh(app, false);
+    // A guest's queue was the host's: hidden explicit songs leave it.
+    app.queue.drop_explicit();
 }
 
 /// Dev hooks: YTM_JAM_HOST=<code> starts a room with that code, YTM_JAM_JOIN=<code> joins one.
@@ -181,7 +183,7 @@ pub fn dev_script(app: &mut App, ctx: &egui::Context, now: f64) {
             "queue=on" => set_control(app, app.jam.control, true),
             "queue=off" => set_control(app, app.jam.control, false),
             a if a.starts_with("add=") => {
-                let track = crate::model::Track { id: a[4..].to_owned(), title: "Test song".into(), artists: vec![], album: None, duration: None, thumbs: vec![], track_nr: None, plays: None, music_video: false };
+                let track = crate::model::Track { id: a[4..].to_owned(), title: "Test song".into(), artists: vec![], ..Default::default() };
                 app.apply(Action::Enqueue(track));
             }
             a if a.starts_with("seek=") => {
@@ -247,6 +249,8 @@ fn on_event(app: &mut App, e: Event) {
             s.members = members;
             if promoted {
                 s.sent_sig = 0;
+                // The queue is ours now: hidden explicit songs leave it.
+                app.queue.drop_explicit();
                 app.toast("You're the host now");
             }
         }
@@ -372,6 +376,11 @@ fn host_request(app: &mut App, from: String, name: String, cmd: Cmd) {
         return;
     }
     if let Cmd::Add { track } | Cmd::Next { track } = &cmd {
+        // The host's setting decides what the jam plays.
+        if app.hide_explicit && track.explicit {
+            app.toast(format!("Skipped an explicit song {name} added"));
+            return;
+        }
         // Their app checks this too; two adds can cross the latest state, though.
         if waiting(app, &from) >= GUEST_WAITING && from != app.jam.you {
             log::info!("jam: {name} already has {GUEST_WAITING} songs waiting");
@@ -419,6 +428,7 @@ fn host_request(app: &mut App, from: String, name: String, cmd: Cmd) {
             let i = app.jam.sent_from + index;
             if i < app.queue.tracks.len() {
                 app.queue.index = Some(i);
+                app.queue.drop_explicit();
                 app.play_current();
             }
         }
@@ -489,6 +499,9 @@ fn sync(app: &mut App) {
             app.audio.status.position_ms.store(target.as_millis() as u64, Ordering::Relaxed);
             app.audio.status.duration_ms.store(app.current().and_then(|t| t.duration).map_or(0, |d| d as u64 * 1000), Ordering::Relaxed);
             app.request_art();
+            if let Some(t) = app.current().cloned() {
+                app.show_in_media(&t);
+            }
         }
         return;
     }
@@ -535,6 +548,11 @@ pub fn request(app: &mut App, cmd: Cmd) {
         app.toast("The host turned off adding songs");
         return;
     }
+    if let Cmd::Add { track } | Cmd::Next { track } = &cmd
+        && app.explicit_hidden(track)
+    {
+        return;
+    }
     if !cmd.is_control() && waiting(app, &app.jam.you) >= GUEST_WAITING {
         log::info!("jam: {GUEST_WAITING} songs already waiting");
         app.toast(format!("You have {GUEST_WAITING} songs waiting. Add more once one plays"));
@@ -554,7 +572,7 @@ pub fn request(app: &mut App, cmd: Cmd) {
 /// instead. Returns the action if it should run locally.
 pub fn guest_action(app: &mut App, a: Action) -> Option<Action> {
     match a {
-        Action::Play(tracks, i) => {
+        Action::Play(tracks, i) | Action::PlayFound(tracks, i) => {
             if let Some(t) = tracks.into_iter().nth(i) {
                 if app.current_id() == Some(t.id.as_str()) {
                     request(app, Cmd::Toggle);
@@ -568,6 +586,7 @@ pub fn guest_action(app: &mut App, a: Action) -> Option<Action> {
         Action::PlayCollection(..) => app.toast("In a jam, add songs one at a time"),
         Action::QueueJump(i) => request(app, Cmd::Jump { index: i }),
         Action::QueueRemove(_) => app.toast("Only the host can remove songs"),
+        Action::QueueMove { .. } => app.toast("Only the host can reorder the jam"),
         Action::Seek(secs) => request(app, Cmd::Seek { pos: (secs.max(0.0) * 1000.0) as u64 }),
         Action::TogglePlay => request(app, Cmd::Toggle),
         a => return Some(a),
@@ -683,7 +702,7 @@ fn room(app: &mut App, ui: &mut Ui) {
         ui.label(RichText::new(spaced).font(theme::bold(40.0)).color(theme::text()));
         if let Some(s) = status {
             ui.horizontal(|ui| {
-                ui.spinner();
+                super::widgets::loader(ui);
                 dim(ui, s);
             });
         }

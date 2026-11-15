@@ -1,37 +1,60 @@
-> **Windows audio continuity fork (0.2.33).** Based on upstream stable 0.2.31
-> (`133ad8990a6cd60eafdc812b333ef356b52380f7`), with continuous per-track
-> resampling to prevent crackle at decoder packet boundaries. Windows builds and
-> automatic updates come from [this fork's releases](https://github.com/Hellgers/ytm-rs/releases).
-> See [audio fix](docs/AUDIO_CONTINUITY_FIX.md) and [release notes](docs/RELEASE_NOTES_0.2.33.md).
-> The upstream project's cross-platform documentation follows; this fork ships Windows x64 binaries.
+## Windows maintenance fork
+
+Version 0.3.4 integrates upstream 0.3.3 with the cumulative playback, radio and
+rendering fixes described in [the technical notes](docs/AUDIO_CONTINUITY_FIX.md).
+The original project is [grapedjuice/ytm-rs](https://github.com/grapedjuice/ytm-rs).
+
+Use this fork's [Windows releases](https://github.com/Hellgers/ytm-rs/releases/latest)
+for its unsigned installer or portable ZIP. These builds follow this fork's update
+channel. Release assets also include the source, a unified functional patch and
+SHA256 checksums. Preserve the previous executable for rollback.
+
+The upstream project's cross-platform documentation follows below.
+
 <div align="center">
   <img src="assets/icon/icon.png" alt="ytm-rs app icon" width="96">
   <h1>ytm-rs</h1>
   <p><strong>YouTube Music in a fast, native desktop app.</strong></p>
-  <p>Built in Rust with egui and rodio. No Electron, no browser-based player, and under 100 MB of memory while playing.</p>
+  <p>Built in Rust with egui and rodio. No Electron, no browser-based player, and around 130 MB of memory while playing.</p>
 
   <p>
-    <a href="https://github.com/Hellgers/ytm-rs/releases/latest"><img src="https://img.shields.io/github/v/release/Hellgers/ytm-rs?style=flat-square&color=ff4e45" alt="Latest release"></a>
-    <a href="https://github.com/Hellgers/ytm-rs/releases"><img src="https://img.shields.io/github/downloads/Hellgers/ytm-rs/total?style=flat-square&color=ff4e45" alt="Downloads"></a>
+    <a href="https://github.com/grapedjuice/ytm-rs/releases/latest"><img src="https://img.shields.io/github/v/release/grapedjuice/ytm-rs?style=flat-square&color=ff4e45" alt="Latest release"></a>
+    <a href="https://github.com/grapedjuice/ytm-rs/releases"><img src="https://img.shields.io/github/downloads/grapedjuice/ytm-rs/total?style=flat-square&color=ff4e45" alt="Downloads"></a>
     <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-333?style=flat-square" alt="Platforms">
     <a href="LICENSE"><img src="https://img.shields.io/github/license/grapedjuice/ytm-rs?style=flat-square&color=333" alt="License: GPL-3.0"></a>
+    <a href="https://ko-fi.com/grapedjuice"><img src="https://img.shields.io/badge/Ko--fi-support-ff4e45?style=flat-square&logo=kofi&logoColor=white" alt="Support on Ko-fi"></a>
   </p>
 
   <p>
     <a href="https://grapedjuice.github.io/ytm-rs/">Website</a> ·
-    <a href="https://github.com/Hellgers/ytm-rs/releases/latest">Download</a> ·
+    <a href="https://github.com/grapedjuice/ytm-rs/releases/latest">Download</a> ·
     <a href="#features">Features</a> ·
     <a href="#installation">Installation</a> ·
-    <a href="#building-from-source">Build from source</a>
+    <a href="#building-from-source">Build from source</a> ·
+    <a href="https://github.com/grapedjuice/ytm-rs/discussions">Discussions</a>
   </p>
 </div>
 
 <p align="center">
-  <img src="docs/readme/hero.jpg" alt="ytm-rs playing Birds of a Feather by Billie Eilish with synced lyrics, with the Spinning Record and reCover themes behind it" width="100%">
+  <img src="docs/readme/v2/hero.jpg" alt="ytm-rs playing Espresso by Sabrina Carpenter with synced lyrics in the Apple Music theme, in front of the Home page, with the mini player floating over both" width="100%">
 </p>
+
+## Why ytm-rs
+
+Most YouTube Music desktop apps are the website running in a hidden browser. ytm-rs draws everything itself, so it starts quickly, stays light and leaves your memory for everything else.
+
+| | ytm-rs | YouTube Music in Chrome | Pear Desktop |
+| --- | --- | --- | --- |
+| Memory with a song playing | **~130 MB** | 496 MB | 638 MB |
+| Windows download | **11 MB** | – | 107 MB |
+| Installed size | **36 MB** | – | 397 MB |
+| Runs a web browser inside | No | Yes | Yes |
+
+<sub>Memory with a song playing on the same Windows 11 PC: ytm-rs 0.3.0, Chrome 155 with one tab and Pear Desktop 3.12.0. Sizes: ytm-rs 0.3.0 and Pear Desktop 3.12.0.</sub>
 
 ## Table of contents
 
+- [Why ytm-rs](#why-ytm-rs)
 - [Features](#features)
 - [Screenshots](#screenshots)
 - [Installation](#installation)
@@ -41,71 +64,55 @@
 - [Contributing](#contributing)
 - [License](#license)
 - [Acknowledgements](#acknowledgements)
+- [Star History](#star-history)
 
 ## Features
 
 **Listening**
 - **Your music feed:** Listen again, Quick picks, your mixes (My Supermix, Discover Mix and more) and mood filters, refreshed each time you open a page.
 - **Explore and search:** new releases, charts, and search across songs, albums, artists and playlists.
-- **Your library:** liked songs, saved albums and playlists, history and uploads. Upload your own songs from the Uploads tab or by dropping files on the window.
-- **Playback:** queue, song radio, shuffle, repeat and autoplay, with the next track prefetched for instant skips. 256 kbps audio with YouTube Premium, volume normalization, and a choice of output device.
+- **Your library:** liked songs, saved albums and playlists, history and uploads. Upload your own songs from the Uploads tab or by dropping files on the window. Turn on podcasts to see shows and episodes too.
+- **Song lists:** drag songs to reorder the queue and your own playlists, or drop them on a playlist in the sidebar to add them. A find box narrows any list to the songs that match.
+- **Playback:** queue, song radio, shuffle, repeat, autoplay and crossfade, with the next track prefetched for instant skips. Volume normalization, a 10-band equalizer with presets, playback speed (the pitch goes with it, like a record), and a choice of output device.
+- **Sound quality:** Opus at about 256 kbps with YouTube Premium, the best stream YouTube offers, and Opus at about 130 kbps without it.
+- **Songs, not music videos:** an official music video plays as its album recording, without the intros and skits, or switch to the video itself in Now playing.
 - **Skip non-music parts:** jumps over talking, skits and sponsor breaks in music videos, as marked by SponsorBlock.
-- **Downloads:** save any song as a tagged `.m4a` with cover art, at the best quality your account gets, and play it offline.
+- **Explicit songs:** marked with an E. Turn on Hide explicit songs to leave them out of lists, search, the queue and autoplay, and optionally use YouTube's Restricted Mode as well.
+- **Downloads:** save any song as a tagged `.m4a` with cover art, at the best quality your account gets. Saved songs are listed in Library › Downloads and play offline.
 
 **Lyrics and looks**
 - **Karaoke lyrics:** word-by-word lyrics drawn the way the Better Lyrics extension draws them, from every Better Lyrics source, with automatic fallback, romanization, translations and per-song timing offsets.
 - **Animated background:** the album art drifts and pulses with the music behind everything. Go full-screen, or hide the lyrics to see just the artwork.
-- **27 themes:** 26 rebuilt from the [Better Lyrics community themes](https://github.com/better-lyrics/themes), such as Apple Music, Spicy, Spinning Record and reCover, plus Fluent, in the style of Windows 11 with your Windows accent colour. Each one restyles the whole app. Use any bundled or installed font.
+- **30 themes:** 27 rebuilt from the [Better Lyrics community themes](https://github.com/better-lyrics/themes), such as Apple Music, Spicy, Spinning Record, reCover and Material 3, plus the app's own ytm-rs and Classic looks and Fluent, in the style of Windows 11. Each one restyles the whole app, in light or dark mode, with real frosted glass where the theme has it. Use any bundled or installed font.
+- **Your colours:** the accent can follow the theme or your system, or be any colour you pick. A `theme.conf` file can set every colour in the app, for tools like wallust and pywal to write. Zoom makes everything bigger or smaller.
 
 **Together and across services**
 - **Listen together:** start a jam, share the code or link, and up to 16 people hear the same song at the same moment. The host decides whether guests can add songs or control playback.
 - **Transfer from Spotify:** bring playlists and Liked Songs over to YouTube Music in the background. ytm-rs asks you when it isn't sure about a match and picks up where it left off if interrupted.
-- **Last.fm and Discord:** scrobbling and Rich Presence.
+- **Last.fm, ListenBrainz and Discord:** scrobbling and Rich Presence.
 
 **Desktop**
-- System media controls, taskbar thumbnail buttons, close to tray, a collapsible sidebar and screen-reader-accessible controls. On Windows, the app draws its own title bar so the window is one surface.
-- Automatic updates in the background for both the installed and portable versions, with release notes when an update is ready.
+- System media controls with a seekable timeline, taskbar thumbnail buttons, close to tray (Wayland too), song notifications while the window is in the background, a choice of page to open on, a collapsible sidebar and screen-reader-accessible controls.
+- The app draws its own title bar on Windows, so the window is one surface, and on Linux desktops that draw none. On Windows 11, Mica or Acrylic can show behind the window.
+- **Mini player:** shrink the window to a small strip with the song and controls (Ctrl+M), or try the experimental pill that sits in a corner and opens on hover.
+- **System-wide media shortcuts:** play/pause, next, previous and volume work while another app is in front or the window is in the tray. Change them in Settings › Keyboard shortcuts.
+- Automatic updates in the background for both the installed and portable versions, with release notes when an update is ready. Pick the Nightly channel for builds of the newest changes.
 
 ## Screenshots
 
-<table>
-  <tr>
-    <td width="50%"><img src="docs/readme/home.jpg" alt="Home feed with mood filters, Quick picks and Throwbacks"></td>
-    <td width="50%"><img src="docs/readme/artist.jpg" alt="Billie Eilish's artist page with her top songs"></td>
-  </tr>
-  <tr>
-    <td align="center"><b>Home</b></td>
-    <td align="center"><b>Artist page</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/readme/theme-spinning-record.jpg" alt="Spinning Record theme: Pink Pony Club by Chappell Roan on a spinning vinyl beside the lyrics"></td>
-    <td><img src="docs/readme/theme-recover.jpg" alt="reCover theme: Abracadabra by Lady Gaga, the cover filling the left side and fading into the lyrics"></td>
-  </tr>
-  <tr>
-    <td align="center"><b>Spinning Record theme</b></td>
-    <td align="center"><b>reCover theme</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/readme/search.jpg" alt="Search results for Tyler, The Creator: top result, songs, artists and albums"></td>
-    <td><img src="docs/readme/settings-themes.jpg" alt="The theme gallery in Settings"></td>
-  </tr>
-  <tr>
-    <td align="center"><b>Search</b></td>
-    <td align="center"><b>Theme gallery</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/readme/listen-together.jpg" alt="Listen together: start a jam or join one with a code"></td>
-    <td><img src="docs/readme/spotify-transfer.jpg" alt="Transfer from Spotify: Today's Top Hits pasted in, ready to copy into a new YouTube Music playlist"></td>
-  </tr>
-  <tr>
-    <td align="center"><b>Listen together</b></td>
-    <td align="center"><b>Transfer from Spotify</b></td>
-  </tr>
-</table>
+<p align="center">
+  <img src="docs/readme/v2/themes-grid.jpg" alt="Six of the 30 themes in Now playing: ytm-rs, Apple Music, Material 3, Spicy, Spinning Record and reCover, each with synced lyrics" width="100%">
+</p>
+
+<p align="center">
+  <img src="docs/readme/v2/features.jpg" alt="Light mode on the Home page, Listen together, the 10-band equalizer, the mini player, and the Last.fm and Discord connections in Settings" width="100%">
+</p>
 
 ## Installation
 
-Windows x64 downloads for this fork are on the [latest release](https://github.com/Hellgers/ytm-rs/releases/latest). Other platform builds are available from [upstream releases](https://github.com/grapedjuice/ytm-rs/releases/latest) and do not include this fork's patch. Once installed, ytm-rs keeps itself up to date; you can turn this off in **Settings → Updates**.
+Downloads for every platform are on the [latest release](https://github.com/grapedjuice/ytm-rs/releases/latest). Once installed, ytm-rs keeps itself up to date; you can turn this off, or switch to nightly builds, in **Settings › About › Updates**.
+
+ytm-rs collects nothing about you; see [Privacy](PRIVACY.md) for every service it talks to and why.
 
 <details open>
 <summary><b>Windows</b></summary>
@@ -136,7 +143,9 @@ Sign-ins are kept in your login Keychain. Jam links don't open the app on macOS 
 curl -fsSL https://raw.githubusercontent.com/grapedjuice/ytm-rs/main/linux/install.sh | sh
 ```
 
-This installs ytm-rs for your user (no root) in `~/.local/lib/ytm-rs`, with a `ytm-rs` command and an app menu entry. If WebKitGTK or other required libraries are missing, it installs them too (that step asks for your password). You can also download `ytm-rs-<version>-linux-x86_64.tar.gz`, extract it and run `./install.sh`.
+This installs ytm-rs for your user (no root) in `~/.local/lib/ytm-rs`, with a `ytm-rs` command and an app menu entry. If WebKitGTK, other required libraries or desktop-file-utils (which lets the browser open jam links in the app) are missing, it installs them too (that step asks for your password). You can also download `ytm-rs-<version>-linux-x86_64.tar.gz`, extract it and run `./install.sh`.
+
+On Debian, Ubuntu and their derivatives you can instead download `ytm-rs_<version>_amd64.deb` and open it, or run `sudo apt install ./ytm-rs_<version>_amd64.deb`. It doesn't update itself: when a new version is out, the app says so and links to the new `.deb`, which installs over the old one. To uninstall it, run `sudo apt remove ytm-rs`.
 
 Sign-ins are kept in your keyring (GNOME Keyring or KWallet). To uninstall, run `~/.local/lib/ytm-rs/install.sh --uninstall`.
 
@@ -161,14 +170,16 @@ Sign-ins are still kept by the system (Credential Manager, Keychain or your keyr
 
 | To… | Do this |
 | --- | --- |
-| **Sign in** | **Settings → Sign in with Google.** Unlocks your feed, library, likes and history. Browsing and search work without it. |
+| **Sign in** | **Settings › Account › Sign in with Google.** Unlocks your feed, library, likes and history. Browsing and search work without it. If your account has more than one YouTube channel, pick one there too. |
 | **Listen together** | Click **Listen together** in the sidebar, start a jam and share the code or link. Songs guests add play next, marked with who added them, up to 5 waiting per guest. |
-| **Transfer from Spotify** | **Settings → Import**, then sign in to Spotify to pick a playlist or Liked Songs, or paste a public playlist link without signing in. Matches ytm-rs isn't sure about come to you for review before it creates a private playlist. |
-| **Upload music** | **Library → Uploads → Upload music**, or drop MP3, M4A, FLAC, OGG or WMA files on the window. Title, artist, album and cover come from the file's tags. |
-| **Download songs** | Open a song's menu and click **Download**. Files go to `Music\ytm-rs`; change this in **Settings → Downloads**. |
-| **Scrobble to Last.fm** | **Settings → Connections → Connect** next to Last.fm, then allow ytm-rs in your browser. Songs scrobble after half their length or four minutes. |
-| **Change the theme** | **Settings → Theme**, click a card. Turn on **Classic theme** under Appearance for the plain dark look with red accents. |
-| **Tune the lyrics** | **Settings → Lyrics** sets the source order, translation language and timing offsets. |
+| **Transfer from Spotify** | **Settings › General › Transfer from Spotify**, then sign in to Spotify to pick a playlist or Liked Songs, or paste a public playlist link without signing in. Matches ytm-rs isn't sure about come to you for review before it creates a private playlist. |
+| **Upload music** | **Library › Uploads › Upload music**, or drop MP3, M4A, FLAC, OGG or WMA files on the window. Title, artist, album and cover come from the file's tags. |
+| **Download songs** | Open a song's menu and click **Download**. Files go to `Music\ytm-rs`; change this in **Settings › General › Downloads**. |
+| **Scrobble to Last.fm** | **Settings › Account › Connections**, click **Connect** next to Last.fm, then allow ytm-rs in your browser. Songs scrobble after half their length or four minutes. |
+| **Send listens to ListenBrainz** | Copy your user token from [listenbrainz.org/settings](https://listenbrainz.org/settings/), then in **Settings › Account › Connections** paste it under ListenBrainz and click **Connect**. Songs count after half their length or four minutes. |
+| **Change the theme** | **Settings › Appearance**, click a theme card. Mode switches between light and dark, and Accent colour sets the highlight colour. |
+| **Shape the sound** | **Settings › Playback** has the equalizer, crossfade and volume normalization. |
+| **Tune the lyrics** | **Settings › Lyrics** sets the source order, translation language and timing offsets. |
 
 ## Building from source
 
@@ -235,7 +246,7 @@ The relay in `server/` is a separate Cloudflare Worker, also in Rust ([workers-r
 
 ## Contributing
 
-Found a bug or have an idea? [Open an issue](https://github.com/grapedjuice/ytm-rs/issues). Pull requests are welcome.
+Found a bug or have an idea? [Open an issue](https://github.com/grapedjuice/ytm-rs/issues). Questions, or a setup to show off? Head to [Discussions](https://github.com/grapedjuice/ytm-rs/discussions). Pull requests are welcome.
 
 ## License
 
@@ -249,3 +260,13 @@ ytm-rs is licensed under [GPL-3.0](LICENSE).
 - Listen together runs on a small relay built with [workers-rs](https://github.com/cloudflare/workers-rs) on Cloudflare Durable Objects.
 - The animated background is based on Kawarp from [Better Lyrics](https://github.com/better-lyrics), and the theme presets are adapted from the Better Lyrics theme store, with credit to each theme's creators.
 - Fonts: Inter, DM Sans, Google Sans Flex, Figtree and Instrument Sans (SIL OFL 1.1). Icons: Lucide.
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=grapedjuice%2Fytm-rs&type=date&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=grapedjuice/ytm-rs&type=date&theme=dark&legend=bottom-right" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=grapedjuice/ytm-rs&type=date&legend=bottom-right" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=grapedjuice/ytm-rs&type=date&legend=bottom-right" />
+ </picture>
+</a>

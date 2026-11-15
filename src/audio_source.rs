@@ -51,6 +51,31 @@ pub fn replace_player(
     drop(old);
 }
 
+/// Delay eager DSP constructors until the device actually requests a sample.
+/// Metadata is supplied independently and never invokes the builder.
+pub fn defer<S, F>(channels: ChannelCount, rate: SampleRate, duration: Option<Duration>, build: F) -> impl Source + Send
+where S: Source + Send, F: FnOnce() -> S + Send {
+    Deferred { build: Some(build), inner: None, channels, rate, duration }
+}
+
+struct Deferred<S, F> {
+    build: Option<F>, inner: Option<S>, channels: ChannelCount, rate: SampleRate, duration: Option<Duration>,
+}
+
+impl<S: Source, F: FnOnce() -> S> Iterator for Deferred<S, F> {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        if let Some(build) = self.build.take() { self.inner = Some(build()); }
+        self.inner.as_mut()?.next()
+    }
+}
+
+impl<S: Source, F: FnOnce() -> S> Source for Deferred<S, F> {
+    fn current_span_len(&self) -> Option<usize> { None }
+    fn channels(&self) -> ChannelCount { self.channels }
+    fn sample_rate(&self) -> SampleRate { self.rate }
+    fn total_duration(&self) -> Option<Duration> { self.duration }
+}
 pub fn convert<S>(
     inner: S,
     channels: ChannelCount,
@@ -214,6 +239,32 @@ mod tests {
             for _ in 0..2000 { output.next(); }
             assert!(reads.load(Ordering::Relaxed) > 0);
         }
+    }
+    #[test]
+    fn deferred_tempo_construction_metadata_and_append_never_read_decoder() {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = convert(CountReads {
+            inner: SamplesBuffer::new(ch(2), nz(44100), vec![0.25; 12000]), reads: reads.clone(),
+        }, ch(2), nz(48000), flag());
+        let speed = Arc::new(crate::audio::tempo::Speed::default());
+        speed.set(1.5);
+        let position = Arc::new(std::sync::atomic::AtomicU64::new(113_195));
+        let clock = position.clone();
+        let source = defer(ch(2), nz(48000), None, move || {
+            crate::audio::tempo::Tempo::new(source, speed, Duration::from_millis(113_195), clock)
+        });
+        assert_eq!(source.channels(), ch(2));
+        assert_eq!(source.sample_rate(), nz(48000));
+        assert_eq!(source.current_span_len(), None);
+        assert_eq!(source.total_duration(), None);
+        let (mixer, mut output) = rodio::mixer::mixer(ch(2), nz(48000));
+        let player = connect_player(&mixer, ch(2), nz(48000));
+        player.append(source);
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+        assert_eq!(position.load(Ordering::Relaxed), 113_195);
+        for _ in 0..6000 { output.next(); }
+        assert!(reads.load(Ordering::Relaxed) > 0);
+        assert!(position.load(Ordering::Relaxed) > 113_195);
     }
     #[test]
     fn replacement_without_output_preserves_gain_and_pause_without_waiting() {

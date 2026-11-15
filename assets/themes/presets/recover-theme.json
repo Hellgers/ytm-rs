@@ -1,0 +1,81 @@
+{
+  "id": "recover-theme",
+  "name": "reCover",
+  "creators": [
+    "mukeenanyafiq"
+  ],
+  "blurb": "The album cover fills the screen's height on the left and fades toward the lyrics, with a small card for the song in the corner and sung lines blurred away.",
+  "source": "Better Lyrics: mukeenanyafiq/recover-theme 1.3.8",
+  "background": {
+    "fullscreen_fullbleed": 1,
+    "fade": [
+      0,
+      1
+    ]
+  },
+  "lyrics": {
+    "font_rem": [
+      [
+        0,
+        3.3
+      ]
+    ],
+    "line_height": 1.25,
+    "line_padding_rem": 1.8,
+    "past": [
+      [
+        0.1,
+        5
+      ]
+    ],
+    "hover_scale": 1,
+    "wobble_secs": 2.5,
+    "past_opacity_transition": {
+      "frac": 0,
+      "secs": 0.75,
+      "delay": 0.75
+    },
+    "past_blur_transition": {
+      "frac": 0,
+      "secs": 1.5,
+      "delay": 0.5
+    },
+    "word_shadow": [
+      3,
+      0.15
+    ],
+    "word_shadow_blur": 1.5,
+    "word_shadow_unsung": true,
+    "instrumental_rem": 4
+  },
+  "cover": {
+    "radius": 10,
+    "max_frac": 0.8,
+    "fullscreen": {
+      "radius": 0,
+      "layout": "lyrics_only"
+    }
+  },
+  "now_playing": {
+    "info_card": true,
+    "info_card_fullscreen_only": true,
+    "info_card_text_only": true,
+    "info_card_look": [
+      0.5,
+      5
+    ],
+    "title_weight": "medium",
+    "artist_weight": "medium",
+    "title_shadow": [0, 0.5],
+    "fullscreen_panel_frac": 0.55,
+    "info_card_top": true,
+    "info_card_margin": 20,
+    "info_card_weights": ["medium", "medium"]
+  },
+  "app": {
+    "page_bg": "solid",
+    "glass": {
+      "title_card": [10, 1, 1]
+    }
+  }
+}

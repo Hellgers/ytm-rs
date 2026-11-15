@@ -14,6 +14,8 @@ pub struct Art {
     pub rgba: Vec<u8>,
     /// Most vivid colour, lifted for use on dark backgrounds (progress bar, highlights).
     pub accent: Color32,
+    /// How bright the cover is overall, 0..1.
+    pub brightness: f32,
 }
 
 pub fn process(bytes: &[u8]) -> anyhow::Result<Art> {
@@ -21,6 +23,7 @@ pub fn process(bytes: &[u8]) -> anyhow::Result<Art> {
     let small = image::imageops::resize(&img, SIZE, SIZE, image::imageops::FilterType::Triangle);
 
     let accent = palette(&small);
+    let brightness = small.pixels().map(|p| (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 255.0).sum::<f32>() / (SIZE * SIZE) as f32;
     let mut px: Vec<[f32; 3]> = small.pixels().map(|p| [p[0] as f32, p[1] as f32, p[2] as f32]).collect();
 
     // Kawarp's tint pass: pull near-black regions toward the accent so dark covers
@@ -38,7 +41,40 @@ pub fn process(bytes: &[u8]) -> anyhow::Result<Art> {
         px = box_blur(&px, SIZE as usize, 6);
     }
     let rgba = px.iter().flat_map(|p| [p[0] as u8, p[1] as u8, p[2] as u8, 255]).collect();
-    Ok(Art { rgba, accent })
+    Ok(Art { rgba, accent, brightness })
+}
+
+/// `passes` more of the art's blur (a theme's `blurPasses` over the usual).
+pub fn soften(art: &mut Art, passes: u32) {
+    if passes == 0 {
+        return;
+    }
+    let n = SIZE as usize;
+    let mut px: Vec<[f32; 3]> = art.rgba.as_chunks::<4>().0.iter().map(|p| [p[0] as f32, p[1] as f32, p[2] as f32]).collect();
+    for _ in 0..passes.min(6) {
+        px = box_blur(&px, n, 3);
+    }
+    art.rgba = px.iter().flat_map(|p| [p[0] as u8, p[1] as u8, p[2] as u8, 255]).collect();
+}
+
+/// A video frame as background art: sampled small and blurred, cheap enough a few times a second.
+pub fn from_frame(frame: &egui::ColorImage) -> Option<Art> {
+    let ([w, h], n) = (frame.size, SIZE as usize);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut px = Vec::with_capacity(n * n);
+    for y in 0..n {
+        for x in 0..n {
+            let c = frame.pixels[(y * h / n) * w + x * w / n];
+            px.push([c.r() as f32, c.g() as f32, c.b() as f32]);
+        }
+    }
+    for _ in 0..2 {
+        px = box_blur(&px, n, 4);
+    }
+    let rgba = px.iter().flat_map(|p| [p[0] as u8, p[1] as u8, p[2] as u8, 255]).collect();
+    Some(Art { rgba, accent: Color32::WHITE, brightness: 0.5 })
 }
 
 fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
@@ -116,5 +152,5 @@ pub fn idle() -> Art {
             rgba.extend_from_slice(&[r as u8, g as u8, b as u8, 255]);
         }
     }
-    Art { rgba, accent: Color32::from_rgb(0xff, 0x4e, 0x6a) }
+    Art { rgba, accent: Color32::from_rgb(0xff, 0x4e, 0x6a), brightness: 0.3 }
 }

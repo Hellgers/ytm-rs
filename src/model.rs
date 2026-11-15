@@ -33,7 +33,7 @@ pub struct Link {
     pub id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Track {
     pub id: String,
     pub title: String,
@@ -49,11 +49,24 @@ pub struct Track {
     /// when one is found and that's switched on.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub music_video: bool,
+    /// A video to show, not a song: an official music video or any other upload (a
+    /// channel's own video of a song, a live performance).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub video: bool,
+    /// Marked explicit (the "E" badge), which can be hidden.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub explicit: bool,
 }
 
 impl Track {
     pub fn artist_line(&self) -> String {
         self.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+    }
+
+    /// Whether there's a video to show. Saved before `video` was, an official music video
+    /// only says `music_video`.
+    pub fn has_video(&self) -> bool {
+        self.video || self.music_video
     }
 
     pub fn first_artist_id(&self) -> Option<&str> {
@@ -68,6 +81,13 @@ pub fn pick_thumb(thumbs: &[Thumb], min_px: u32) -> Option<&Thumb> {
 
 pub fn pick(thumbs: &[Thumb], min_px: u32) -> Option<&str> {
     pick_thumb(thumbs, min_px).map(|t| t.url.as_str())
+}
+
+/// A YouTube video thumbnail's largest size (1280×720), for one listed smaller. Not every
+/// video has one that big: it fails to load, and the one listed stays.
+pub fn ytimg_max(url: &str) -> Option<String> {
+    let id = url.split_once("i.ytimg.com/vi/")?.1.split('/').next().filter(|id| !id.is_empty())?;
+    Some(format!("https://i.ytimg.com/vi/{id}/maxresdefault.jpg"))
 }
 
 /// Ask Google's image CDN for a specific size (`=w226-h226…` / `=s120` suffixes), so
@@ -97,7 +117,14 @@ fn square_crop(opts: &str) -> bool {
 
 #[cfg(test)]
 mod sized_tests {
-    use super::sized;
+    use super::{sized, ytimg_max};
+
+    #[test]
+    fn a_video_thumbnail_has_a_biggest_size() {
+        let listed = "https://i.ytimg.com/vi/3JBKp0YbSEc/hq720.jpg?sqp=-oaymwEKCNUGEN8DIABIWg&rs=AMzJL3mWm";
+        assert_eq!(ytimg_max(listed).as_deref(), Some("https://i.ytimg.com/vi/3JBKp0YbSEc/maxresdefault.jpg"));
+        assert_eq!(ytimg_max("https://lh3.googleusercontent.com/abc=w544-h544"), None);
+    }
 
     #[test]
     fn square_crops_stay_cropped() {
@@ -131,7 +158,7 @@ pub struct Card {
     pub links: Vec<Link>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ShelfKind {
     /// Square/round cards in one horizontal row.
     Cards(Vec<Card>),
@@ -139,7 +166,7 @@ pub enum ShelfKind {
     Songs { tracks: Vec<Track>, rows: usize },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Shelf {
     pub title: String,
     /// Small line above the title ("GRAPE JUICE" on Listen again).
@@ -148,7 +175,7 @@ pub struct Shelf {
     pub kind: ShelfKind,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Chip {
     pub title: String,
     /// Browse params selecting this mood; `None` clears the filter.

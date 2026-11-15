@@ -28,7 +28,8 @@ impl App {
             }
         } else if self.theme_id != all[n].id {
             self.theme_id = all[n].id.clone();
-            self.default_theme = false;
+            self.art_key = None;
+            self.request_art();
         }
         let shot_id = egui::Id::unique("tour-shot");
         let requested: usize = ctx.data(|d| d.get_temp(shot_id)).unwrap_or(usize::MAX);
@@ -110,6 +111,105 @@ pub(super) fn dev_screenshot(ctx: &egui::Context, now: f64) {
     }
 }
 
+/// Dev hook: `YTM_SCRIPT="<secs>:<step>;…"` drives a test window that has no mouse or
+/// keyboard, with seconds from the first frame. Steps: `m:x,y` moves the pointer, `c:x,y`
+/// clicks, `r:w,h` resizes, `t:text` types, `k:esc` presses Esc (`k:f` F, and so on), `w:n` scrolls n lines (down), `f:n` flicks a touchpad n pixels (down) over 0.1 s, as Wayland sends it, `s:name` saves `<YTM_SCRIPT_DIR>/name.png`, `q` quits.
+pub(super) fn dev_script(ctx: &egui::Context, raw: &mut egui::RawInput) {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    enum Step {
+        Move(egui::Pos2),
+        Press(egui::Pos2, bool),
+        Resize(egui::Pos2),
+        Text(&'static str),
+        Key(egui::Key),
+        Wheel(f32),
+        Swipe(egui::TouchPhase, f32),
+        Shot(&'static str),
+        Quit,
+    }
+    let Some(script) = dev_var("YTM_SCRIPT") else { return };
+    static START: OnceLock<Instant> = OnceLock::new();
+    static STEPS: OnceLock<Vec<(f64, Step)>> = OnceLock::new();
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let steps = STEPS.get_or_init(|| {
+        let point = |v: &str| v.split_once(',').and_then(|(x, y)| Some(egui::pos2(x.parse().ok()?, y.parse().ok()?)));
+        let mut steps = Vec::new();
+        for step in script.split(';') {
+            let mut parts = step.splitn(3, ':');
+            let (Some(at), Some(kind)) = (parts.next().and_then(|t| t.trim().parse::<f64>().ok()), parts.next()) else { continue };
+            let value = parts.next().unwrap_or("");
+            match (kind, point(value)) {
+                ("m", Some(p)) => steps.push((at, Step::Move(p))),
+                ("c", Some(p)) => steps.extend([(at, Step::Move(p)), (at + 0.2, Step::Press(p, true)), (at + 0.3, Step::Press(p, false))]),
+                ("r", Some(p)) => steps.push((at, Step::Resize(p))),
+                ("t", _) => steps.push((at, Step::Text(value))),
+                ("k", _) if egui::Key::from_name(&value.to_uppercase()).is_some() || value == "esc" => {
+                    let key = if value == "esc" { egui::Key::Escape } else { egui::Key::from_name(&value.to_uppercase()).unwrap_or(egui::Key::Escape) };
+                    steps.push((at, Step::Key(key)));
+                }
+                ("w", _) if value.parse::<f32>().is_ok() => steps.push((at, Step::Wheel(value.parse().unwrap_or(0.0)))),
+                ("f", _) if value.parse::<f32>().is_ok() => {
+                    // 6 moves 20 ms apart, then the fingers lift (Wayland's axis stop).
+                    let n: f32 = value.parse().unwrap_or(0.0);
+                    steps.push((at, Step::Swipe(egui::TouchPhase::Start, n / 6.0)));
+                    steps.extend((1..6).map(|i| (at + 0.02 * f64::from(i), Step::Swipe(egui::TouchPhase::Move, n / 6.0))));
+                    steps.push((at + 0.11, Step::Swipe(egui::TouchPhase::End, 0.0)));
+                }
+                ("s", _) => steps.push((at, Step::Shot(value))),
+                ("q", _) => steps.push((at, Step::Quit)),
+                _ => log::warn!("YTM_SCRIPT: can't read {step}"),
+            }
+        }
+        steps.sort_by(|a, b| a.0.total_cmp(&b.0));
+        steps
+    });
+    let now = START.get_or_init(Instant::now).elapsed().as_secs_f64();
+    let mut next = NEXT.load(Ordering::Relaxed);
+    while let Some((_, step)) = steps.get(next).filter(|(at, _)| *at <= now) {
+        next += 1;
+        match step {
+            Step::Move(p) => raw.events.push(egui::Event::PointerMoved(*p)),
+            Step::Press(p, pressed) => raw.events.push(egui::Event::PointerButton { pos: *p, button: egui::PointerButton::Primary, pressed: *pressed, modifiers: egui::Modifiers::NONE }),
+            Step::Resize(p) => ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(p.to_vec2())),
+            Step::Text(text) => raw.events.push(egui::Event::Text((*text).to_owned())),
+            // Positive scrolls down, in lines.
+            Step::Wheel(n) => raw.events.push(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta: egui::vec2(0.0, -*n), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE, source: egui::MouseWheelSource::Wheel }),
+            Step::Swipe(phase, n) => raw.events.push(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -*n), phase: *phase, modifiers: egui::Modifiers::NONE, source: egui::MouseWheelSource::Unknown }),
+            Step::Key(key) => {
+                for pressed in [true, false] {
+                    raw.events.push(egui::Event::Key { key: *key, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE });
+                }
+            }
+            Step::Shot(name) => {
+                let path = std::path::Path::new(dev_var("YTM_SCRIPT_DIR").unwrap_or(".")).join(format!("{name}.png"));
+                ctx.request_screenshot(move |img| {
+                    let [w, h] = img.size;
+                    let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+                    if let Some(Err(e)) = image::RgbaImage::from_raw(w as u32, h as u32, bytes).map(|i| i.save(&path)) {
+                        log::warn!("screenshot failed: {e}");
+                    }
+                });
+            }
+            Step::Quit => std::process::exit(0),
+        }
+    }
+    NEXT.store(next, Ordering::Relaxed);
+    // A repaint asked for here wouldn't last the frame: an idle window has to be kept going.
+    static TICKING: AtomicBool = AtomicBool::new(false);
+    if !TICKING.swap(true, Ordering::Relaxed) {
+        let ctx = ctx.clone();
+        // Until the script ends: a test of what happens after it shouldn't see these frames.
+        std::thread::spawn(move || {
+            while NEXT.load(Ordering::Relaxed) < STEPS.get().map_or(usize::MAX, Vec::len) {
+                ctx.request_repaint();
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            ctx.request_repaint();
+        });
+    }
+}
+
 /// A `YTM_*` dev hook, read once: several are checked every frame.
 pub(super) fn dev_var(name: &str) -> Option<&'static str> {
     static VARS: std::sync::OnceLock<std::collections::HashMap<String, String>> = std::sync::OnceLock::new();
@@ -120,31 +220,67 @@ pub(super) fn dev_var(name: &str) -> Option<&'static str> {
     .map(String::as_str)
 }
 
-/// Dev hook: YTM_FPS=<hz> holds each frame to 1/<hz> s, as vsync does on a visible window
-/// of that refresh rate (test windows sit off-screen, where Windows gives them ~21 fps);
-/// YTM_FPS_LOG logs the rate reached every 5 s.
-pub(super) fn dev_pace() {
+/// Dev hook: `YTM_PROBE=1` logs, each time the pointer stops somewhere new (`YTM_SCRIPT`'s
+/// `m:x,y`), whether a press there would go to the title bar (move the window, maximize on
+/// a double-click), and how many widgets are under it.
+pub(super) fn dev_probe(ctx: &egui::Context) {
     use std::sync::Mutex;
-    use std::time::Instant;
-    static HZ: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
-    static STATE: Mutex<Option<(Instant, Instant, u32)>> = Mutex::new(None);
-    let Some(hz) = *HZ.get_or_init(|| std::env::var("YTM_FPS").ok().and_then(|v| v.parse().ok())) else { return };
-    let period = std::time::Duration::from_secs_f64(1.0 / hz);
-    let mut st = STATE.lock().unwrap();
-    let now = Instant::now();
-    let (last, window, frames) = st.get_or_insert((now, now, 0));
-    let next = *last + period;
-    if next > now {
-        std::thread::sleep(next - now);
+    if dev_var("YTM_PROBE").is_none() {
+        return;
     }
-    *last = Instant::now();
-    *frames += 1;
-    let span = last.duration_since(*window).as_secs_f64();
-    if span >= 5.0 {
-        if std::env::var_os("YTM_FPS_LOG").is_some() {
-            log::info!("fps {:.1}", *frames as f64 / span);
+    static LAST: Mutex<Option<egui::Pos2>> = Mutex::new(None);
+    let Some(p) = ctx.input(|i| i.pointer.hover_pos()) else { return };
+    {
+        let mut last = LAST.lock().unwrap();
+        if *last == Some(p) {
+            return;
         }
-        *window = *last;
-        *frames = 0;
+        *last = Some(p);
     }
+    let (hovered, under) = ctx.viewport(|v| (v.interact_widgets.hovered.clone(), v.interact_widgets.contains_pointer.len()));
+    let names = ["main", "main-over", "band-back", "capsule-back", "now-playing", "queue-float"];
+    let title = names.iter().any(|n| hovered.contains(&egui::Id::unique(("titlebar-drag", *n)))) || hovered.contains(&egui::Id::unique("np-full-top"));
+    log::info!("probe {:.0},{:.0}: title bar {}, {} hovered, {under} under", p.x, p.y, if title { "yes" } else { "NO" }, hovered.len());
+}
+
+/// Dev hook: `YTM_MEM=<secs>` logs, that often, what the app's own caches hold: GPU
+/// textures (thumbnails and the rest), the font atlas, and the image loaders' bytes. The
+/// process's own figures come from outside (Task Manager, `Get-Process`).
+pub(super) fn dev_memory(ctx: &egui::Context, now: f64) {
+    use std::sync::Mutex;
+    let Some(every) = dev_var("YTM_MEM").and_then(|v| v.parse::<f64>().ok()) else { return };
+    static LAST: Mutex<f64> = Mutex::new(f64::NEG_INFINITY);
+    {
+        let mut last = LAST.lock().unwrap();
+        if now - *last < every {
+            ctx.request_repaint_after(Duration::from_secs_f64(every - (now - *last)));
+            return;
+        }
+        *last = now;
+    }
+    let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
+    let (count, textures, biggest) = {
+        let tm = ctx.tex_manager();
+        let tm = tm.read();
+        let mut all: Vec<(usize, String)> = tm.allocated().map(|(_, m)| (m.bytes_used(), m.name.clone())).collect();
+        all.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
+        let total = all.iter().map(|a| a.0).sum::<usize>();
+        let top: Vec<String> = all.iter().take(3).map(|(b, n)| format!("{} {:.1}", n.chars().take(48).collect::<String>(), mb(*b))).collect();
+        (all.len(), total, top.join(", "))
+    };
+    let atlas = ctx.fonts(|f| f.font_image_size());
+    let loaders = ctx.loaders();
+    let bytes: usize = loaders.bytes.lock().iter().map(|l| l.byte_size()).sum();
+    let images: usize = loaders.image.lock().iter().map(|l| l.byte_size()).sum();
+    let tex_loaders: usize = loaders.texture.lock().iter().map(|l| l.byte_size()).sum();
+    log::info!(
+        "mem: {count} textures {:.1} MB (loader {:.1}); font atlas {}x{}; bytes {:.1} MB, decoded {:.1} MB; {} audio buffers [{biggest}]",
+        mb(textures),
+        mb(tex_loaders),
+        atlas[0],
+        atlas[1],
+        mb(bytes),
+        mb(images),
+        crate::stream::LIVE.load(std::sync::atomic::Ordering::Relaxed)
+    );
 }

@@ -28,6 +28,7 @@ const PREROLL: Duration = Duration::from_millis(80);
 struct Media {
     reader: StreamReader,
     len: u64,
+    seekable: bool,
 }
 
 impl Read for Media {
@@ -44,7 +45,7 @@ impl Seek for Media {
 
 impl MediaSource for Media {
     fn is_seekable(&self) -> bool {
-        true
+        self.seekable
     }
     fn byte_len(&self) -> Option<u64> {
         Some(self.len)
@@ -66,10 +67,10 @@ pub struct OpusSource {
 }
 
 impl OpusSource {
-    /// Reads the WebM header and its seek index (YouTube puts both at the start), so
-    /// it opens after the first block whether or not it'll be seeked.
-    pub fn new(reader: StreamReader, len: u64, duration_ms: u64) -> anyhow::Result<Self> {
-        let mss = MediaSourceStream::new(Box::new(Media { reader, len }), Default::default());
+    /// A streaming start reads the header without chasing seek-head targets that
+    /// may live at EOF. Indexed construction is reserved for an actual seek.
+    pub fn new(reader: StreamReader, len: u64, duration_ms: u64, seekable: bool) -> anyhow::Result<Self> {
+        let mss = MediaSourceStream::new(Box::new(Media { reader, len, seekable }), Default::default());
         let format = MkvReader::try_new(mss, &FormatOptions::default())?;
         let track = format.tracks().iter().find(|t| t.codec_params.codec == CODEC_TYPE_OPUS).ok_or_else(|| anyhow::anyhow!("no Opus track"))?;
         // OpusHead (RFC 7845 §5.1): channel count at byte 9, pre-skip at 10-11.
@@ -215,7 +216,7 @@ mod tests {
         let http = reqwest::Client::new();
         let s = crate::innertube::audio_stream(&http, "zuO2fClon98", &vd, true).await.unwrap();
         let shared = crate::stream::Shared::new(s.size, s.duration_ms, s.loudness_db, s.opus, false);
-        crate::stream::download(http.clone(), s.url, crate::innertube::UA.to_owned(), shared.clone(), None).await;
+        crate::stream::download(http.clone(), crate::stream::Media::File(s.url), crate::innertube::UA.to_owned(), shared.clone(), None).await;
         let opus = crate::stream::decoder(shared, true).unwrap();
         assert_eq!(opus.sample_rate().get(), 48_000);
         let (tx, rx) = rodio::queue::queue(false);
@@ -242,7 +243,7 @@ mod tests {
                 let s = crate::innertube::audio_stream(&http, id, &vd, opus).await.unwrap();
                 assert_eq!(s.opus, opus);
                 let shared = crate::stream::Shared::new(s.size, s.duration_ms, s.loudness_db, s.opus, false);
-                crate::stream::download(http.clone(), s.url, crate::innertube::UA.to_owned(), shared.clone(), None).await;
+                crate::stream::download(http.clone(), crate::stream::Media::File(s.url), crate::innertube::UA.to_owned(), shared.clone(), None).await;
                 assert!(shared.error().is_none(), "{:?}", shared.error());
                 let mut d = crate::stream::decoder(shared.clone(), true).unwrap();
                 let (ch, rate) = (d.channels().get() as usize, d.sample_rate().get() as usize);

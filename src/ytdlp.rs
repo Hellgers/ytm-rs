@@ -59,6 +59,18 @@ async fn ensure(http: &reqwest::Client, data_dir: &Path) -> anyhow::Result<PathB
     Ok(bin)
 }
 
+/// Cookie files a crash left behind, with the session in them: nothing's using them at launch.
+pub fn remove_leftover_cookies(data_dir: &Path) {
+    let Ok(files) = std::fs::read_dir(data_dir) else { return };
+    for f in files.flatten() {
+        let name = f.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("cookies-") && name.ends_with(".txt") {
+            let _ = std::fs::remove_file(f.path());
+        }
+    }
+}
+
 pub async fn resolve(http: &reqwest::Client, data_dir: &Path, cookie: &str, video_id: &str) -> anyhow::Result<Stream> {
     let bin = ensure(http, data_dir).await?;
     let data_dir = data_dir.to_owned();
@@ -66,7 +78,8 @@ pub async fn resolve(http: &reqwest::Client, data_dir: &Path, cookie: &str, vide
     let mut s = tokio::task::spawn_blocking(move || run(&bin, &data_dir, &video_id, &cookie)).await??;
     // The range downloader needs the exact size; yt-dlp sometimes only estimates it.
     if s.size == 0 {
-        let head = http.head(&s.url).header("User-Agent", &s.user_agent).send().await?.error_for_status()?;
+        // Errors leave the URL out: it carries the client's IP address and signatures (logs).
+        let head = http.head(&s.url).header("User-Agent", &s.user_agent).send().await.and_then(reqwest::Response::error_for_status).map_err(reqwest::Error::without_url)?;
         // Not `content_length()`: for a HEAD response that reports the empty body.
         let len = head.headers().get(reqwest::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
         s.size = len.filter(|&n| n > 0).ok_or_else(|| anyhow::anyhow!("unknown stream size"))?;
@@ -98,6 +111,7 @@ fn run(bin: &Path, data_dir: &Path, video_id: &str, cookie: &str) -> anyhow::Res
         .arg(&jar)
         .args(crate::proxy::ytdlp_args())
         .arg(format!("https://music.youtube.com/watch?v={video_id}"));
+    crate::proxy::ytdlp_env(&mut cmd);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

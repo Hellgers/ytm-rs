@@ -19,6 +19,10 @@ const RETRY_AFTER: Duration = Duration::from_secs(30);
 const DISK_MAX_FILE: usize = 256 * 1024;
 /// The disk cache is trimmed to this, oldest first, at launch.
 const DISK_BUDGET: u64 = 64 * 1024 * 1024;
+/// A page full of covers doesn't ask for them all at once.
+const MAX_DOWNLOADS: usize = 8;
+/// Downloaded pictures not made into textures yet, kept in memory.
+const BYTES_BUDGET: usize = 32 * 1024 * 1024;
 
 enum Entry {
     Pending,
@@ -34,6 +38,8 @@ pub struct HttpImages {
     backend: Backend,
     cache: Arc<Mutex<HashMap<String, Entry>>>,
     dir: std::path::PathBuf,
+    /// Downloads wait for one of these.
+    turns: Arc<tokio::sync::Semaphore>,
 }
 
 impl HttpImages {
@@ -41,8 +47,29 @@ impl HttpImages {
         let dir = backend.data_dir().join("thumbs");
         let _ = std::fs::create_dir_all(&dir);
         trim(&dir);
-        Self { backend, cache: Default::default(), dir }
+        Self { backend, cache: Default::default(), dir, turns: Arc::new(tokio::sync::Semaphore::new(MAX_DOWNLOADS)) }
     }
+}
+
+/// A download's outcome, unless `uri` was forgotten while in flight. Pictures that never
+/// become a texture (one that can't be decoded) would otherwise stay: past the budget,
+/// others go. One still wanted just comes again, mostly from the disk.
+fn store(cache: &Mutex<HashMap<String, Entry>>, uri: &str, entry: Entry) {
+    let mut cache = cache.lock().unwrap();
+    let Some(slot) = cache.get_mut(uri) else { return };
+    *slot = entry;
+    let mut total: usize = cache.values().map(|e| if let Entry::Ready(b, _) = e { b.len() } else { 0 }).sum();
+    if total <= BYTES_BUDGET {
+        return;
+    }
+    cache.retain(|k, e| {
+        let Entry::Ready(b, _) = e else { return true };
+        if total <= BYTES_BUDGET || k == uri {
+            return true;
+        }
+        total -= b.len();
+        false
+    });
 }
 
 /// Where `uri` is kept on disk. Thumbnail URLs change when the picture does.
@@ -102,18 +129,18 @@ impl BytesLoader for HttpImages {
 
         let (http, cache, uri, backend) =
             (self.backend.http(), self.cache.clone(), uri.to_owned(), self.backend.clone());
+        let turns = self.turns.clone();
         let file = disk_path(&self.dir, &uri);
         self.backend.spawn(async move {
             if let Ok(bytes) = std::fs::read(&file) {
                 // Touch it, so trimming drops pictures that aren't used any more.
                 let _ = std::fs::File::options().write(true).open(&file).and_then(|f| f.set_modified(std::time::SystemTime::now()));
-                if let Some(slot) = cache.lock().unwrap().get_mut(&uri) {
-                    *slot = Entry::Ready(Arc::from(bytes), None);
-                }
+                store(&cache, &uri, Entry::Ready(Arc::from(bytes), None));
                 backend.wake();
                 return;
             }
             let res = async {
+                let _turn = turns.acquire().await;
                 let resp = http.get(&uri).send().await?.error_for_status()?;
                 let mime = resp
                     .headers()
@@ -132,10 +159,7 @@ impl BytesLoader for HttpImages {
                 }
                 Err(e) => Entry::Failed(e.to_string(), Instant::now()),
             };
-            // Only store if not forgotten while in flight.
-            if let Some(slot) = cache.lock().unwrap().get_mut(&uri) {
-                *slot = entry;
-            }
+            store(&cache, &uri, entry);
             backend.wake();
         });
         Ok(BytesPoll::Pending { size: None })
@@ -167,13 +191,20 @@ impl BytesLoader for HttpImages {
 }
 
 /// GPU memory the thumbnails may keep before the least recently drawn are dropped.
-const TEXTURE_BUDGET: usize = 96 * 1024 * 1024;
+const TEXTURE_BUDGET: usize = 64 * 1024 * 1024;
+/// A big picture (now playing's cover, a banner: 3.5 MB at 960 px) not drawn for this
+/// long is dropped even under the budget: one per song played would otherwise pile up
+/// until it. It comes back from the disk cache when it's next shown.
+const BIG: usize = 1024 * 1024;
+const BIG_UNUSED: Duration = Duration::from_secs(30);
 
 struct Texture {
     handle: TextureHandle,
     options: TextureOptions,
     size: Vec2,
     last_used: u64,
+    /// When it was last drawn.
+    drawn: Instant,
 }
 
 #[derive(Default)]
@@ -208,6 +239,7 @@ impl TextureLoader for Textures {
             let pass = state.pass;
             if let Some(t) = state.cache.get_mut(uri).filter(|t| t.options == options) {
                 t.last_used = pass;
+                t.drawn = Instant::now();
                 return Ok(TexturePoll::Ready { texture: SizedTexture::new(t.handle.id(), t.size) });
             }
         }
@@ -226,7 +258,7 @@ impl TextureLoader for Textures {
                 }
                 let mut state = self.state.lock().unwrap();
                 let last_used = state.pass;
-                state.cache.insert(uri.to_owned(), Texture { handle, options, size, last_used });
+                state.cache.insert(uri.to_owned(), Texture { handle, options, size, last_used, drawn: Instant::now() });
                 Ok(TexturePoll::Ready { texture })
             }
         }
@@ -243,6 +275,7 @@ impl TextureLoader for Textures {
     fn end_pass(&self, pass_index: u64) {
         let mut state = self.state.lock().unwrap();
         state.pass = pass_index;
+        state.cache.retain(|_, t| t.handle.byte_size() < BIG || t.drawn.elapsed() < BIG_UNUSED);
         let mut total = state.cache.values().map(|t| t.handle.byte_size()).sum::<usize>();
         if total <= TEXTURE_BUDGET {
             return;

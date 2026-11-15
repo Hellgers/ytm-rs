@@ -1,7 +1,9 @@
-//! The app's own title bar on Windows: no system frame, the window buttons drawn at the
-//! top right, the empty top of the window to move it by (double-click maximizes), and
-//! its edges to resize it by. winit keeps the window styles snapping needs, so dragging
-//! to a screen edge and Win+arrows still work. Elsewhere the system's frame stays.
+//! The app's own title bar: no system frame, the window buttons drawn at the top right,
+//! the empty top of the window to move it by (double-click maximizes), and its edges to
+//! resize it by. On Windows always (winit keeps the window styles snapping needs, so
+//! dragging to a screen edge and Win+arrows still work). On Linux where the desktop
+//! draws no frame for a Wayland window (GNOME), or when Settings › Window asks for it.
+//! On macOS the system's frame stays.
 
 use egui::{Color32, CursorIcon, Id, Pos2, Rect, ResizeDirection, Sense, Stroke, Ui, ViewportCommand, pos2, vec2};
 
@@ -16,10 +18,84 @@ const BUTTON_W: f32 = 46.0;
 const EDGE: f32 = 5.0;
 const CORNER: f32 = 14.0;
 
-/// Whether the app draws the title bar itself: on Windows, unless `YTM_NATIVE_TITLEBAR`
-/// asks for the system's.
+/// Linux: who draws the title bar (Settings › Window), saved in `titlebar` in the data
+/// folder since the window is made with or without a frame before settings load.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum Choice {
+    /// The app's where the desktop draws none, the system's elsewhere.
+    #[default]
+    Auto,
+    Own,
+    System,
+}
+
+impl Choice {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Own, Self::System];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Automatic",
+            Self::Own => "ytm-rs's",
+            Self::System => "System's",
+        }
+    }
+
+    pub fn load(data_dir: &std::path::Path) -> Self {
+        match std::fs::read_to_string(data_dir.join("titlebar")).unwrap_or_default().trim() {
+            "own" => Self::Own,
+            "system" => Self::System,
+            _ => Self::Auto,
+        }
+    }
+
+    pub fn save(self, data_dir: &std::path::Path) -> std::io::Result<()> {
+        let key = match self {
+            Self::Auto => "auto",
+            Self::Own => "own",
+            Self::System => "system",
+        };
+        std::fs::write(data_dir.join("titlebar"), key)
+    }
+
+    /// Whether the app draws the title bar on Linux with this choice. `wayland`: the
+    /// window is a Wayland one; `desktop`: `XDG_CURRENT_DESKTOP`.
+    pub fn own(self, wayland: bool, desktop: &str) -> bool {
+        match self {
+            Self::Own => true,
+            Self::System => false,
+            // GNOME draws no frame around Wayland windows (it has no xdg-decoration),
+            // and what winit draws in its place is a bare strip. X11 windows get one.
+            Self::Auto => wayland && desktop.split(':').any(|d| d.trim().eq_ignore_ascii_case("gnome")),
+        }
+    }
+
+    /// As [`Self::own`], for this session.
+    pub fn own_here(self) -> bool {
+        self.own(crate::wayland_window(), &std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default())
+    }
+}
+
+static CUSTOM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Settle who draws this run's title bar, before the window is made.
+pub fn init(data_dir: &std::path::Path) {
+    let _ = CUSTOM.set(decide(data_dir));
+}
+
+fn decide(data_dir: &std::path::Path) -> bool {
+    if std::env::var_os("YTM_NATIVE_TITLEBAR").is_some() {
+        return false;
+    }
+    if cfg!(target_os = "linux") {
+        return Choice::load(data_dir).own_here();
+    }
+    cfg!(windows)
+}
+
+/// Whether the app draws the title bar itself: on Windows, and on Linux as [`init`]
+/// settled it, unless `YTM_NATIVE_TITLEBAR` asks for the system's.
 pub fn custom() -> bool {
-    cfg!(windows) && std::env::var_os("YTM_NATIVE_TITLEBAR").is_none()
+    *CUSTOM.get_or_init(|| cfg!(windows) && std::env::var_os("YTM_NATIVE_TITLEBAR").is_none())
 }
 
 /// Full screen has no title bar. The app's own full screen (`crate::fullscreen`) goes
@@ -95,7 +171,10 @@ pub fn drag_strip(ui: &Ui, rect: Rect, id: &str) -> egui::Response {
     }
     if !resp.double_clicked() && down && dragging && ui.ctx().data_mut(|d| d.remove_temp::<bool>(pressed_here)).unwrap_or(false) {
         // Once: the system moves the window until the button is let go.
-        ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+        let from = ui.input(|i| i.pointer.press_origin().map(|p| p * i.pixels_per_point())).map(|p| (p.x.round() as i32, p.y.round() as i32));
+        if !from.is_some_and(crate::fullscreen::start_drag) {
+            ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+        }
     }
     resp
 }
@@ -252,11 +331,12 @@ pub fn set_hwnd(hwnd: *mut std::ffi::c_void) {
 
 #[cfg(windows)]
 mod frame {
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
+    use windows::Win32::Graphics::Gdi::{BLACK_BRUSH, ClientToScreen, FillRect, GetMonitorInfoW, GetStockObject, GetWindowDC, HBRUSH, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, ReleaseDC};
     use windows::Win32::UI::Controls::MARGINS;
     use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
-    use windows::Win32::UI::WindowsAndMessaging::{NCCALCSIZE_PARAMS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, WM_NCCALCSIZE};
+    use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect, IsZoomed, NCCALCSIZE_PARAMS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, WM_NCCALCSIZE, WM_NCPAINT};
 
     pub fn init(hwnd: *mut std::ffi::c_void) {
         let hwnd = HWND(hwnd);
@@ -273,12 +353,42 @@ mod frame {
         }
     }
 
+    /// The reserved row is outside egui's clear. Black lets DWM show the material there.
+    fn clear_edge(hwnd: HWND) {
+        if !crate::backdrop::shows() {
+            return;
+        }
+        // SAFETY: the app's own window; the rectangles are ours, and the DC is released.
+        unsafe {
+            if !IsZoomed(hwnd).as_bool() {
+                return;
+            }
+            let (mut outer, mut client, mut origin) = (RECT::default(), RECT::default(), POINT::default());
+            if GetWindowRect(hwnd, &mut outer).is_err() || GetClientRect(hwnd, &mut client).is_err() || !ClientToScreen(hwnd, &mut origin).as_bool() {
+                return;
+            }
+            let dc = GetWindowDC(Some(hwnd));
+            if dc.is_invalid() {
+                return;
+            }
+            let x = origin.x - outer.left;
+            let y = origin.y - outer.top + client.bottom;
+            let line = RECT { left: x, top: y, right: x + client.right, bottom: y + 1 };
+            FillRect(dc, &line, HBRUSH(GetStockObject(BLACK_BRUSH).0));
+            ReleaseDC(Some(hwnd), dc);
+        }
+    }
+
     unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _: usize, _: usize) -> LRESULT {
         // SAFETY: called by Windows with the window's own message; for WM_NCCALCSIZE with
         // wparam set, lparam points at an NCCALCSIZE_PARAMS.
         unsafe {
             if msg != WM_NCCALCSIZE || wparam.0 == 0 {
-                return DefSubclassProc(hwnd, msg, wparam, lparam);
+                let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+                if msg == WM_NCPAINT {
+                    clear_edge(hwnd);
+                }
+                return result;
             }
             let params = &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS);
             let proposed = params.rgrc[0];
@@ -289,7 +399,50 @@ mod frame {
             if (r.left, r.right, r.top, r.bottom) == (proposed.left, proposed.right, proposed.top + 1, proposed.bottom + 1) {
                 params.rgrc[0] = proposed;
             }
+            // Maximized, a GPU window can fill its whole monitor, and Windows then presents
+            // it straight to the screen: no blending, so a window material turns black. A
+            // pixel short of that keeps it composited (Chromium does the same).
+            if IsZoomed(hwnd).as_bool() {
+                if crate::backdrop::active() != crate::backdrop::Backdrop::None {
+                    params.rgrc[0].bottom -= 1;
+                } else if fills_monitor(&params.rgrc[0]) {
+                    // Exactly its monitor's size (maximized with the taskbar auto-hiding),
+                    // it's taken for exclusive full screen by some drivers: AMD's OpenGL
+                    // keeps some 80 MB more for it from then on. A pixel past the screen's
+                    // edge it isn't, and, unlike a pixel short, nothing shows.
+                    params.rgrc[0].bottom += 1;
+                }
+            }
             result
         }
+    }
+
+    /// Whether `r` covers all of the monitor it's on: the one it's going to, while the
+    /// window moves to another.
+    fn fills_monitor(r: &RECT) -> bool {
+        let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        // SAFETY: `r` and `info` are ours, and `info` is sized.
+        if !unsafe { GetMonitorInfoW(MonitorFromRect(r, MONITOR_DEFAULTTONEAREST), &mut info) }.as_bool() {
+            return false;
+        }
+        let m = info.rcMonitor;
+        r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Choice;
+
+    #[test]
+    fn linux_draws_its_own_title_bar_only_where_the_desktop_draws_none() {
+        assert!(Choice::Auto.own(true, "GNOME"));
+        assert!(Choice::Auto.own(true, "ubuntu:GNOME"));
+        // XWayland windows get the desktop's frame.
+        assert!(!Choice::Auto.own(false, "GNOME"));
+        assert!(!Choice::Auto.own(true, "KDE"));
+        assert!(!Choice::Auto.own(true, ""));
+        assert!(Choice::Own.own(false, "KDE"));
+        assert!(!Choice::System.own(true, "GNOME"));
     }
 }

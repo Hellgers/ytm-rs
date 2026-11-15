@@ -54,6 +54,8 @@ pub struct Api {
     refusals: std::sync::atomic::AtomicU64,
     /// When the session cookies were last rotated (unix ms).
     rotated_at: std::sync::atomic::AtomicU64,
+    /// YouTube's Restricted Mode, asked for in every request.
+    restricted: std::sync::atomic::AtomicBool,
 }
 
 /// music.youtube.com's "not available in your area" page, served to addresses in a
@@ -86,7 +88,13 @@ impl Api {
             paused_until: Default::default(),
             refusals: Default::default(),
             rotated_at: Default::default(),
+            restricted: Default::default(),
         }
+    }
+
+    /// Restricted Mode: YouTube leaves out explicit songs and what else it finds mature.
+    pub fn set_restricted(&self, on: bool) {
+        self.restricted.store(on, Relaxed);
     }
 
     pub fn account(&self) -> Option<Arc<Session>> {
@@ -409,6 +417,9 @@ impl Api {
             "request": {"useSsl": true},
             "user": {"lockedSafetyMode": false},
         });
+        if self.restricted.load(Relaxed) {
+            payload["context"]["user"]["enableSafetyMode"] = true.into();
+        }
         let mut req = crate::proxy::http()
             .post(format!("{ORIGIN}/youtubei/v1/{endpoint}?prettyPrint=false"))
             .header("User-Agent", webmusic::UA)
@@ -569,6 +580,12 @@ fn now_secs() -> u64 {
 }
 
 /// The text between `start` and the next `end`.
+/// The signed-in session itself was turned away (signed out, or refused even after the
+/// retries): a page anyone can see may still come asked signed out.
+pub fn session_refused(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ApiError>().is_some_and(|a| a.status == 401 || a.status == 403)
+}
+
 fn is_refused(e: &anyhow::Error) -> bool {
     e.downcast_ref::<ApiError>().is_some_and(is_throttled)
 }
@@ -634,6 +651,17 @@ fn utc_offset_minutes() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_refusals() {
+        let api = |status| anyhow::Error::new(ApiError { status, msg: String::new() });
+        assert!(session_refused(&api(401)));
+        assert!(session_refused(&api(403)));
+        // Not about the session: asking signed out wouldn't help.
+        assert!(!session_refused(&api(400)));
+        assert!(!session_refused(&api(500)));
+        assert!(!session_refused(&anyhow::anyhow!("YouTube Music returned an empty artist page")));
+    }
 
     #[test]
     fn stray_refusals_dont_pause_everything() {

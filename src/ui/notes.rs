@@ -157,10 +157,15 @@ fn rule_color() -> Color32 {
 }
 
 pub(super) fn surface() -> egui::Frame {
+    let look = &crate::preset::active().app;
+    // A theme's own dialog fill; see-through only when what's behind is really frosted.
+    let wanted = look.menu_look.dialog_alpha.unwrap_or(look.menu_look.alpha);
+    let alpha = if look.glass.dialog.is_some() && crate::shader::glass_ready() { wanted } else { wanted.max(0.85) };
+    let dark = crate::preset::hex(&look.menu_color).map_or(Color32::from_gray(28), |c| theme::with_alpha(c, alpha));
     egui::Frame::new()
-        .fill(if theme::light() { theme::surface_fill() } else { Color32::from_gray(28) })
-        .stroke(Stroke::new(1.0, rule_color()))
-        .corner_radius(16)
+        .fill(if theme::light() { theme::surface_fill() } else { dark })
+        .stroke(if look.dialog_bottom_line { Stroke::NONE } else { Stroke::new(1.0, rule_color()) })
+        .corner_radius(look.menu_radius.unwrap_or(16.0).clamp(0.0, 32.0) as u8)
         .shadow(egui::epaint::Shadow { offset: [0, 24], blur: 70, spread: 0, color: theme::shade(0.55) })
 }
 
@@ -183,8 +188,14 @@ pub struct NotesDialog {
 pub fn dialog(app: &mut App, ctx: &egui::Context) {
     let Some(d) = app.notes_dialog.clone() else { return };
     let body = app.updater.as_ref().and_then(|u| u.notes(&d.version));
+    // For the .deb, which can't install it itself: the new .deb to download.
+    let deb_url = app.updater.as_ref().and_then(|u| match u.state() {
+        crate::update::State::Available { version, url } if d.ready && version == d.version => Some(url),
+        _ => None,
+    });
     let (mut close, mut restart) = (false, false);
     let accent = app.accent_color();
+    widgets::modal_extras(ctx, egui::Id::unique("release-notes"));
     let modal = egui::Modal::new(egui::Id::unique("release-notes")).frame(surface()).backdrop_color(theme::shade(0.55)).show(ctx, |ui| {
         let w = 540.0_f32.min(ctx.content_rect().width() - 48.0);
         ui.set_width(w);
@@ -193,7 +204,7 @@ pub fn dialog(app: &mut App, ctx: &egui::Context) {
             ui.horizontal(|ui| {
                 widgets::icon_at(ui, ui.cursor().min + vec2(8.0, 8.0), icon::SPARKLES, 15.0, accent);
                 ui.add_space(22.0);
-                let label = if d.ready { "UPDATE READY" } else { "WHAT'S NEW" };
+                let label = if deb_url.is_some() { "UPDATE AVAILABLE" } else if d.ready { "UPDATE READY" } else { "WHAT'S NEW" };
                 let mut j = LayoutJob::default();
                 j.append(label, 0.0, TextFormat { font_id: theme::semibold(12.0), color: theme::text_dim(), extra_letter_spacing: 1.0, ..Default::default() });
                 ui.label(j);
@@ -201,7 +212,9 @@ pub fn dialog(app: &mut App, ctx: &egui::Context) {
             ui.add_space(8.0);
             ui.label(egui::RichText::new(format!("ytm-rs {}", d.version)).font(theme::bold(26.0)).color(theme::text()));
             ui.add_space(6.0);
-            let sub = if d.ready {
+            let sub = if deb_url.is_some() {
+                format!("You're on {}. {}", crate::update::current_version(), crate::update::package_step())
+            } else if d.ready {
                 format!("You're on {}. It's downloaded and installs when you close the app.", crate::update::current_version())
             } else {
                 "The version you're running.".to_owned()
@@ -216,7 +229,7 @@ pub fn dialog(app: &mut App, ctx: &egui::Context) {
                     Some(md) => show(ui, &parse(md), 14.0),
                     None => {
                         ui.horizontal(|ui| {
-                            ui.spinner();
+                            widgets::loader(ui);
                             ui.add_space(8.0);
                             ui.label(egui::RichText::new("Loading release notes…").color(theme::text_dim()));
                         });
@@ -230,7 +243,13 @@ pub fn dialog(app: &mut App, ctx: &egui::Context) {
         egui::Frame::new().inner_margin(Margin { left: 28, right: 28, top: 16, bottom: 16 }).show(ui, |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                if d.ready {
+                if let Some(url) = &deb_url {
+                    if widgets::pill(ui, "Download", None, true).clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                        close = true;
+                    }
+                    close |= widgets::pill(ui, "Later", None, false).clicked();
+                } else if d.ready {
                     restart = widgets::pill(ui, "Restart to update", None, true).clicked();
                     close = widgets::pill(ui, "Later", None, false).clicked();
                 } else {
@@ -260,6 +279,8 @@ pub fn card(app: &mut App, ctx: &egui::Context) {
     let screen = ctx.content_rect();
     let at = egui::pos2(screen.right() - 24.0, screen.bottom() - app.bar_height() - 20.0);
     let t = theme::anim_bool(ctx, "whats-new-in", true, 0.35);
+    // A see-through dialog fill needs its frost here too.
+    widgets::modal_extras(ctx, egui::Id::unique("whats-new"));
     let (mut dismiss, mut all) = (false, false);
     egui::Area::new(egui::Id::unique("whats-new"))
         .order(egui::Order::Foreground)
@@ -267,7 +288,8 @@ pub fn card(app: &mut App, ctx: &egui::Context) {
         .fixed_pos(at + vec2(0.0, 16.0 * (1.0 - t)))
         .show(ctx, |ui| {
             ui.multiply_opacity(t);
-            surface().corner_radius(14).inner_margin(Margin { left: 18, right: 12, top: 14, bottom: 16 }).show(ui, |ui| {
+            let radius = crate::preset::active().app.menu_radius.unwrap_or(14.0).clamp(0.0, 32.0) as u8;
+            surface().corner_radius(radius).inner_margin(Margin { left: 18, right: 12, top: 14, bottom: 16 }).show(ui, |ui| {
                 ui.set_width(330.0);
                 ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
                 ui.horizontal_top(|ui| {

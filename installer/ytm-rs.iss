@@ -6,7 +6,10 @@
 ;   iscc /DArm64 installer\ytm-rs.iss  ->  ytm-rs-setup-<version>-arm64.exe
 
 #define AppName "ytm-rs"
-#define AppVersion "0.2.33"
+; A nightly build passes its own: iscc /DAppVersion=0.2.34-nightly.20261110
+#ifndef AppVersion
+  #define AppVersion "0.3.4"
+#endif
 #define AppExe "ytm-rs.exe"
 #ifdef Arm64
   #define Arch "arm64"
@@ -22,7 +25,7 @@
 AppId={{6E0B7C4A-2D1F-4C8E-9B3A-7F5D1E2A9C40}
 AppName={#AppName}
 AppVersion={#AppVersion}
-AppPublisher=ytm-rs maintainers
+AppPublisher=ytm-rs contributors
 AppPublisherURL=https://github.com/Hellgers/ytm-rs
 AppSupportURL=https://github.com/Hellgers/ytm-rs/issues
 DefaultDirName={autopf}\{#AppName}
@@ -66,6 +69,9 @@ Root: HKA; Subkey: "Software\Classes\ytm-rs\shell\open\command"; ValueType: stri
 [UninstallDelete]
 ; Installers downloaded by the in-app updater.
 Type: filesandordirs; Name: "{userappdata}\ytm-rs\data\updates"
+; The app's own Start menu shortcut on an all-users install, for a custom app icon.
+Type: files; Name: "{userprograms}\{#AppName}\{#AppName}.lnk"
+Type: dirifempty; Name: "{userprograms}\{#AppName}"
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
