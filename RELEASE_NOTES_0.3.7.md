@@ -1,4 +1,4 @@
-# ytm-rs 0.3.6
+# ytm-rs 0.3.7
 
 - AppleTify is the default and only desktop theme. Existing profiles use AppleTify
   automatically and keep their light, dark or system appearance selection.

@@ -170,8 +170,8 @@ settings-higher = Higher
 
 ## Appearance
 
-settings-mode-desc-windows = Light or dark pages, in any theme. System follows Windows' app mode. Now playing stays dark, over the album art.
-settings-mode-desc = Light or dark pages, in any theme. System follows your system's setting. Now playing stays dark, over the album art.
+settings-mode-desc-windows = Light or dark pages. System follows Windows' app mode. Now playing stays dark, over the album art.
+settings-mode-desc = Light or dark pages. System follows your system's setting. Now playing stays dark, over the album art.
 settings-mode = Mode
 settings-accent-desc-file = Follows the colours in theme.conf: the accent, the text and, if you like, the background. Save the file and the app follows in a couple of seconds. wallust or pywal can write it too.
 settings-accent-desc-windows = The theme's colour, your Windows accent colour, a colour file, or one you pick.
@@ -193,8 +193,6 @@ settings-dim-bright-covers = Dim bright covers
 settings-dim-bright-covers-desc = Darkens the background when the album art is bright, so the lyrics and titles over it stay easy to read. Dark covers are left as they are.
 settings-font = Font
 settings-font-desc = For the whole app and the lyrics. Any font installed on this PC works, e.g. one made for your language.
-settings-themes = Themes
-settings-themes-note = Ported from the Better Lyrics community themes. Each one restyles the background, lyrics, cover, player bar and the rest of the app, and every setting above works in all of them.
 settings-zoom = Zoom
 settings-zoom-desc = Makes everything bigger or smaller. Ctrl + plus and Ctrl + minus do the same, and Ctrl + 0 goes back to 100%.
 settings-window-material-desc = Windows 11's material behind the pages, in place of the theme's background.
@@ -367,7 +365,6 @@ settings-whats-new-in = What's new in { $version }
 
 settings-about-tagline = A fast, native YouTube Music client.
 settings-about-lyrics-sources = Better Lyrics API: Musixmatch, LRCLIB, QQ, KuGou and Better Lyrics TTML
-settings-about-themes-credit = Adapted from the Better Lyrics theme store; each card credits its creators
 settings-background = Background
 settings-about-background-credit = A port of Kawarp, MIT © Better Lyrics
 settings-fonts-and-icons = Fonts and icons
