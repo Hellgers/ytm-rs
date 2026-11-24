@@ -420,7 +420,7 @@ mod tests {
     fn staggered_curves_reach_exact_endpoints_and_join_at_the_payload_swap() {
         let tile = |x, y| Tile { center: pos2(x,y), meshes: vec![] };
         let bounds = Rect::from_min_size(Pos2::ZERO, vec2(180.0,48.0));
-        let flight = join(vec![tile(5.0,10.0),tile(30.0,20.0)], vec![tile(20.0,30.0),tile(50.0,22.0)], bounds, 0.0, vec![], (String::new(),String::new(),true)).unwrap();
+        let flight = join(vec![tile(5.0,10.0),tile(30.0,20.0)], vec![tile(20.0,30.0),tile(50.0,22.0)], bounds, 0.0, vec![], (String::new(), String::new(), [true, false])).unwrap();
         assert_ne!(flight.carriers[0].delay, flight.carriers[1].delay);
         for c in &flight.carriers {
             let begin = Flight::pose(c,0.0);

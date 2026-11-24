@@ -1,6 +1,6 @@
 ## Windows maintenance fork
 
-Version 0.3.5 uses AppleTify as the single desktop theme. Appearance still has
+Version 0.3.6 uses AppleTify as the single desktop theme. Appearance still has
 light, dark and system modes. The bottom bar animates visible track changes
 and shows the current song immediately when the window is restored.
 
