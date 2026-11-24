@@ -481,6 +481,14 @@ struct Shared {
     frames: Mutex<VecDeque<Frame>>,
     stop: AtomicBool,
     failed: AtomicBool,
+    stopped: tokio::sync::Notify,
+}
+
+impl Shared {
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.stopped.notify_one();
+    }
 }
 
 /// A video being decoded along with the audio. Stops when dropped.
@@ -498,7 +506,9 @@ impl Player {
         std::thread::Builder::new()
             .name("video".into())
             .spawn(move || {
-                if let Err(e) = run(&stream, &http, &clock, &s) {
+                if let Err(e) = run(&stream, &http, &clock, &s)
+                    && !s.stop.load(Ordering::Relaxed)
+                {
                     log::warn!("video: {e:#}");
                     s.failed.store(true, Ordering::Relaxed);
                 }
@@ -531,7 +541,7 @@ impl Player {
 
 impl Drop for Player {
     fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::Relaxed);
+        self.shared.stop();
     }
 }
 
@@ -579,9 +589,12 @@ fn to_image(yuv: &openh264::decoder::DecodedYUV, colors: Colors) -> egui::ColorI
 
 fn run(stream: &VideoStream, http: &reqwest::Client, status: &AudioStatus, shared: &Shared) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let download = |from: u64, to: u64| Download { rt: &rt, http, url: &stream.url, from, to, resp: None, tries: 0 };
+    let download = |from: u64, to: u64| Download { rt: &rt, http, url: &stream.url, from, to, resp: None, tries: 0, shared };
     // The header and the index after it, in one request.
     let start = download(0, stream.index.1).all()?;
+    if shared.stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     let head = start.get(..=stream.init_end as usize).ok_or_else(|| anyhow::anyhow!("short header"))?;
     let index = start.get(stream.index.0 as usize..).ok_or_else(|| anyhow::anyhow!("short index"))?;
     let track = parse_track(find(head, &["moov"]).ok_or_else(|| anyhow::anyhow!("no moov"))?).ok_or_else(|| anyhow::anyhow!("not H.264 in MP4"))?;
@@ -620,6 +633,9 @@ fn run(stream: &VideoStream, http: &reqwest::Client, status: &AudioStatus, share
         let (mut bytes, mut done) = (Vec::with_capacity(f.size as usize), 0);
         loop {
             let more = dl.more(&mut bytes)?;
+            if shared.stop.load(Ordering::Relaxed) {
+                break 'play;
+            }
             let samples = parse_fragment(&bytes, &track);
             while let Some(sample) = samples.get(done).filter(|s| s.at + s.size <= bytes.len()) {
                 done += 1;
@@ -699,8 +715,8 @@ fn disposable(sample: &[u8], nal_len: usize) -> bool {
     slices > 0
 }
 
-/// A range of the video, read as it arrives. One that breaks off goes on from where it got
-/// to, three times.
+/// A range of the video, read as it arrives. Resume from the last byte until three
+/// requests for the range have failed or ended short.
 struct Download<'a> {
     rt: &'a tokio::runtime::Runtime,
     http: &'a reqwest::Client,
@@ -709,39 +725,47 @@ struct Download<'a> {
     to: u64,
     resp: Option<reqwest::Response>,
     tries: u32,
+    shared: &'a Shared,
 }
 
 impl Download<'_> {
-    /// Add what has arrived since to `buf`: false once all of it has.
+    /// Add what has arrived since to `buf`. False once complete or stopped.
     fn more(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
-        loop {
+        while !self.shared.stop.load(Ordering::Relaxed) {
             let at = self.from + buf.len() as u64;
             if at > self.to {
-                return Ok(false);
+                break;
             }
+            let shared = self.shared;
             let got = self.rt.block_on(async {
-                if self.resp.is_none() {
-                    let url = format!("{}&range={at}-{}", self.url, self.to);
-                    self.resp = Some(self.http.get(&url).header("User-Agent", crate::innertube::UA).timeout(Duration::from_secs(30)).send().await?.error_for_status()?);
+                tokio::select! {
+                    biased;
+                    _ = shared.stopped.notified() => None,
+                    got = async {
+                        if self.resp.is_none() {
+                            let url = format!("{}&range={at}-{}", self.url, self.to);
+                            self.resp = Some(self.http.get(&url).header("User-Agent", crate::innertube::UA).timeout(Duration::from_secs(30)).send().await?.error_for_status()?);
+                        }
+                        self.resp.as_mut().expect("just set").chunk().await
+                    } => Some(got),
                 }
-                anyhow::Ok(self.resp.as_mut().expect("just set").chunk().await?)
             });
-            match got {
-                Ok(Some(chunk)) => {
+            let err = match got {
+                Some(Ok(Some(chunk))) => {
                     buf.extend_from_slice(&chunk);
                     return Ok(true);
                 }
-                // Ended short: ask for the rest.
-                Ok(None) => self.resp = None,
-                Err(e) => {
-                    self.resp = None;
-                    self.tries += 1;
-                    if self.tries >= 3 {
-                        return Err(e);
-                    }
-                }
+                Some(Ok(None)) => anyhow::anyhow!("video range ended before byte {at} (expected through {})", self.to),
+                Some(Err(e)) => e.without_url().into(),
+                None => break,
+            };
+            self.resp = None;
+            self.tries += 1;
+            if self.tries >= 3 {
+                return Err(err);
             }
         }
+        Ok(false)
     }
 
     fn all(mut self) -> anyhow::Result<Vec<u8>> {
@@ -832,6 +856,7 @@ impl Loop {
     pub fn failed(&self) -> bool {
         self.shared.failed.load(Ordering::Relaxed)
     }
+
 }
 
 impl Drop for Loop {
@@ -932,6 +957,72 @@ mod tests {
 
     fn track() -> Track {
         Track { params: vec![], nal_len: 4, timescale: 1000, default_duration: 40, start: 80, colors: Colors::default() }
+    }
+
+    mod http {
+        use super::super::*;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::time::timeout;
+
+        const WAIT: Duration = Duration::from_secs(4);
+
+        async fn request(listener: &TcpListener, range: &str) -> TcpStream {
+            let (socket, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut line = String::new();
+            timeout(WAIT, reader.read_line(&mut line)).await.unwrap().unwrap();
+            assert_eq!(line, format!("GET /video?test=1&range={range} HTTP/1.1\r\n"));
+            loop {
+                line.clear();
+                assert!(timeout(WAIT, reader.read_line(&mut line)).await.unwrap().unwrap() > 0);
+                if line == "\r\n" {
+                    return reader.into_inner();
+                }
+            }
+        }
+
+        fn download(listener: &TcpListener, shared: Arc<Shared>) -> tokio::task::JoinHandle<anyhow::Result<Vec<u8>>> {
+            let url = format!("http://{}/video?test=1", listener.local_addr().unwrap());
+            tokio::task::spawn_blocking(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+                let http = reqwest::Client::builder().no_proxy().build()?;
+                Download { rt: &rt, http: &http, url: &url, from: 10, to: 13, resp: None, tries: 0, shared: &shared }.all()
+            })
+        }
+
+        #[tokio::test]
+        async fn an_empty_video_range_gives_up_after_three_requests() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let task = download(&listener, Arc::new(Shared::default()));
+            for _ in 0..3 {
+                let mut socket = request(&listener, "10-13").await;
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            }
+            let err = timeout(WAIT, task).await.unwrap().unwrap().unwrap_err();
+            assert_eq!(err.to_string(), "video range ended before byte 10 (expected through 13)");
+        }
+
+        #[tokio::test]
+        async fn a_short_video_range_continues_at_the_next_byte() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let task = download(&listener, Arc::new(Shared::default()));
+            for (range, body) in [("10-13", "ab"), ("12-13", "cd")] {
+                let mut socket = request(&listener, range).await;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{body}").as_bytes()).await.unwrap();
+            }
+            assert_eq!(timeout(WAIT, task).await.unwrap().unwrap().unwrap(), b"abcd");
+        }
+
+        #[tokio::test]
+        async fn stopping_video_interrupts_a_pending_range_request() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let shared = Arc::new(Shared::default());
+            let task = download(&listener, shared.clone());
+            let _socket = request(&listener, "10-13").await;
+            shared.stop();
+            assert!(timeout(WAIT, task).await.unwrap().unwrap().unwrap().is_empty());
+        }
     }
 
     #[test]

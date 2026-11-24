@@ -1,6 +1,6 @@
 [package]
 name = "ytm-rs"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/Hellgers/ytm-rs"
@@ -18,6 +18,7 @@ egui = { version = "0.37.0", features = ["monochrome_emoji_fonts"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "sink"] }
 egui_extras = { version = "0.37.0", default-features = false, features = ["image"] }
 env_logger = { version = "0.11.11", default-features = false, features = ["humantime"] }
+httpdate = "1.0.3"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 localzone = "0.3.1"
 log = "0.4.34"
@@ -51,8 +52,14 @@ unicode-normalization = "0.1.26"
 symphonia = { version = "0.5.5", default-features = false, features = ["mkv", "aac"] }
 rusty-opus = "1.0.2"
 unicode-bidi = "0.3"
+# Cutting the tray menu's song line between letters a reader sees as one (tray.rs).
+unicode-segmentation = "1.13.3"
 # System-wide media shortcuts (hotkeys.rs).
 global-hotkey = "0.9"
+# The interface in the listener's language, from locales/, built in (i18n.rs).
+fluent-templates = "0.15.1"
+# The system's languages, for the default one.
+sys-locale = "0.3.2"
 
 [target.'cfg(windows)'.dependencies]
 # Windows Credential Manager, for the Google and Spotify sign-ins.
@@ -70,6 +77,10 @@ dbus = "0.9"
 [target.'cfg(target_os = "macos")'.dependencies]
 # The login Keychain for the sign-ins.
 keyring = { version = "3.6.3", features = ["apple-native"] }
+# The window's traffic lights on the app's own top row (ui/titlebar.rs).
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "NSButton", "NSControl", "NSResponder", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "NSGeometry", "NSString", "NSUserDefaults"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -97,6 +108,9 @@ winresource = "0.1.31"
 # in vendor/epaint/src/text/text_layout.rs.
 # souvlaki with its Linux media controls sending changes as they happen, not one a
 # second (#144): see the ytm-rs notes in vendor/souvlaki/src/platform/mpris/dbus/controls.rs.
+# winit with X11 windows taking a scale that changes after they open (#208): see the
+# ytm-rs notes in vendor/winit/src/platform_impl/linux/x11/window.rs.
 [patch.crates-io]
 epaint = { path = "vendor/epaint" }
 souvlaki = { path = "vendor/souvlaki" }
+winit = { path = "vendor/winit" }

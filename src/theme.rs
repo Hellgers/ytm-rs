@@ -119,7 +119,36 @@ pub fn menu_fill_solid() -> Color32 {
 
 /// What popups and menus are drawn on.
 pub fn menu_frame(style: &egui::Style) -> egui::Frame {
-    egui::Frame::popup(style).fill(menu_fill())
+    let [y, blur, a] = crate::preset::active().app.menu_look.shadow.unwrap_or([8.0, 28.0, if light() { 0.16 } else { 0.5 }]);
+    egui::Frame::popup(style).fill(menu_fill()).shadow(egui::epaint::Shadow { offset: [0, y as i8], blur: blur.min(255.0) as u8, spread: 0, color: shade(a) })
+}
+
+/// The player menus sit above artwork and lyrics, so their labels need an opaque backing.
+pub(crate) fn player_menu_frame(style: &egui::Style) -> egui::Frame {
+    if !crate::preset::active().app.menu_look.player_style {
+        return menu_frame(style);
+    }
+    let (fill, edge, alpha) = if light() {
+        (menu_fill_solid(), shade(0.15), 0.24)
+    } else {
+        (Color32::from_gray(30), Color32::from_gray(58), 0.55)
+    };
+    egui::Frame::popup(style)
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, edge))
+        .shadow(egui::epaint::Shadow { offset: [0, 4], blur: 16, spread: 0, color: shade(alpha) })
+}
+
+/// A compact tooltip for an icon button, independent of the theme's menu frame.
+pub(crate) fn icon_tooltip_frame(style: &egui::Style) -> Option<egui::Frame> {
+    (!light() && crate::preset::active().app.dark_icon_tooltips).then(|| {
+        egui::Frame::popup(style)
+            .inner_margin(egui::Margin::symmetric(9, 5))
+            .corner_radius(egui::CornerRadius::same(9))
+            .fill(Color32::from_gray(38))
+            .stroke(egui::Stroke::new(1.0, Color32::from_gray(74)))
+            .shadow(egui::epaint::Shadow { offset: [0, 3], blur: 12, spread: 0, color: shade(0.48) })
+    })
 }
 
 /// Dialogs and cards that float over the page.
@@ -799,6 +828,12 @@ pub fn ease_in_out(t: f32) -> f32 {
 /// Every UI transition runs at this fraction of the time it's written with: one knob
 /// for how snappy the app feels. (Lyrics keep their own timing.)
 pub const SPEED: f32 = 0.65;
+
+/// Keep a long frame from skipping most of a panel slide. Zero still means instant.
+pub fn panel_secs(ctx: &egui::Context, secs: f32) -> f32 {
+    if secs <= 0.0 { return 0.0; }
+    secs.max(ctx.input(|i| i.stable_dt) * 8.0 / SPEED)
+}
 
 /// Animate toward `target` (eased), keyed by `id`. Requests repaints while moving.
 pub fn anim(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug, target: f32, secs: f32) -> f32 {
@@ -1547,7 +1582,7 @@ pub fn apply_chrome(ctx: &egui::Context, p: &crate::preset::Preset) {
     FADE.store(p.app.ui_fade_secs.map_or(1.0, |s| (s / 0.18).clamp(0.3, 3.0)).to_bits(), std::sync::atomic::Ordering::Relaxed);
     install_style(ctx);
     // Romanization and translation look the same in every theme: the app's own fonts.
-    let deco = &crate::preset::get(crate::preset::DEFAULT_ID).lyrics;
+    let deco = &crate::preset::active().lyrics;
     install_fonts(ctx, &p.app.font, &[&p.lyrics.font, &deco.romanization_font, &deco.translation_font]);
 }
 
@@ -1594,10 +1629,8 @@ fn visuals() -> egui::Visuals {
     v.window_corner_radius = pr;
     v.menu_corner_radius = p.app.menu_radius.map_or(pr, |r| egui::CornerRadius::same(r.clamp(0.0, 32.0) as u8));
     v.window_stroke = egui::Stroke::new(1.0, if p.app.menu_border > 0.0 { with_alpha(if light() { Color32::BLACK } else { Color32::WHITE }, p.app.menu_border) } else { glass(0.08) });
-    v.popup_shadow = egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: shade(if light() { 0.16 } else { 0.5 }) };
-    if let Some([y, blur, a]) = p.app.menu_look.shadow {
-        v.popup_shadow = egui::epaint::Shadow { offset: [0, y as i8], blur: blur.min(255.0) as u8, spread: 0, color: shade(a) };
-    }
+    // Hover labels share egui's popup frame. Keep their shadow close to the text.
+    v.popup_shadow = egui::epaint::Shadow { offset: [0, 2], blur: 8, spread: 0, color: shade(if light() { 0.16 } else { 0.32 }) };
     let r = egui::CornerRadius::same(p.chrome.radius.clamp(2.0, 28.0) as u8);
     for (w, fill) in [
         (&mut v.widgets.inactive, glass(0.08)),

@@ -6,11 +6,68 @@ use std::time::{Duration, Instant};
 use crate::backend::Req;
 use crate::model::{Target, Track};
 
-use super::lists::LIKED_MUSIC;
+use super::lists::{self, LIKED_MUSIC};
 use super::queue::QueueFill;
-use super::{Action, App, Dialog, LibTab, NpTab, Page, jam, transfer};
+use super::undo::Undo;
+use super::{Action, App, Dialog, LibTab, NpTab, Page, Unlike, jam, palette, transfer};
 
 impl App {
+    pub(super) fn heard_like_action(&self, like: bool) -> Option<Action> {
+        Some(Action::LikeHeard { like, video_id: self.playing_id()?.to_owned(), generation: self.generation })
+    }
+
+    fn request_unlike(&mut self, unlike: Unlike) {
+        if !self.logged_in {
+            self.toast("Sign in to like songs");
+            return;
+        }
+        match unlike {
+            Unlike::Track(track) => {
+                if let Some(id) = track.stands_for.clone() {
+                    let video = Track { id, video: true, stands_for: None, ..track.clone() };
+                    self.unlike_versions(track, video);
+                    return;
+                }
+                let send = Req::Like { video_id: track.id.clone(), like: false };
+                self.unlike_soon(vec![track], send);
+            }
+            Unlike::Versions(song, video) => self.unlike_versions(song, video),
+            Unlike::Selection(tracks) => self.set_many_likes(tracks, false),
+            Unlike::Rating(track) => {
+                let send = Req::RemoveRating { video_id: track.id.clone(), was_disliked: false };
+                self.unlike_soon(vec![track], send);
+            }
+        }
+    }
+
+    fn unlike_versions(&mut self, song: Track, video: Track) {
+        let send = Req::UnlikeBoth { song: song.id.clone(), video: video.id.clone() };
+        self.unlike_soon(vec![song, video], send);
+    }
+
+    fn set_many_likes(&mut self, tracks: Vec<Track>, like: bool) {
+        if !self.logged_in {
+            self.toast("Sign in to like songs");
+            return;
+        }
+        // Liking songs whose unlike waits: those stay liked, so it doesn't go.
+        if like && tracks.iter().any(|t| self.unliking_soon(&t.id)) {
+            self.undo();
+        }
+        let tracks: Vec<Track> = tracks.into_iter().filter(|t| self.liked.contains(&t.id) != like).collect();
+        if tracks.is_empty() { return; }
+        let stand_ins = tracks.iter().filter(|_| !like).filter_map(|t| Some((t.id.clone(), t.stands_for.clone()?))).collect();
+        let send = Req::LikeMany { video_ids: tracks.iter().map(|t| t.id.clone()).collect(), like, stand_ins };
+        if !like {
+            return self.unlike_soon(tracks, send);
+        }
+        self.set_liked(&tracks, true);
+        if tracks.len() > 10 {
+            self.toast(format!("Liking {} songs…", tracks.len()));
+        }
+        self.backend.request(send);
+    }
+
     pub(super) fn apply(&mut self, a: Action) {
         // In someone else's jam, playback changes become requests to the host.
         let a = if self.jam.guest() {
@@ -32,12 +89,13 @@ impl App {
             }
             Action::Play(tracks, i) => {
                 self.queue_source = self.page_source();
-                // All of a playlist that's still coming in, in order or shuffled: the rest follows.
-                let fill = self.page_list().filter(|id| self.receiving(id)).and_then(|id| {
-                    let o = self.opened(id).filter(|o| o.c.tracks.len() == tracks.len())?;
-                    Some(QueueFill { id: id.to_owned(), load: o.load, shuffled: o.c.tracks.iter().zip(&tracks).any(|(a, b)| a.id != b.id), ran_out: false })
-                });
+                let fill = self.page_fill(&tracks);
                 self.play_list_filling(tracks, i, fill);
+            }
+            Action::Shuffle(tracks) => {
+                self.queue_source = self.page_source();
+                let fill = self.page_fill(&tracks);
+                self.play_shuffled(tracks, fill);
             }
             Action::TogglePlay => self.toggle(),
             Action::TransferPick(t) => transfer::use_pick(self, t),
@@ -52,18 +110,33 @@ impl App {
                 }
             }
             Action::Open(Target::Song(t)) | Action::Radio(t) if self.explicit_hidden(&t) => {}
+            // Radio from the song playing: it goes on playing, and the radio replaces what
+            // was to come, as YouTube Music's Start radio does. Clicking its card (which
+            // starts a song's radio) does the same rather than starting it over.
+            Action::Open(Target::Song(t)) | Action::Radio(t) if self.current_id() == Some(t.id.as_str()) || self.playing_id() == Some(t.id.as_str()) => {
+                let Some(cur) = self.queue.keep_current() else { return };
+                self.play_pending = None;
+                self.queue_source = None;
+                self.request_radio(cur);
+            }
             Action::Open(Target::Song(t)) | Action::Radio(t) => {
                 self.queue_source = None;
                 self.play_list(vec![t.clone()], 0);
-                if !self.radio_pending {
-                    self.radio_pending = true;
-                    self.backend.request(Req::Radio { song_of: self.song_of(&t), seed: t.id });
-                }
+                self.request_radio(t);
+            }
+            Action::OpenCollectionFromCard { target, widget_id, rect, radius, thumbs, zoom } => {
+                let page = match target {
+                    Target::Album(id) => Page::Album(id),
+                    Target::Playlist(id) => Page::Playlist(id),
+                    _ => return,
+                };
+                let origin = super::navigation::CoverOrigin { widget_id, rect, radius, thumbs, zoom };
+                self.go_with_cover(page, false, Some(origin));
             }
             Action::Open(Target::Album(id)) => self.go(Page::Album(id)),
             Action::Open(Target::Playlist(id)) => self.go(Page::Playlist(id)),
             Action::Open(Target::Artist(id)) => self.go(Page::Artist(id)),
-            Action::PlayNext(t) | Action::Enqueue(t) if self.explicit_hidden(&t) => {}
+            Action::PlayNext(t) | Action::Enqueue(t) | Action::QueueInsert { track: t, .. } if self.explicit_hidden(&t) => {}
             Action::PlayNext(t) => {
                 let start = self.queue.play_next(t);
                 self.toast("Playing next");
@@ -81,6 +154,7 @@ impl App {
                 }
             }
             Action::Go(p) => self.go(p),
+            Action::SidebarGo(p) => self.go_from(p, true),
             Action::QueueJump(i) => {
                 // Its row may be gone: the queue changed since it was clicked.
                 if i >= self.queue.tracks.len() {
@@ -91,7 +165,23 @@ impl App {
                 self.queue.drop_explicit();
                 self.play_current();
             }
-            Action::QueueRemove(i) => self.queue.remove(i),
+            Action::QueueRemove(i) => {
+                if let Some(saved) = self.queue.remove(i) {
+                    self.toast_undo("Removed from queue", Undo::Queue(saved));
+                    self.prefetch_next();
+                }
+            }
+            Action::QueueClear => {
+                if let Some(saved) = self.queue.clear() {
+                    self.toast_undo("Queue cleared", Undo::Queue(saved));
+                }
+            }
+            Action::Undo => self.undo(),
+            Action::QueueInsert { gap, track } => {
+                self.queue.insert_at(gap, track);
+                self.toast("Added to queue");
+                self.prefetch_next();
+            }
             Action::QueueMove { from, gap, id } => {
                 if self.queue.tracks.get(from).is_some_and(|t| t.id == id) && self.queue.move_track(from, gap) {
                     self.prefetch_next();
@@ -121,55 +211,62 @@ impl App {
                 self.seek_to(Duration::from_secs_f32(secs.max(0.0)));
                 self.lyric_view.resume();
             }
-            Action::Like(t, like) => {
+            Action::Like(t, false) => self.request_unlike(Unlike::Track(t)),
+            Action::Like(t, true) => {
                 if !self.logged_in {
                     self.toast("Sign in to like songs");
                     return;
                 }
+                // Liked again while its unlike waits: that unlike just doesn't go.
+                if self.unliking_soon(&t.id) {
+                    return self.undo();
+                }
                 // Optimistic: update the like state and the cached Liked songs list now.
-                self.set_liked(std::slice::from_ref(&t), like);
-                self.backend.request(Req::Like { video_id: t.id, like });
+                self.set_liked(std::slice::from_ref(&t), true);
+                self.backend.request(Req::Like { video_id: t.id, like: true });
             }
             // The heart of what's playing stands for both a music video and the song version
             // standing in for it: taking it away takes both likes, whichever are there.
-            Action::LikeHeard(like) => {
+            Action::LikeHeard { like, video_id, generation } => {
+                if generation != self.generation || self.playing_id() != Some(video_id.as_str()) {
+                    return;
+                }
                 let Some(heard) = self.playing_track().cloned() else { return };
-                match self.playing_as().and(self.current()).cloned().filter(|_| !like) {
-                    Some(video) if self.logged_in => {
-                        self.set_liked(&[heard.clone(), video.clone()], false);
-                        self.backend.request(Req::UnlikeBoth { song: heard.id, video: video.id });
-                    }
+                let video = self.playing_as().and(self.current()).cloned();
+                // Liked again while its unlike waits: both come back as they were.
+                if like && [Some(&heard), video.as_ref()].into_iter().flatten().any(|t| self.unliking_soon(&t.id)) {
+                    return self.undo();
+                }
+                match video.filter(|_| !like) {
+                    Some(video) => self.request_unlike(Unlike::Versions(heard, video)),
                     _ => self.apply(Action::Like(heard, like)),
                 }
             }
-            Action::LikeMany(tracks, like) => {
-                if !self.logged_in {
-                    self.toast("Sign in to like songs");
-                    return;
-                }
-                let tracks: Vec<Track> = tracks.into_iter().filter(|t| self.liked.contains(&t.id) != like).collect();
-                if tracks.is_empty() { return; }
-                if like {
-                    self.set_liked(&tracks, true);
-                } else {
-                    // Unlikes go a few a second (YouTube Music drops faster ones): each song
-                    // leaves the list when its unlike goes through, not all at once.
-                    self.unliking.extend(tracks.iter().map(|t| (t.id.clone(), t.clone())));
-                }
-                if tracks.len() > 10 {
-                    // One at a time, then checked: a few hundred take a few minutes.
-                    self.toast(format!("{} {} songs…", if like { "Liking" } else { "Removing likes from" }, tracks.len()));
-                }
-                self.backend.request(Req::LikeMany { video_ids: tracks.into_iter().map(|t| t.id).collect(), like });
-            }
+            Action::LikeMany(tracks, false) => self.request_unlike(Unlike::Selection(tracks)),
+            Action::LikeMany(tracks, true) => self.set_many_likes(tracks, true),
             Action::Dislike(t) => {
                 if !self.logged_in { self.toast("Sign in to rate songs"); return; }
+                let id = Some(t.id.as_str());
+                let skip_generation = (!self.jam.guest() && (self.current_id() == id || self.playing_id() == id)).then_some(self.generation);
+                self.rating(|id| id == t.id);
                 self.set_liked(std::slice::from_ref(&t), false);
-                self.backend.request(Req::Dislike(t.id));
+                self.backend.request(Req::Dislike { video_id: t.id, skip_generation });
             }
+            Action::RemoveDislike(video_id) => {
+                if !self.logged_in { self.toast("Sign in to rate songs"); return; }
+                self.rating(|id| id == video_id);
+                self.backend.request(Req::RemoveRating { video_id, was_disliked: true });
+            }
+            Action::RemoveLike(track) => self.request_unlike(Unlike::Rating(track)),
             Action::Share(target) => {
                 self.share_pending = Some(share_url(&target));
                 self.toast("Link copied");
+            }
+            Action::Pin(id, on) => {
+                self.pinned.retain(|p| *p != id);
+                if on {
+                    self.pinned.insert(0, id);
+                }
             }
             Action::Download(track) => {
                 self.toast(format!("Downloading \u{201c}{}\u{201d}", track.title));
@@ -196,18 +293,23 @@ impl App {
                 }
                 let items: Vec<(String, String)> = rows.iter().map(|&i| (c.tracks[i].id.clone(), c.set_ids[i].clone().unwrap_or_default())).collect();
                 let playlist = c.id.clone();
-                // Optimistic: drop the rows now; the playlist reloads once YouTube confirms.
+                let taken = lists::taken(c, &rows);
+                // Optimistic: drop the rows now. YouTube Music is told once the Undo is gone,
+                // and the playlist reloads when it confirms.
                 c.remove_rows(&rows);
                 log::debug!("list {playlist}: removing {} entries", items.len());
                 self.lists.edits.remove(&playlist, &items);
                 self.sync_card_count(&playlist);
                 self.selection.clear();
-                self.backend.request(Req::RemoveFromPlaylist { playlist_id: playlist, items });
+                self.toast_undo("Removed from playlist", Undo::Removal { id: playlist, rows: taken });
             }
             Action::PlaylistMove { from, gap, id } => {
                 // A load that started during the drag would answer with the old order.
                 if self.page_list().is_some_and(|p| self.lists.loading(p)) {
                     return self.toast("This playlist is still loading. Try again in a moment.");
+                }
+                if let Some(list) = self.page_list().map(str::to_owned) {
+                    self.settle_removal(&list);
                 }
                 let Some(c) = self.current_collection().filter(|c| c.owned && !c.is_album && c.tracks.get(from).is_some_and(|t| t.id == id)) else { return };
                 let playlist_id = c.id.clone();
@@ -240,6 +342,11 @@ impl App {
                 if let Some(id) = self.current_collection().filter(|c| !c.is_album && c.owned).map(|c| c.id.clone()) {
                     self.backend.request(Req::Collaboration(id.clone()));
                     self.dialog = Some(Dialog::Collaborate { id, info: None, busy: true, confirm_off: false });
+                }
+            }
+            Action::DeleteUpload(t) => {
+                if let Some(entity) = crate::ytm::upload_entity(&t.id) {
+                    self.dialog = Some(Dialog::ConfirmDeleteUpload { entity, title: t.title });
                 }
             }
             Action::DeletePlaylist => {
@@ -295,11 +402,19 @@ impl App {
         }
     }
 
+    /// `tracks` are all of the playlist on screen that's still coming in: the rest follows.
+    fn page_fill(&self, tracks: &[Track]) -> Option<QueueFill> {
+        let id = self.page_list().filter(|id| self.receiving(id))?;
+        let o = self.opened(id).filter(|o| o.c.tracks.len() == tracks.len())?;
+        Some(QueueFill { id: id.to_owned(), load: o.load, ran_out: false })
+    }
+
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
         // Space or the arrows are being picked as a shortcut, not pressed.
         if self.hotkeys.capturing() {
             return;
         }
+        palette::shortcut(self, ctx);
         let typing = ctx.egui_wants_keyboard_input();
         // In a text box, Ctrl+arrows move the cursor by words (and lines) instead; on a
         // focused button or slider they still skip and change the volume.
@@ -333,9 +448,14 @@ impl App {
                 }),
                 // Quits for real, with Close to tray on too: GNOME has no tray to quit from (#143).
                 i.modifiers.command && i.key_pressed(egui::Key::Q),
+                // The toast's Undo. With Shift it would be redo, which there isn't.
+                !editing && i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
             )
         });
-        let (space, back, fwd, next, prev, lyr, full, esc, vol_up, vol_down, mini, refresh, quit) = i;
+        let (space, back, fwd, next, prev, lyr, full, esc, vol_up, vol_down, mini, refresh, quit, undo) = i;
+        if undo && self.undo.is_some() {
+            self.actions.push(Action::Undo);
+        }
         if quit {
             self.quit(ctx);
         }
@@ -364,19 +484,11 @@ impl App {
         if prev {
             self.prev();
         }
-        if lyr && self.current().is_some() {
-            self.np_open = !self.np_open;
-            self.np_tab = NpTab::Lyrics;
+        if lyr {
+            self.toggle_lyrics();
         }
         if full && self.np_open {
-            // With a video on show, full screen is the video's, as F is on YouTube.
-            if self.fullscreen {
-                self.set_fullscreen(ctx, false);
-            } else if self.shown_video().is_some() {
-                self.set_video_fullscreen(ctx, true);
-            } else {
-                self.set_fullscreen(ctx, true);
-            }
+            self.toggle_fullscreen(ctx);
         }
         // A menu or dialog that's open takes this Esc for itself.
         if esc && !egui::Popup::is_any_open(ctx) && ctx.memory(|m| m.top_modal_layer()).is_none() {
@@ -390,6 +502,39 @@ impl App {
         }
         if vol_up || vol_down {
             self.nudge_volume(vol_up);
+        }
+    }
+
+    /// Now playing with its lyrics, or back out of it (L).
+    pub(super) fn toggle_lyrics(&mut self) {
+        if self.current().is_some() {
+            self.np_open = !self.np_open;
+            self.np_tab = NpTab::Lyrics;
+        }
+    }
+
+    /// Full screen in now playing, or out of it (F).
+    pub(super) fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        // With a video on show, full screen is the video's, as F is on YouTube.
+        if self.fullscreen {
+            self.set_fullscreen(ctx, false);
+        } else if self.shown_video().is_some() {
+            self.set_video_fullscreen(ctx, true);
+        } else {
+            self.set_fullscreen(ctx, true);
+        }
+    }
+
+    /// In now playing the queue is its Up next panel; elsewhere, the side panel.
+    pub(super) fn queue_shown(&self) -> bool {
+        if self.np_open { self.np_tab == NpTab::UpNext } else { self.queue_open }
+    }
+
+    pub(super) fn toggle_queue(&mut self) {
+        if self.np_open {
+            self.np_tab = if self.queue_shown() { NpTab::Art } else { NpTab::UpNext };
+        } else {
+            self.queue_open = !self.queue_open;
         }
     }
 
@@ -407,6 +552,10 @@ impl App {
             self.set_fullscreen(ctx, false);
             self.mini.request(true);
             return;
+        }
+        if on && !self.pending_unlikes().is_empty() {
+            self.toast = None;
+            self.settle();
         }
         // With a video on show, the mini player is that video (picture in picture).
         let video = on && self.np_open && self.shown_video().is_some();
@@ -434,12 +583,10 @@ impl App {
     }
 }
 
-/// A shuffled list about to play: not with the song already playing first, whose Play
-/// would only pause it.
-pub(super) fn not_current_first(t: &mut [Track], current: Option<&Track>) {
-    if t.len() > 1 && current.is_some_and(|c| c.id == t[0].id) {
-        t.swap(0, 1);
-    }
+/// Whether a link to it opens for others: an uploaded album's or artist's page opens
+/// only for the account that uploaded it.
+pub(super) fn shareable(target: &Target) -> bool {
+    !matches!(target, Target::Album(id) | Target::Artist(id) if crate::ytm::uploaded(id))
 }
 
 fn share_url(target: &Target) -> String {
@@ -547,5 +694,13 @@ mod share_tests {
         assert_eq!(share_url(&Target::Playlist("MPSPPL123".into())), "https://music.youtube.com/playlist?list=PL123");
         assert_eq!(share_url(&Target::Album("MPRE123".into())), "https://music.youtube.com/browse/MPRE123");
         assert_eq!(share_url(&Target::Artist("UC123".into())), "https://music.youtube.com/channel/UC123");
+    }
+
+    #[test]
+    fn uploaded_albums_and_artists_have_no_link_to_share() {
+        assert!(!shareable(&Target::Artist("FEmusic_library_privately_owned_artist_detaila_po_CICr2crg7OWpchIIY29sZHBsYXk".into())));
+        assert!(!shareable(&Target::Album("FEmusic_library_privately_owned_release_detailb_po_CICr2crg7OWpchIOZ2hvc3Qgc3Rvcmllcw".into())));
+        assert!(shareable(&Target::Artist("UC123".into())));
+        assert!(shareable(&Target::Album("MPRE123".into())));
     }
 }

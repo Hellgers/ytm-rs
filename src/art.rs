@@ -20,11 +20,38 @@ pub struct Art {
 
 pub fn process(bytes: &[u8]) -> anyhow::Result<Art> {
     let img = image::load_from_memory(bytes)?.to_rgb8();
-    let small = image::imageops::resize(&img, SIZE, SIZE, image::imageops::FilterType::Triangle);
+    Ok(process_rgb(&img))
+}
 
-    let accent = palette(&small);
-    let brightness = small.pixels().map(|p| (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 255.0).sum::<f32>() / (SIZE * SIZE) as f32;
-    let mut px: Vec<[f32; 3]> = small.pixels().map(|p| [p[0] as f32, p[1] as f32, p[2] as f32]).collect();
+/// The still-cover pipeline over a decoded image: resize to SIZE×SIZE with Triangle,
+/// pick the accent, tint the dark areas toward it, then blur.
+fn process_rgb(img: &image::RgbImage) -> Art {
+    process_small(&image::imageops::resize(img, SIZE, SIZE, image::imageops::FilterType::Triangle))
+}
+
+/// The accent, tint and blur of a cover already SIZE×SIZE.
+fn process_small(small: &image::RgbImage) -> Art {
+    let accent = palette(small);
+    backdrop(small.pixels().map(|p| [p[0] as f32, p[1] as f32, p[2] as f32]).collect(), accent)
+}
+
+/// A frame of an animated cover as the cover art, as a still cover's would be (accent,
+/// tint and blur), sampled nearest-neighbour like [`from_frame`].
+pub fn from_cover_frame(frame: &egui::ColorImage) -> Option<Art> {
+    let ([w, h], n) = (frame.size, SIZE as usize);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let small = image::RgbImage::from_fn(SIZE, SIZE, |x, y| {
+        let c = frame.pixels[(y as usize * h / n) * w + x as usize * w / n];
+        image::Rgb([c.r(), c.g(), c.b()])
+    });
+    Some(process_small(&small))
+}
+
+/// SIZE×SIZE pixels (0–255) made into the backdrop, tinted toward `accent`.
+fn backdrop(mut px: Vec<[f32; 3]>, accent: Color32) -> Art {
+    let brightness = px.iter().map(|p| (0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]) / 255.0).sum::<f32>() / px.len().max(1) as f32;
 
     // Kawarp's tint pass: pull near-black regions toward the accent so dark covers
     // still produce a coloured backdrop instead of a black one.
@@ -41,7 +68,7 @@ pub fn process(bytes: &[u8]) -> anyhow::Result<Art> {
         px = box_blur(&px, SIZE as usize, 6);
     }
     let rgba = px.iter().flat_map(|p| [p[0] as u8, p[1] as u8, p[2] as u8, 255]).collect();
-    Ok(Art { rgba, accent, brightness })
+    Art { rgba, accent, brightness }
 }
 
 /// `passes` more of the art's blur (a theme's `blurPasses` over the usual).
@@ -70,11 +97,12 @@ pub fn from_frame(frame: &egui::ColorImage) -> Option<Art> {
             px.push([c.r() as f32, c.g() as f32, c.b() as f32]);
         }
     }
+    let brightness = px.iter().map(|p| (0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]) / 255.0).sum::<f32>() / px.len() as f32;
     for _ in 0..2 {
         px = box_blur(&px, n, 4);
     }
     let rgba = px.iter().flat_map(|p| [p[0] as u8, p[1] as u8, p[2] as u8, 255]).collect();
-    Some(Art { rgba, accent: Color32::WHITE, brightness: 0.5 })
+    Some(Art { rgba, accent: Color32::WHITE, brightness })
 }
 
 fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
@@ -119,10 +147,7 @@ fn palette(img: &image::RgbImage) -> Color32 {
             sum[c] += rgb[c];
         }
         n += 1.0;
-        let (max, min) = (rgb[0].max(rgb[1]).max(rgb[2]), rgb[0].min(rgb[1]).min(rgb[2]));
-        let sat = if max > 0.0 { (max - min) / max } else { 0.0 };
-        // Favour saturated, mid-to-bright pixels.
-        let score = sat * sat * (1.0 - (max - 0.75).abs());
+        let score = vivid(rgb);
         if score > best.0 {
             best = (score, [rgb[0] * 255.0, rgb[1] * 255.0, rgb[2] * 255.0]);
         }
@@ -130,6 +155,13 @@ fn palette(img: &image::RgbImage) -> Color32 {
     let avg = [sum[0] / n * 255.0, sum[1] / n * 255.0, sum[2] / n * 255.0];
     let accent = if best.0 > 0.05 { best.1 } else { avg };
     lift(accent)
+}
+
+/// How vivid a colour (0–1) is as an accent: saturated, mid-to-bright pixels score highest.
+fn vivid(rgb: [f32; 3]) -> f32 {
+    let (max, min) = (rgb[0].max(rgb[1]).max(rgb[2]), rgb[0].min(rgb[1]).min(rgb[2]));
+    let sat = if max > 0.0 { (max - min) / max } else { 0.0 };
+    sat * sat * (1.0 - (max - 0.75).abs())
 }
 
 /// Raise brightness so the colour reads on a dark UI.
@@ -153,4 +185,62 @@ pub fn idle() -> Art {
         }
     }
     Art { rgba, accent: Color32::from_rgb(0xff, 0x4e, 0x6a), brightness: 0.3 }
+}
+
+/// Below this, a background behind white text is left as the theme has it.
+const READABLE_KNEE: f32 = 0.2;
+/// What brighter backgrounds are eased toward and never quite reach.
+const READABLE_CAP: f32 = 0.3;
+
+/// How much to darken a background whose overall brightness, as it would show (0..1),
+/// is `shown`, for white text over it to stay readable (Settings › Appearance › Dim bright
+/// covers). 1 leaves it be: anything up to [`READABLE_KNEE`] is, so dark covers aren't
+/// dulled. Above that the brightness eases toward [`READABLE_CAP`], darkening a bright
+/// cover in proportion to how far over it is.
+pub fn readable_dim(shown: f32) -> f32 {
+    if !shown.is_finite() || shown <= READABLE_KNEE {
+        return 1.0;
+    }
+    let room = READABLE_CAP - READABLE_KNEE;
+    let eased = READABLE_KNEE + room * (1.0 - (-(shown - READABLE_KNEE) / room).exp());
+    eased / shown
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{READABLE_CAP, READABLE_KNEE, from_cover_frame, process_rgb, readable_dim};
+
+    #[test]
+    fn a_cover_frame_gives_a_still_covers_colours() {
+        // Flat colour: sampling it small can't tell nearest from Triangle.
+        let frame = egui::ColorImage::new([300, 300], vec![egui::Color32::from_rgb(180, 60, 120); 300 * 300]);
+        let still = process_rgb(&image::RgbImage::from_pixel(300, 300, image::Rgb([180, 60, 120])));
+        let art = from_cover_frame(&frame).unwrap();
+        assert_eq!((art.accent, art.rgba), (still.accent, still.rgba));
+        assert!(from_cover_frame(&egui::ColorImage::new([0, 0], vec![])).is_none());
+    }
+
+
+    #[test]
+    fn dark_backgrounds_are_left_alone() {
+        for shown in [0.0, 0.1, 0.2, READABLE_KNEE] {
+            assert_eq!(readable_dim(shown), 1.0);
+        }
+        assert_eq!(readable_dim(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn bright_backgrounds_are_eased_under_the_cap() {
+        let mut last = READABLE_KNEE;
+        for i in 1..=72 {
+            let shown = READABLE_KNEE + i as f32 * 0.01;
+            let after = shown * readable_dim(shown);
+            // Brighter art still shows brighter, just never past the cap…
+            assert!(after > last && after < READABLE_CAP, "{shown} -> {after}");
+            last = after;
+        }
+        // …and the darkening grows with it: barely over the knee, hardly any.
+        assert!(readable_dim(READABLE_KNEE + 0.01) > 0.98);
+        assert!(readable_dim(1.0) < 0.41);
+    }
 }

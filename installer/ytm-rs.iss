@@ -8,7 +8,7 @@
 #define AppName "ytm-rs"
 ; A nightly build passes its own: iscc /DAppVersion=0.2.34-nightly.20261110
 #ifndef AppVersion
-  #define AppVersion "0.3.4"
+  #define AppVersion "0.3.5"
 #endif
 #define AppExe "ytm-rs.exe"
 #ifdef Arm64
@@ -25,7 +25,7 @@
 AppId={{6E0B7C4A-2D1F-4C8E-9B3A-7F5D1E2A9C40}
 AppName={#AppName}
 AppVersion={#AppVersion}
-AppPublisher=ytm-rs contributors
+AppPublisher=grapedjuice
 AppPublisherURL=https://github.com/Hellgers/ytm-rs
 AppSupportURL=https://github.com/Hellgers/ytm-rs/issues
 DefaultDirName={autopf}\{#AppName}
@@ -44,6 +44,13 @@ WizardStyle=modern
 SetupIconFile=..\assets\icon\icon.ico
 UninstallDisplayIcon={app}\{#AppExe}
 CloseApplications=yes
+
+#ifdef Arm64
+[Messages]
+; Setup shows this when the processor isn't allowed, and on ARM64 that only happens on an
+; Intel or AMD PC, where the default "doesn't support this version of Windows" misleads (#117).
+WindowsVersionNotSupported=This is the ytm-rs installer for Windows on ARM PCs, and this PC has an Intel or AMD processor.%n%nDownload ytm-rs-setup-{#AppVersion}.exe instead, the one without -arm64 in its name.
+#endif
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked

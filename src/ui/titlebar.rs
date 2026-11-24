@@ -3,7 +3,10 @@
 //! resize it by. On Windows always (winit keeps the window styles snapping needs, so
 //! dragging to a screen edge and Win+arrows still work). On Linux where the desktop
 //! draws no frame for a Wayland window (GNOME), or when Settings › Window asks for it.
-//! On macOS the system's frame stays.
+//!
+//! On macOS the system's frame stays (its corners, shadow, resizing and full screen),
+//! but not its title strip: the app runs up to the window's top, and the system's window
+//! buttons (the traffic lights) sit at the left of the app's own top row, on its line.
 
 use egui::{Color32, CursorIcon, Id, Pos2, Rect, ResizeDirection, Sense, Stroke, Ui, ViewportCommand, pos2, vec2};
 
@@ -14,6 +17,8 @@ use crate::theme;
 pub const HEIGHT: f32 = 56.0;
 /// The window buttons' width, as Windows draws them.
 const BUTTON_W: f32 = 46.0;
+/// AppleTify's navigation controls use a 20-point icon in a 36-point target.
+const ROUND_BUTTON_TARGET: f32 = 36.0;
 /// How far in from the window's edge resizing starts, and along a corner.
 const EDGE: f32 = 5.0;
 const CORNER: f32 = 14.0;
@@ -82,6 +87,24 @@ pub fn init(data_dir: &std::path::Path) {
     let _ = CUSTOM.set(decide(data_dir));
 }
 
+/// Where the traffic lights' left edge goes, and the room they take at the window's
+/// top left (the lights, and as much again after them as before).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const LIGHTS_X: f32 = 20.0;
+const LIGHTS_W: f32 = 84.0;
+
+/// macOS: the system's window buttons over the app's top row, the system's title strip
+/// gone. `YTM_NATIVE_TITLEBAR` keeps the strip.
+pub fn inset() -> bool {
+    cfg!(target_os = "macos") && std::env::var_os("YTM_NATIVE_TITLEBAR").is_none()
+}
+
+/// Whether the window's top is the app's 56-point row, the window buttons on its line:
+/// the app's own title bar, or macOS's buttons over the app.
+pub fn own_row() -> bool {
+    custom() || inset()
+}
+
 fn decide(data_dir: &std::path::Path) -> bool {
     if std::env::var_os("YTM_NATIVE_TITLEBAR").is_some() {
         return false;
@@ -104,9 +127,9 @@ pub fn set_fullscreen(ctx: &egui::Context, on: bool) {
     ctx.data_mut(|d| d.insert_temp(Id::unique("titlebar-fullscreen"), on));
 }
 
-/// Drawn now: not in full screen.
+/// The app's top row is the title bar now: not in full screen.
 fn shown(ctx: &egui::Context) -> bool {
-    custom() && !ctx.data(|d| d.get_temp::<bool>(Id::unique("titlebar-fullscreen")).unwrap_or(false)) && !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
+    own_row() && !ctx.data(|d| d.get_temp::<bool>(Id::unique("titlebar-fullscreen")).unwrap_or(false)) && !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
 }
 
 fn maximized(ctx: &egui::Context) -> bool {
@@ -115,7 +138,7 @@ fn maximized(ctx: &egui::Context) -> bool {
 
 /// The window buttons' corner, which what's drawn at the top right stays clear of.
 pub fn buttons_rect(ctx: &egui::Context) -> Option<Rect> {
-    shown(ctx).then(|| {
+    (custom() && shown(ctx)).then(|| {
         let screen = ctx.content_rect();
         Rect::from_min_size(pos2(screen.right() - 3.0 * BUTTON_W, screen.top()), vec2(3.0 * BUTTON_W, HEIGHT))
     })
@@ -124,12 +147,12 @@ pub fn buttons_rect(ctx: &egui::Context) -> Option<Rect> {
 /// The top margin above a row `row` tall at the top of the window: `normal`, or with the
 /// app's title bar what centres it on the window buttons' line.
 pub fn top_margin(normal: i8, row: f32) -> i8 {
-    if custom() { ((HEIGHT - row) / 2.0).round() as i8 } else { normal }
+    if own_row() { ((HEIGHT - row) / 2.0).round() as i8 } else { normal }
 }
 
 /// How much of `row` (a strip along the top) the window buttons cover from its right.
 fn overlap(ctx: &egui::Context, row: Rect) -> f32 {
-    buttons_rect(ctx).map_or(0.0, |b| (row.right() - b.left()).max(0.0))
+    buttons_rect(ctx).filter(|b| row.top() < b.bottom()).map_or(0.0, |b| (row.right() - b.left()).max(0.0))
 }
 
 /// The space to leave at the right of a row along the top: `normal`, or beside the
@@ -137,6 +160,52 @@ fn overlap(ctx: &egui::Context, row: Rect) -> f32 {
 pub fn right_gap(ctx: &egui::Context, row: Rect, normal: f32) -> f32 {
     let o = overlap(ctx, row);
     if o > 0.0 { o + 10.0 } else { normal }
+}
+
+/// macOS: the traffic lights' corner, at the window's top left, which what's drawn
+/// there stays clear of. None in full screen, which has none.
+pub fn lights_rect(ctx: &egui::Context) -> Option<Rect> {
+    (inset() && shown(ctx)).then(|| Rect::from_min_size(ctx.content_rect().min, vec2(LIGHTS_W, HEIGHT)))
+}
+
+/// The space to leave at the left of a row along the top: `normal`, or past the traffic
+/// lights when they're over its start.
+pub fn left_gap(ctx: &egui::Context, row: Rect, normal: f32) -> f32 {
+    match lights_rect(ctx) {
+        Some(l) if row.left() < l.right() && row.top() < l.bottom() => (l.right() - row.left()).max(normal),
+        _ => normal,
+    }
+}
+
+/// How far down the sidebar's content starts so the traffic lights have the top row to
+/// themselves: they and the sidebar's menu button and logo don't fit side by side.
+pub fn below_lights(ctx: &egui::Context) -> f32 {
+    if lights_rect(ctx).is_some() { HEIGHT } else { 0.0 }
+}
+
+/// Once a frame, before drawing: macOS keeps the traffic lights on the app's top row.
+/// `full`: the full window is up (the mini player keeps the system's title strip),
+/// None while switching between them.
+///
+/// macOS puts them back where its own title strip would have them when it lays the
+/// window out again (resized, full screen left, the frame back after the mini player),
+/// and that can come after the frame drawn for the change. So for a moment after one,
+/// it's looked at again a few times a second, until they stay put.
+pub fn sync(ctx: &egui::Context, full: Option<bool>) {
+    #[cfg(target_os = "macos")]
+    if inset() {
+        let id = Id::unique("titlebar-sync");
+        let (now, state) = ctx.input(|i| (i.time, (i.viewport().inner_rect.map(|r| r.size()), i.viewport().fullscreen, i.focused)));
+        let (last, until) = ctx.data(|d| d.get_temp::<((Option<egui::Vec2>, Option<bool>, bool), f64)>(id)).map_or((None, 0.0), |(l, u)| (Some(l), u));
+        let until = if last != Some(state) { now + 1.0 } else { until };
+        let moved = full.is_some_and(|full| mac::sync(full, f64::from(HEIGHT) / 2.0, f64::from(LIGHTS_X)));
+        let until = if moved { until.max(now + 0.5) } else { until };
+        ctx.data_mut(|d| d.insert_temp(id, (state, until)));
+        if now < until {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+    let _ = (ctx, full);
 }
 
 /// Move the window by `rect` where nothing else on it takes the pointer; double-click
@@ -153,6 +222,13 @@ pub fn drag_area(ui: &Ui, rect: Rect, id: &str) {
     }
     if drag_strip(ui, rect, id).double_clicked() {
         let max = maximized(ui.ctx());
+        // macOS: what System Settings › Desktop & Dock says a double-click on a title bar does.
+        #[cfg(target_os = "macos")]
+        match mac::double_click() {
+            mac::DoubleClick::Minimize => return ui.ctx().send_viewport_cmd(ViewportCommand::Minimized(true)),
+            mac::DoubleClick::Nothing => return,
+            mac::DoubleClick::Zoom => {}
+        }
         ui.ctx().send_viewport_cmd(ViewportCommand::Maximized(!max));
     }
 }
@@ -189,17 +265,30 @@ pub fn edge_inset() -> f32 {
 pub fn window_buttons(ctx: &egui::Context) {
     let Some(rect) = buttons_rect(ctx) else { return };
     let max = maximized(ctx);
-    egui::Area::new(Id::unique("window-buttons")).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+    let rounded = crate::preset::active().app.top_bar.round_window_buttons;
+    egui::Area::new(Id::unique("window-buttons")).order(egui::Order::Foreground).fixed_pos(rect.min).default_size(rect.size()).show(ctx, |ui| {
+        // Keep the whole corner on this layer, even where there is no button.
+        // The guard is an input sink, with no focus or window action of its own.
+        ui.allocate_space(rect.size());
+        ui.interact(rect, Id::unique("window-buttons-guard"), Sense::CLICK | Sense::DRAG);
         let kinds = [(Kind::Minimize, "Minimize"), (if max { Kind::Restore } else { Kind::Maximize }, if max { "Restore" } else { "Maximize" }), (Kind::Close, "Close")];
         for (i, (kind, name)) in kinds.into_iter().enumerate() {
-            let r = Rect::from_min_size(rect.min + vec2(i as f32 * BUTTON_W, 0.0), vec2(BUTTON_W, HEIGHT));
-            let resp = ui.interact(r, Id::unique(("window-button", i)), Sense::click());
+            let cell = Rect::from_min_size(rect.min + vec2(i as f32 * BUTTON_W, 0.0), vec2(BUTTON_W, HEIGHT));
+            let r = if rounded { Rect::from_center_size(cell.center(), egui::Vec2::splat(ROUND_BUTTON_TARGET)) } else { cell };
+            let resp = ui.interact(r, Id::unique(("window-button", i)), Sense::click_and_drag());
             let resp = super::widgets::named(resp, name);
-            paint_button(ui, r, kind, &resp);
-            if resp.has_focus() {
+            let input = if rounded {
+                round_button_input(ui, r, &resp)
+            } else {
+                ButtonInput { hovered: resp.hovered(), pressed: resp.is_pointer_button_down_on(), clicked: resp.clicked() }
+            };
+            paint_button(ui, r, kind, resp.id, &input, rounded);
+            if rounded {
+                super::widgets::focus_ring(ui, &resp, r, r.width() / 2.0);
+            } else if resp.has_focus() {
                 ui.painter().rect_stroke(r.shrink(3.0), 3.0, Stroke::new(1.5, theme::text()), egui::StrokeKind::Inside);
             }
-            if resp.clicked() {
+            if input.clicked {
                 ctx.send_viewport_cmd(match kind {
                     Kind::Minimize => ViewportCommand::Minimized(true),
                     Kind::Maximize => ViewportCommand::Maximized(true),
@@ -219,11 +308,66 @@ enum Kind {
     Close,
 }
 
-fn paint_button(ui: &Ui, r: Rect, kind: Kind, resp: &egui::Response) {
-    let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered(), 0.1);
-    let down = resp.is_pointer_button_down_on();
+struct ButtonInput {
+    hovered: bool,
+    pressed: bool,
+    clicked: bool,
+}
+
+fn round_button_input(ui: &Ui, rect: Rect, resp: &egui::Response) -> ButtonInput {
+    let radius = rect.width() / 2.0;
+    let inside = |p: Pos2| (p - rect.center()).length_sq() <= radius * radius;
+    let (pointed, pressed_in_circle, released_in_circle, down) = ui.input(|i| {
+        let endpoint = |pressed| i.events.iter().rev().find_map(|event| match event {
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: p, .. } if *p == pressed => Some(inside(*pos)),
+            _ => None,
+        });
+        (i.pointer.hover_pos().is_some_and(inside), endpoint(true), endpoint(false), i.pointer.primary_down())
+    });
+    // Keep the rectangular focus target, but both pointer endpoints must be in the halo.
+    // The foreground guard still consumes presses and drags in the transparent corners.
+    let id = resp.id.with("press-in-halo");
+    let armed = ui.ctx().data_mut(|data| {
+        let armed = pressed_in_circle.unwrap_or_else(|| data.get_temp::<bool>(id).unwrap_or(false));
+        if down { data.insert_temp(id, armed); } else { data.remove::<bool>(id); }
+        armed
+    });
+    let pointer_click = resp.clicked_by(egui::PointerButton::Primary);
+    let accepted = armed && released_in_circle == Some(true);
+    if (pointer_click && !accepted) || (resp.is_pointer_button_down_on() && pressed_in_circle == Some(false)) {
+        resp.surrender_focus();
+    }
+    ButtonInput {
+        hovered: resp.hovered() && pointed && (!down || armed),
+        pressed: resp.is_pointer_button_down_on() && pointed && armed,
+        clicked: resp.clicked() && (!pointer_click || accepted),
+    }
+}
+
+fn paint_button(ui: &Ui, r: Rect, kind: Kind, id: Id, input: &ButtonInput, rounded: bool) {
+    let h = theme::anim_bool(ui.ctx(), id.with("h"), input.hovered, if rounded { 0.15 } else { 0.1 });
+    let down = input.pressed;
     let p = ui.painter();
-    let fg = if kind == Kind::Close {
+    let mut scale = 1.0;
+    let fg = if rounded {
+        // The same circular fill, rim and pressed treatment as Back and Forward.
+        let controls = &crate::preset::active().app.controls;
+        let radius = r.width() / 2.0;
+        if h > 0.0 {
+            p.circle_filled(r.center(), radius, theme::glass(0.10 * h));
+            let rim = controls.ghost_outline.max(controls.hover_border) * h;
+            if rim > 0.0 {
+                p.circle_stroke(r.center(), radius, Stroke::new(1.0, theme::glass(rim)));
+            }
+        }
+        if down && controls.press_fill > 0.0 {
+            p.circle_filled(r.center(), radius, theme::glass(controls.press_fill));
+        }
+        scale = if down { controls.press_scale } else { 1.0 + (controls.hover_scale - 1.0) * h };
+        let idle = theme::with_alpha(theme::text_dim(), controls.idle_alpha.clamp(0.5, 1.0));
+        let lit = crate::preset::hex(&controls.hover_color).unwrap_or_else(theme::text);
+        theme::lerp_color(idle, lit, h)
+    } else if kind == Kind::Close {
         // Windows' own close red, and a darker one while held.
         let red = if down { Color32::from_rgb(0x94, 0x1F, 0x15) } else { Color32::from_rgb(0xC4, 0x2B, 0x1C) };
         if h > 0.0 {
@@ -240,24 +384,25 @@ fn paint_button(ui: &Ui, r: Rect, kind: Kind, resp: &egui::Response) {
     let px = 1.0 / ui.ctx().pixels_per_point();
     let snap = |p: Pos2| pos2((p.x / px).round() * px + px / 2.0, (p.y / px).round() * px + px / 2.0);
     let c = snap(r.center());
+    let point = |x, y| c + vec2(x, y) * scale;
     let s = Stroke::new(1.0, fg);
     match kind {
         Kind::Minimize => {
-            p.line_segment([c + vec2(-5.0, 0.0), c + vec2(5.0, 0.0)], s);
+            p.line_segment([point(-5.0, 0.0), point(5.0, 0.0)], s);
         }
         Kind::Maximize => {
-            p.rect_stroke(Rect::from_center_size(c, vec2(10.0, 10.0)), 1.0, s, egui::StrokeKind::Middle);
+            p.rect_stroke(Rect::from_center_size(c, vec2(10.0, 10.0) * scale), 1.0, s, egui::StrokeKind::Middle);
         }
         Kind::Restore => {
-            p.rect_stroke(Rect::from_center_size(c + vec2(-1.0, 1.0), vec2(8.0, 8.0)), 1.0, s, egui::StrokeKind::Middle);
+            p.rect_stroke(Rect::from_center_size(point(-1.0, 1.0), vec2(8.0, 8.0) * scale), 1.0, s, egui::StrokeKind::Middle);
             // The window behind: its top and right edges, showing past the front one.
-            let b = Rect::from_center_size(c + vec2(1.0, -1.0), vec2(8.0, 8.0));
-            p.line_segment([pos2(b.left() + 2.0, b.top()), b.right_top()], s);
-            p.line_segment([b.right_top(), pos2(b.right(), b.bottom() - 2.0)], s);
+            let b = Rect::from_center_size(point(1.0, -1.0), vec2(8.0, 8.0) * scale);
+            p.line_segment([pos2(b.left() + 2.0 * scale, b.top()), b.right_top()], s);
+            p.line_segment([b.right_top(), pos2(b.right(), b.bottom() - 2.0 * scale)], s);
         }
         Kind::Close => {
-            p.line_segment([c + vec2(-5.0, -5.0), c + vec2(5.0, 5.0)], s);
-            p.line_segment([c + vec2(-5.0, 5.0), c + vec2(5.0, -5.0)], s);
+            p.line_segment([point(-5.0, -5.0), point(5.0, 5.0)], s);
+            p.line_segment([point(-5.0, 5.0), point(5.0, -5.0)], s);
         }
     }
 }
@@ -273,8 +418,13 @@ pub fn resize_sides(ctx: &egui::Context) {
     edges(ctx, true);
 }
 
+pub(super) fn resize_inset(ctx: &egui::Context) -> f32 {
+    if custom() && shown(ctx) && !maximized(ctx) { EDGE } else { 0.0 }
+}
+
 fn edges(ctx: &egui::Context, sides_only: bool) {
-    if !shown(ctx) || maximized(ctx) {
+    // macOS resizes its own frame.
+    if resize_inset(ctx) == 0.0 {
         return;
     }
     let s = ctx.content_rect();
@@ -321,11 +471,146 @@ fn edges(ctx: &egui::Context, sides_only: bool) {
 /// instead. That frame sits under the app's bottom row, which the app always paints
 /// opaque, so it never shows. Anything else winit decides (the work area when maximized)
 /// stays as it is.
+///
+/// `gl_vendor` is the OpenGL driver's vendor, when OpenGL draws: see [`drop_caption`].
 #[cfg_attr(not(windows), allow(unused_variables))]
-pub fn set_hwnd(hwnd: *mut std::ffi::c_void) {
+pub fn set_hwnd(hwnd: *mut std::ffi::c_void, gl_vendor: Option<&str>) {
     #[cfg(windows)]
     if custom() {
-        frame::init(hwnd);
+        frame::init(hwnd, drop_caption(gl_vendor, std::env::var("YTM_DROP_CAPTION").ok().as_deref()));
+    }
+}
+
+/// Whether the frameless window goes without the caption style too (#196). winit keeps
+/// it (for snapping and the minimize and maximize animations) though the window shows
+/// no caption. Intel's OpenGL drivers for older chips (HD 5500) then put the picture
+/// where a captioned window's drawable area would start, a caption's height lower than
+/// the window's, while the pointer lands where it should. Full screen, which drops the
+/// style, and the system title bar, whose drawable area does start below a caption,
+/// show it in place. Dropping the style costs only those animations, so it's for
+/// Intel's OpenGL alone. `YTM_DROP_CAPTION=1` drops it anywhere, `=0` keeps it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn drop_caption(gl_vendor: Option<&str>, forced: Option<&str>) -> bool {
+    match forced {
+        Some("1") => true,
+        Some("0") => false,
+        _ => gl_vendor.is_some_and(|v| v.to_ascii_lowercase().contains("intel")),
+    }
+}
+
+/// macOS: the main window's view, from `main`.
+#[cfg(target_os = "macos")]
+pub fn set_view(ns_view: *mut std::ffi::c_void) {
+    mac::init(ns_view);
+}
+
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::sync::atomic::{AtomicPtr, Ordering};
+
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
+    use objc2_foundation::{NSPoint, NSString, NSUserDefaults};
+
+    static VIEW: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+    pub fn init(ns_view: *mut std::ffi::c_void) {
+        VIEW.store(ns_view, Ordering::Relaxed);
+    }
+
+    /// Put the traffic lights' left edge at `left` and their middle `center_y` down from
+    /// the window's top; or, not `full` (the mini player), give the window its title strip
+    /// back. Whether anything had to change.
+    pub fn sync(full: bool, center_y: f64, left: f64) -> bool {
+        let ptr = VIEW.load(Ordering::Relaxed);
+        if ptr.is_null() || MainThreadMarker::new().is_none() {
+            return false;
+        }
+        // SAFETY: winit's view of the main window, alive as long as the app's loop that
+        // calls this, and used on the main thread.
+        let view = unsafe { &*(ptr as *const NSView) };
+        let Some(window) = view.window() else { return false };
+        let mask = window.styleMask();
+        // Borderless is the mini player; full screen has macOS's own top, sliding down.
+        if !mask.contains(NSWindowStyleMask::Titled) || mask.contains(NSWindowStyleMask::FullScreen) {
+            return false;
+        }
+        if !full {
+            if !mask.contains(NSWindowStyleMask::FullSizeContentView) {
+                return false;
+            }
+            // macOS lays the strip out afresh, the buttons back in their usual place.
+            set_mask(&window, mask & !NSWindowStyleMask::FullSizeContentView);
+            window.setTitlebarAppearsTransparent(false);
+            window.setTitleVisibility(NSWindowTitleVisibility::Visible);
+            return true;
+        }
+        if !mask.contains(NSWindowStyleMask::FullSizeContentView) {
+            // Back from the mini player; or winit set the mask afresh, without this, when
+            // the frame came back after the pill.
+            set_mask(&window, mask | NSWindowStyleMask::FullSizeContentView);
+        }
+        if !window.titlebarAppearsTransparent() {
+            window.setTitlebarAppearsTransparent(true);
+            window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+        }
+        let Some(close) = window.standardWindowButton(NSWindowButton::CloseButton) else { return false };
+        // The buttons' bar and what holds it, moved as one: the buttons' highlight while
+        // the pointer is over them moves with them. Moving the buttons inside it left
+        // that where it was (winit#4466).
+        // SAFETY: AppKit's own views, kept alive by the window for as long as this runs.
+        let Some(holder) = (unsafe { close.superview() }).and_then(|bar| unsafe { bar.superview() }) else { return false };
+        let Some(frame_view) = (unsafe { holder.superview() }) else { return false };
+        // In the window's own coordinates: from its bottom left, up.
+        let at = close.convertRect_toView(close.bounds(), None);
+        let height = window.frame().size.height;
+        let dx = left - at.origin.x;
+        let down = center_y - (height - (at.origin.y + at.size.height / 2.0));
+        if dx.abs() < 0.5 && down.abs() < 0.5 {
+            return false;
+        }
+        let o = holder.frame().origin;
+        let dy = if frame_view.isFlipped() { down } else { -down };
+        holder.setFrameOrigin(NSPoint::new(o.x + dx, o.y + dy));
+        true
+    }
+
+    /// Change the window's style, the app's area kept the size it was: the strip coming
+    /// or going would otherwise take its height from it, or add it, with the window's
+    /// outside the same (the mini player sized to fit its strip would lose a row). The
+    /// top edge stays put.
+    fn set_mask(window: &NSWindow, mask: NSWindowStyleMask) {
+        let content = || window.contentView().map(|v| v.frame().size.height);
+        let before = content();
+        window.setStyleMask(mask);
+        if let (Some(before), Some(after)) = (before, content()) {
+            let lost = before - after;
+            if lost.abs() > 0.5 {
+                let mut f = window.frame();
+                f.origin.y -= lost;
+                f.size.height += lost;
+                window.setFrame_display(f, true);
+            }
+        }
+    }
+
+    pub enum DoubleClick {
+        Zoom,
+        Minimize,
+        Nothing,
+    }
+
+    /// What System Settings › Desktop & Dock › "Double-click a window's title bar to" says.
+    pub fn double_click() -> DoubleClick {
+        let defaults = NSUserDefaults::standardUserDefaults();
+        match defaults.stringForKey(&NSString::from_str("AppleActionOnDoubleClick")).map(|s| s.to_string()).as_deref() {
+            Some("Minimize") => DoubleClick::Minimize,
+            Some("None") => DoubleClick::Nothing,
+            Some(_) => DoubleClick::Zoom,
+            // Older systems: a switch for minimizing, zooming otherwise.
+            None if defaults.boolForKey(&NSString::from_str("AppleMiniaturizeOnDoubleClick")) => DoubleClick::Minimize,
+            None => DoubleClick::Zoom,
+        }
     }
 }
 
@@ -333,13 +618,22 @@ pub fn set_hwnd(hwnd: *mut std::ffi::c_void) {
 mod frame {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
-    use windows::Win32::Graphics::Gdi::{BLACK_BRUSH, ClientToScreen, FillRect, GetMonitorInfoW, GetStockObject, GetWindowDC, HBRUSH, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, ReleaseDC};
+    use windows::Win32::Graphics::Gdi::{
+        BLACK_BRUSH, ClientToScreen, FillRect, GetMonitorInfoW, GetStockObject, GetWindowDC, HBRUSH, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, MonitorFromWindow, ReleaseDC,
+    };
     use windows::Win32::UI::Controls::MARGINS;
     use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
-    use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect, IsZoomed, NCCALCSIZE_PARAMS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, WM_NCCALCSIZE, WM_NCPAINT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_STYLE, GetClientRect, GetWindowLongW, GetWindowRect, IsZoomed, MINMAXINFO, NCCALCSIZE_PARAMS, STYLESTRUCT, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        SetWindowLongW, SetWindowPos, WM_GETMINMAXINFO, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCPAINT, WM_STYLECHANGING, WS_CAPTION,
+    };
 
-    pub fn init(hwnd: *mut std::ffi::c_void) {
+    /// See `super::drop_caption`.
+    static NO_CAPTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub fn init(hwnd: *mut std::ffi::c_void, no_caption: bool) {
         let hwnd = HWND(hwnd);
+        NO_CAPTION.store(no_caption, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: the app's own window, on the thread that made it (still hidden: eframe
         // shows it after the first frame); the subclass lives as long as the window.
         unsafe {
@@ -348,6 +642,11 @@ mod frame {
                 return;
             }
             let _ = DwmExtendFrameIntoClientArea(hwnd, &MARGINS { cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: 0, cyBottomHeight: 1 });
+            if no_caption {
+                // The subclass keeps it off when winit sets the style again.
+                log::info!("title bar: window without the caption style");
+                SetWindowLongW(hwnd, GWL_STYLE, GetWindowLongW(hwnd, GWL_STYLE) & !(WS_CAPTION.0 as i32));
+            }
             // Have Windows ask for the window's areas again.
             let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
@@ -381,8 +680,31 @@ mod frame {
 
     unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _: usize, _: usize) -> LRESULT {
         // SAFETY: called by Windows with the window's own message; for WM_NCCALCSIZE with
-        // wparam set, lparam points at an NCCALCSIZE_PARAMS.
+        // wparam set, lparam points at an NCCALCSIZE_PARAMS; for WM_STYLECHANGING, at a
+        // STYLESTRUCT.
         unsafe {
+            if msg == WM_STYLECHANGING && wparam.0 as i32 == GWL_STYLE.0 && NO_CAPTION.load(std::sync::atomic::Ordering::Relaxed) {
+                (*(lparam.0 as *mut STYLESTRUCT)).styleNew &= !WS_CAPTION.0;
+            }
+            // Without the caption style, as GLFW's frameless windows (#196): maximized to
+            // the work area, and no old-style title bar drawn on activation or a new title.
+            if NO_CAPTION.load(std::sync::atomic::Ordering::Relaxed) {
+                if msg == WM_GETMINMAXINFO {
+                    let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+                    to_work_area(hwnd, &mut *(lparam.0 as *mut MINMAXINFO));
+                    return result;
+                }
+                // Activation still goes to winit, which tracks focus by it; lparam -1 asks
+                // Windows not to repaint the frame for it, so no old-style title bar shows.
+                if msg == WM_NCACTIVATE {
+                    DefSubclassProc(hwnd, msg, wparam, LPARAM(-1));
+                    return LRESULT(1);
+                }
+                if msg == WM_NCPAINT {
+                    clear_edge(hwnd);
+                    return LRESULT(1);
+                }
+            }
             if msg != WM_NCCALCSIZE || wparam.0 == 0 {
                 let result = DefSubclassProc(hwnd, msg, wparam, lparam);
                 if msg == WM_NCPAINT {
@@ -417,6 +739,21 @@ mod frame {
         }
     }
 
+    /// Without the caption style Windows maximizes a window over its whole monitor, the
+    /// taskbar included, as it does a full-screen game's. winit still keeps the app's area
+    /// to the work area, so the strip past it went unseen but took the taskbar's clicks
+    /// (#196). Maximized, it fills the work area instead, as GLFW's frameless windows do.
+    fn to_work_area(hwnd: HWND, mm: &mut MINMAXINFO) {
+        let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        // SAFETY: the app's own window; `info` is ours and sized.
+        if !unsafe { GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info) }.as_bool() {
+            return;
+        }
+        let (m, w) = (info.rcMonitor, info.rcWork);
+        mm.ptMaxPosition = POINT { x: w.left - m.left, y: w.top - m.top };
+        mm.ptMaxSize = POINT { x: w.right - w.left, y: w.bottom - w.top };
+    }
+
     /// Whether `r` covers all of the monitor it's on: the one it's going to, while the
     /// window moves to another.
     fn fills_monitor(r: &RECT) -> bool {
@@ -433,6 +770,17 @@ mod frame {
 #[cfg(test)]
 mod tests {
     use super::Choice;
+
+    #[test]
+    fn only_intel_opengl_drops_the_caption_style_unless_forced() {
+        use super::drop_caption;
+        assert!(drop_caption(Some("Intel"), None));
+        assert!(!drop_caption(Some("NVIDIA Corporation"), None));
+        assert!(!drop_caption(None, None));
+        assert!(drop_caption(None, Some("1")));
+        assert!(!drop_caption(Some("Intel"), Some("0")));
+        assert!(!drop_caption(Some("ATI Technologies Inc."), Some("")));
+    }
 
     #[test]
     fn linux_draws_its_own_title_bar_only_where_the_desktop_draws_none() {

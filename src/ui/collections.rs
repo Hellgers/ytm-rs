@@ -4,12 +4,12 @@
 use std::collections::HashSet;
 
 use crate::backend::{Collection, Req};
-use crate::model::{ShelfKind, Target, Track};
+use crate::model::{Card, ShelfKind, Target, Track};
 
 use super::lists::{Arrival, Done, LIKED_MUSIC, Opened, Start};
 use super::pages::thousands;
 use super::queue::QueueFill;
-use super::{App, shuffle};
+use super::App;
 
 impl App {
     /// What the queue was started from, while the song playing is one of it: what kind
@@ -125,13 +125,14 @@ impl App {
     /// as the rest arrives.
     pub(super) fn play_opened(&mut self, id: String, shuffled: bool) {
         let Some(o) = self.opened(&id).filter(|o| !o.c.tracks.is_empty()) else { return };
-        let mut tracks = o.c.tracks.clone();
-        if shuffled {
-            shuffle(&mut tracks);
-        }
-        let fill = self.receiving(&id).then(|| QueueFill { id: id.clone(), load: o.load, shuffled, ran_out: false });
+        let tracks = o.c.tracks.clone();
+        let fill = self.receiving(&id).then(|| QueueFill { id: id.clone(), load: o.load, ran_out: false });
         self.queue_source = Some(if o.c.is_album { Target::Album(id) } else { Target::Playlist(id) });
-        self.play_list_filling(tracks, 0, fill);
+        if shuffled {
+            self.play_shuffled(tracks, fill);
+        } else {
+            self.play_list_filling(tracks, 0, fill);
+        }
     }
 
     /// The album or playlist on screen.
@@ -221,7 +222,11 @@ impl App {
     /// The next songs of a playlist played before all of it was in join the queue.
     fn fill_queue(&mut self, id: &str, load: u64, tracks: Vec<Track>, more: bool) {
         let playing_it = self.queue_source == Some(Target::Playlist(id.to_owned()));
-        let Some(filled) = self.queue.fill_from(id, load, tracks, more, playing_it) else { return };
+        let saved = match &mut self.undo {
+            Some(super::undo::Undo::Queue(saved)) => Some(saved),
+            _ => None,
+        };
+        let Some(filled) = self.queue.fill_saved(saved, id, load, tracks, more, playing_it) else { return };
         if filled.ran_out {
             self.next();
         } else if filled.was_at_end && !self.buffering {
@@ -275,6 +280,19 @@ fn with_count(subtitle: &str, n: u64) -> Option<String> {
     Some(parts.join(" • "))
 }
 
+/// The playlist cards `order`ed (indices into `cards`), the `pinned` ones first in the
+/// order they're pinned in.
+pub(super) fn pinned_first(pinned: &[String], cards: &[Card], order: impl IntoIterator<Item = usize>) -> Vec<usize> {
+    let rank = |i: usize| match &cards[i].target {
+        Target::Playlist(id) => pinned.iter().position(|p| p == id),
+        _ => None,
+    };
+    let mut order: Vec<usize> = order.into_iter().collect();
+    // Stable: the rest keep their order.
+    order.sort_by_key(|&i| rank(i).unwrap_or(usize::MAX));
+    order
+}
+
 /// "1,234 tracks" -> (1234, "track").
 fn count_of(part: &str) -> Option<(u64, &str)> {
     let (n, noun) = part.split_once(' ')?;
@@ -285,7 +303,19 @@ fn count_of(part: &str) -> Option<(u64, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::with_count;
+    use super::{pinned_first, with_count};
+    use crate::model::{Card, Target};
+
+    #[test]
+    fn pinned_playlists_come_first() {
+        let card = |id: &str| Card { title: String::new(), subtitle: String::new(), thumbs: Vec::new(), target: Target::Playlist(id.into()), round: false, links: Vec::new() };
+        let cards = [card("a"), card("b"), card("c"), card("d")];
+        let pinned = ["d".to_owned(), "b".to_owned(), "gone".to_owned()];
+        assert_eq!(pinned_first(&pinned, &cards, 0..4), [3, 1, 0, 2]);
+        // Sorted some other way, the rest keep that order.
+        assert_eq!(pinned_first(&pinned, &cards, [2, 1, 0, 3]), [3, 1, 2, 0]);
+        assert_eq!(pinned_first(&[], &cards, 0..4), [0, 1, 2, 3]);
+    }
 
     #[test]
     fn a_card_counts_what_its_playlist_has() {

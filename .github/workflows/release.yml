@@ -4,7 +4,7 @@ name: Windows fork release candidate
 # Tags attach to a draft only; manual runs upload Actions artifacts only.
 on:
   push:
-    tags: ["v0.3.4"]
+    tags: ["v0.3.5"]
   workflow_dispatch:
 
 permissions:
@@ -25,8 +25,8 @@ jobs:
       run:
         shell: pwsh
     env:
-      EXPECTED_VERSION: "0.3.4"
-      PATCH_BASE: 7fe50ee97213771e56385973369d2680d6b972ca
+      EXPECTED_VERSION: "0.3.5"
+      PATCH_BASE: a6e4cc0f005b03d442396a5adaa93e6a05b893b5
       YTM_NIGHTLY: ""
     steps:
       - uses: actions/checkout@v5
@@ -57,7 +57,7 @@ jobs:
           $rustupRoot = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $env:USERPROFILE '.rustup' }
           $cargoRoot = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
           "RUSTFLAGS=--remap-path-prefix=$env:GITHUB_WORKSPACE=/src --remap-path-prefix=$cargoRoot=/cargo --remap-path-prefix=$rustupRoot=/rust" >> $env:GITHUB_ENV
-          foreach ($path in @('LICENSE', 'README.md', 'docs/AUDIO_CONTINUITY_FIX.md', 'src/testdata/README.md', 'RELEASE_NOTES_0.3.4.md')) {
+          foreach ($path in @('LICENSE', 'README.md', 'docs/AUDIO_CONTINUITY_FIX.md', 'src/testdata/README.md', 'RELEASE_NOTES_0.3.5.md')) {
             if (!(Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required document missing: $path" }
           }
 
@@ -113,18 +113,16 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $dist = 'installer/Output'
-          $portable = Join-Path $env:RUNNER_TEMP 'ytm-rs-0.3.4-portable'
+          $portable = Join-Path $env:RUNNER_TEMP 'ytm-rs-0.3.5-portable'
           New-Item -ItemType Directory -Path "$portable/docs" -Force | Out-Null
-          Copy-Item -LiteralPath 'target/release/ytm-rs.exe', 'installer/portable.txt', 'README.md', 'LICENSE', 'RELEASE_NOTES_0.3.4.md' -Destination $portable
+          Copy-Item -LiteralPath 'target/release/ytm-rs.exe', 'installer/portable.txt', 'README.md', 'LICENSE', 'RELEASE_NOTES_0.3.5.md' -Destination $portable
           Copy-Item -LiteralPath 'docs/AUDIO_CONTINUITY_FIX.md' -Destination "$portable/docs"
           Compress-Archive -Path "$portable/*" -DestinationPath "$dist/ytm-rs-portable-$env:VERSION.zip" -Force
           git archive --format=zip --prefix="ytm-rs-$env:VERSION/" --output="$dist/ytm-rs-source-$env:VERSION.zip" HEAD
           if ($LASTEXITCODE) { throw 'Source archive failed' }
-          # Functional paths only: no fork updater, version/repository branding,
-          # release workflows, installer branding or these fork release notes.
-          $functional = @('docs/AUDIO_CONTINUITY_FIX.md', 'src/audio.rs', 'src/audio_source.rs', 'src/backend.rs', 'src/innertube.rs', 'src/main.rs', 'src/opus.rs', 'src/shader.rs', 'src/stream.rs', 'src/testdata', 'src/ui/karaoke.rs', 'src/ui/mod.rs', 'src/ui/playback.rs', 'src/ui/responses.rs', 'src/webmusic.rs', 'src/ytm.rs')
+          # Full tracked source delta from the previous fork release.
           $patch = "$dist/ytm-rs-unified-fixes-$env:VERSION.patch"
-          git diff --binary --full-index --no-ext-diff --output=$patch $env:PATCH_BASE HEAD -- @functional
+          git diff --binary --full-index --no-ext-diff --output=$patch $env:PATCH_BASE HEAD
           if ($LASTEXITCODE) { throw 'Functional patch generation failed' }
           if ((Get-Item -LiteralPath $patch).Length -eq 0) { throw 'Functional patch unexpectedly empty' }
           git apply --check --reverse $patch
@@ -161,7 +159,7 @@ jobs:
             if (!(($existing | ConvertFrom-Json).isDraft)) { throw 'Refusing to modify a published release' }
             gh release upload $tag @files --clobber
           } else {
-            gh release create $tag @files --verify-tag --draft --title "ytm-rs $env:VERSION - Playback, radio and rendering fixes" --notes-file RELEASE_NOTES_0.3.4.md
+            gh release create $tag @files --verify-tag --draft --title "ytm-rs $env:VERSION - AppleTify" --notes-file RELEASE_NOTES_0.3.5.md
           }
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           # No publish/edit --draft=false, --latest, schedule or nightly path.

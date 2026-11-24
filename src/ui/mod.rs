@@ -18,18 +18,26 @@ mod karaoke;
 mod lists;
 mod lyric_prefs;
 mod mini;
+mod navigation;
 mod notes;
+mod presence;
 mod nowplaying;
 mod pace;
 mod pages;
+mod palette;
 mod playback;
 mod queue;
+mod ratings;
 mod responses;
 mod row_drag;
 mod shell;
+mod shuffle;
 mod titlebar;
-pub use titlebar::{custom as custom_titlebar, init as init_titlebar, set_hwnd as set_titlebar_hwnd};
+pub use titlebar::{custom as custom_titlebar, init as init_titlebar, inset as titlebar_inset, set_hwnd as set_titlebar_hwnd};
+#[cfg(target_os = "macos")]
+pub use titlebar::set_view as set_titlebar_view;
 mod transfer;
+mod undo;
 mod vector;
 mod wheel;
 mod widgets;
@@ -53,6 +61,7 @@ use crate::theme;
 use crate::ytm::Scope;
 use lists::{LIKED_MUSIC, Lists};
 use queue::Queue;
+use shuffle::{shuffle, shuffle_to_play};
 use dev::{dev_screenshot, dev_var};
 use dialogs::text_field;
 pub use queue::Repeat;
@@ -176,10 +185,21 @@ impl AccentSource {
 
 /// User intents collected while drawing; applied after the frame's UI pass.
 pub enum Action {
+    SidebarGo(Page),
+    OpenCollectionFromCard {
+        target: Target,
+        widget_id: egui::Id,
+        rect: egui::Rect,
+        radius: f32,
+        thumbs: Vec<crate::model::Thumb>,
+        zoom: f32,
+    },
     Play(Vec<Track>, usize),
     /// The songs a list was narrowed to: they stay the whole queue, however much more of
     /// the list comes in.
     PlayFound(Vec<Track>, usize),
+    /// A page's Shuffle button: its songs shuffled, with shuffle on.
+    Shuffle(Vec<Track>),
     PlayCollection(Target, bool),
     /// Click on a card: songs start a radio, everything else opens its page.
     Open(Target),
@@ -189,9 +209,16 @@ pub enum Action {
     Go(Page),
     QueueJump(usize),
     QueueRemove(usize),
+    /// Everything in the queue but the song playing goes.
+    QueueClear,
+    /// Take back what the toast up now says was done.
+    Undo,
     /// A song to come dragged to the gap between songs (see `Queue::move_track`), if the
     /// song `id` is still at `from`.
     QueueMove { from: usize, gap: usize, id: String },
+    /// A song dragged in from another list, let go at the gap between songs `gap` (see
+    /// `Queue::insert_at`).
+    QueueInsert { gap: usize, track: Track },
     Seek(f32),
     /// Moving video or the picture, for music videos.
     ToggleVideo,
@@ -200,11 +227,15 @@ pub enum Action {
     SongVideo(bool),
     Like(Track, bool),
     /// The heart of what's playing, in the player bar, the mini player and Now playing's menu.
-    LikeHeard(bool),
+    LikeHeard { like: bool, video_id: String, generation: u64 },
     /// Like (or unlike) a selection of songs.
     LikeMany(Vec<Track>, bool),
     Dislike(Track),
+    RemoveLike(Track),
+    RemoveDislike(String),
     Share(Target),
+    /// Keep a playlist at the top of the sidebar and Library › Playlists (true), or not.
+    Pin(String, bool),
     AddToPlaylist(Vec<Track>),
     /// Rows (indices into the open playlist) to take out of it.
     RemoveFromPlaylist(Vec<usize>),
@@ -223,6 +254,8 @@ pub enum Action {
     /// The open playlist's collaboration settings.
     Collaborate,
     DeletePlaylist,
+    /// Delete an uploaded song from the account, after asking.
+    DeleteUpload(Track),
     SaveCollection(String, bool),
     /// Subscribe to the open artist (true), or unsubscribe.
     Subscribe(bool),
@@ -236,11 +269,22 @@ pub enum Action {
     TransferPick(Track),
 }
 
+enum Unlike {
+    Track(Track),
+    Versions(Track, Track),
+    Selection(Vec<Track>),
+    Rating(Track),
+}
+
 enum Dialog {
     PickPlaylist(Vec<Track>),
     NewPlaylist { title: String, tracks: Vec<Track> },
     EditPlaylist { id: String, title: String, description: String, privacy: Option<String> },
     ConfirmDelete { id: String, title: String },
+    /// Deleting an uploaded song (`Track::upload`), asked about first.
+    ConfirmDeleteUpload { entity: String, title: String },
+    /// Clearing the cache (Settings › Storage), asked about first.
+    ConfirmClearCache,
     /// A large download (`count` songs to go) asked about before it starts.
     ConfirmDownload { target: Option<Target>, title: String, tracks: Vec<Track>, count: usize },
     /// `info` until it loads; `busy` while a change is on its way; `confirm_off` asks
@@ -323,7 +367,12 @@ pub struct App {
     discord: Option<crate::discord::Discord>,
     discord_enabled: bool,
     /// Last state sent to Discord, to send only real changes.
-    discord_sent: Option<crate::discord::Presence>,
+    discord_sent: Option<crate::discord::Card>,
+    /// How the card looks: Settings › Connections › Discord.
+    discord_prefs: crate::discord::Prefs,
+    /// Artists' pictures for the card's badge, by artist id; `None` while asked or when
+    /// there's none.
+    artist_pics: HashMap<String, Option<crate::discord::Badge>>,
     /// Local WebSocket for a Stream Deck plugin. Off until Connections enables it.
     remote: crate::remote::Remote,
     remote_enabled: bool,
@@ -365,9 +414,14 @@ pub struct App {
     page: Page,
     /// Settings › General › Window › Open on: the page the app starts on.
     start_page: Page,
-    back: Vec<Page>,
-    forward: Vec<Page>,
+    back: Vec<navigation::Visit>,
+    forward: Vec<navigation::Visit>,
+    active_visit: navigation::Visit,
     page_changed: f64,
+    /// Signed entry distance for forward/back navigation and the fraction still to travel.
+    page_entry: f32,
+    navigation: navigation::Navigation,
+    page_remaining: f32,
     /// Room the page leaves at its top and bottom for glass it scrolls under.
     page_insets: [f32; 2],
     /// When a video's picture last went to the background, and the cover to go back to.
@@ -428,8 +482,8 @@ pub struct App {
     /// Files chosen in the upload dialog, handed over from its thread.
     picked_uploads: Arc<std::sync::Mutex<Option<Vec<std::path::PathBuf>>>>,
     liked: HashSet<String>,
-    /// Songs whose unlike is queued and hasn't gone through yet.
-    unliking: HashMap<String, Track>,
+    ratings: ratings::Ratings,
+    rating_settings: ratings::Settings,
     selection: Selection,
     find: find::ListFind,
     account_name: Option<String>,
@@ -442,17 +496,20 @@ pub struct App {
     switching_to: Option<String>,
     /// Last launch's playlists, shown in the sidebar until the library arrives.
     sidebar_cache: Option<Vec<Card>>,
+    /// Playlists kept at the top of the sidebar and Library › Playlists, last pinned first.
+    pinned: Vec<String>,
 
     // playback
     queue: Queue,
     generation: u64,
+    /// Deliberate track starts and restarts, independent of stream retries and resumes.
+    bar_track_epoch: u64,
     buffering: bool,
     /// Unplayable songs skipped in a row; a run of them stops playback instead of
     /// racing through the queue.
     skip_streak: u32,
     /// Times the current song was reopened after its download failed.
     recoveries: u32,
-    recovery_at: Option<Duration>,
     autoplay: bool,
     /// The level volume normalization brings songs to.
     normalize: crate::audio::Normalize,
@@ -480,6 +537,9 @@ pub struct App {
     animated_covers: bool,
     /// The song's animated cover: looked up, then playing.
     cover_clip: Option<nowplaying::CoverClip>,
+    /// The colours of the animated cover's first frame (and its song's): the accent and
+    /// background while it's on screen.
+    clip_art: Option<(String, crate::art::Art)>,
     hide_search_videos: bool,
     /// Leave explicit songs out of lists and the queue.
     hide_explicit: bool,
@@ -499,7 +559,9 @@ pub struct App {
     /// connected), and the devices last listed there.
     output_device: Option<(String, String)>,
     output_devices: Vec<crate::audio::OutputDevice>,
-    radio_pending: bool,
+    /// The language picked in Settings (`None`: the system's), saved; this run shows
+    /// [`crate::i18n::current`] until the next start.
+    language: Option<String>,
     /// The last song ended with nothing after it: radio carries on from there.
     ended: bool,
     seek_drag: Option<f32>,
@@ -510,7 +572,6 @@ pub struct App {
     art_brightness: f32,
     accent: Color32,
     /// Selected theme (see `preset.rs`).
-    theme_id: String,
     /// Preset whose chrome (glass, corner radius) is installed in the egui style.
     chrome_applied: Option<String>,
     /// Light or dark pages (the ytm-rs theme's; see `light_pages`).
@@ -523,6 +584,10 @@ pub struct App {
     /// Panels frost what's behind them, in themes that have them do so.
     glass_on: bool,
     reactive_bg: bool,
+    /// Bright album art is darkened behind now playing and the pages, for the text over it.
+    dim_bright: bool,
+    /// The progress line's knob shown all the time, not only on hover.
+    seek_knob_always: bool,
     /// Skip the parts of music videos SponsorBlock marks as not music.
     sponsorblock: bool,
     /// Crossfade between songs, and over how many seconds.
@@ -534,6 +599,8 @@ pub struct App {
     eq_on: bool,
     eq_gains: crate::audio::eq::Gains,
     eq_no_clip: bool,
+    /// Crossfeed, mono and balance.
+    stereo: crate::audio::stereo::Settings,
     /// Playback speed: whether it's on (saved, and it puts a button in the player bar),
     /// and the speed (not saved: 1× each launch).
     tempo_on: bool,
@@ -565,11 +632,14 @@ pub struct App {
     np_open: bool,
     np_tab: NpTab,
     queue_open: bool,
+    /// Where the queue floats over the page in a narrow window, as last drawn.
+    queue_float: Option<egui::Rect>,
     /// A song row being dragged.
     row_drag: Option<row_drag::RowDrag>,
     /// Settings: the category on show, and what its search box is looking for.
     settings_tab: pages::SettingsTab,
     settings_query: String,
+    palette: palette::Palette,
     fullscreen: bool,
     /// Full screen is the video alone, its controls showing while the pointer moves.
     video_full: bool,
@@ -583,6 +653,12 @@ pub struct App {
     extras_asked: Option<(String, String, String)>,
     show_roman: bool,
     show_trans: bool,
+    /// Lines move on quickly, the extension's way, whatever the theme's timing.
+    quick_lyric_scroll: bool,
+    /// Synced lyrics animate at the screen's refresh rate rather than 60 fps.
+    lyrics_full_rate: bool,
+    /// The last frame's lyrics asked for the next at the screen's rate: `frame_pace` doesn't hold it.
+    full_rate_frame: bool,
     lyric_prefs: lyric_prefs::Prefs,
     lyric_view: karaoke::View,
     lyric_clock: lyric_prefs::Clock,
@@ -598,9 +674,14 @@ pub struct App {
     jam: jam::Session,
     signing_in: Arc<AtomicBool>,
     toast: Option<(String, f64)>,
+    toast_after_unlike: Option<String>,
+    /// What the toast up now can undo.
+    undo: Option<undo::Undo>,
 
     // updates
     updater: Option<crate::update::Updater>,
+    /// The cache Settings › Storage measures and clears.
+    storage: crate::cache::Storage,
     auto_update: bool,
     /// Updates from the nightly channel rather than stable.
     update_nightly: bool,
@@ -694,6 +775,9 @@ impl App {
         storage: Option<&dyn eframe::Storage>,
     ) -> Self {
         let get = |k: &str| storage.and_then(|s| s.get_string(k));
+        let language = get("language").filter(|l| !l.is_empty());
+        // Before anything is drawn: the language is this run's.
+        crate::i18n::init(language.as_deref());
         // Dev hook: YTM_FONT=<font name> tries a font without saving it.
         theme::set_font_choice(&dev_var("YTM_FONT").map(str::to_owned).or_else(|| get("font")).unwrap_or_default());
         let discord_enabled = get("discord_enabled").is_none_or(|v| v == "1");
@@ -742,6 +826,8 @@ impl App {
             discord: discord_enabled.then(crate::discord::Discord::spawn).flatten(),
             discord_enabled,
             discord_sent: None,
+            discord_prefs: get("discord").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+            artist_pics: HashMap::new(),
             remote: crate::remote::Remote::new(),
             remote_enabled,
             lastfm_user: crate::lastfm::user(),
@@ -766,7 +852,11 @@ impl App {
             start_page: start_choice,
             back: Vec::new(),
             forward: Vec::new(),
+            active_visit: navigation::Visit::initial(),
             page_changed: 0.0,
+            page_entry: 1.0,
+            navigation: navigation::Navigation::default(),
+            page_remaining: 0.0,
             page_insets: [0.0, 0.0],
             page_scrolled: 0.0,
             video_art_at: 0.0,
@@ -800,7 +890,8 @@ impl App {
             all_downloaded: HashMap::new(),
             picked_uploads: Default::default(),
             liked: HashSet::new(),
-            unliking: HashMap::new(),
+            ratings: Default::default(),
+            rating_settings: ratings::Settings::load(get),
             selection: Selection::default(),
             find: Default::default(),
             account_name: None,
@@ -809,16 +900,17 @@ impl App {
             channels_asked: None,
             switching_to: None,
             sidebar_cache: None,
+            pinned: get("pinned_playlists").and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default(),
             queue: Queue::new(match get("repeat").as_deref() {
                 Some("all") => Repeat::All,
                 Some("one") => Repeat::One,
                 _ => Repeat::Off,
             }),
             generation: 0,
+            bar_track_epoch: 0,
             buffering: false,
             skip_streak: 0,
             recoveries: 0,
-            recovery_at: None,
             autoplay: get("autoplay").is_none_or(|v| v == "1"),
             normalize: get("normalize").map_or_else(Default::default, |v| crate::audio::Normalize::from_key(&v)),
             log_volume: get("log_volume").is_none_or(|v| v == "1"),
@@ -835,6 +927,7 @@ impl App {
             glow: None,
             animated_covers: std::env::var_os("YTM_CANVAS").is_some() || get("animated_covers").is_some_and(|v| v == "1"),
             cover_clip: None,
+            clip_art: None,
             hide_search_videos: get("hide_search_videos").is_some_and(|v| v == "1"),
             hide_explicit,
             show_podcasts,
@@ -844,7 +937,9 @@ impl App {
             music_videos: Default::default(),
             output_device: get("output_device").filter(|d| !d.is_empty()).map(|id| (id, get("output_device_name").unwrap_or_default())),
             output_devices: Vec::new(),
+            language,
             updater: None,
+            storage: Default::default(),
             auto_update: get("auto_update").is_none_or(|v| v == "1"),
             // A nightly build stays on nightlies until told otherwise.
             update_nightly: get("update_channel").map_or_else(|| crate::update::is_nightly(&crate::update::build_version()), |v| v == "nightly"),
@@ -886,16 +981,12 @@ impl App {
             proxy_test: Default::default(),
             restart_app: false,
             media_cover: Default::default(),
-            radio_pending: false,
             ended: false,
             seek_drag: None,
             art_key: None,
             art_changed: -10.0,
             art_brightness: 0.0,
             accent: theme::RED,
-            // Dev hook: YTM_THEME=<preset id> tries a theme without saving it.
-            // The old "Classic theme" switch is the Classic theme now.
-            theme_id: std::env::var("YTM_THEME").ok().or_else(|| get("default_theme").filter(|v| v == "1").map(|_| "classic".to_owned())).or_else(|| get("theme")).unwrap_or_else(|| crate::preset::DEFAULT_ID.to_owned()),
             chrome_applied: None,
             // Dev hook: YTM_APPEARANCE=light|dark|system tries a mode without saving it.
             appearance: theme::Appearance::from_key(&dev_var("YTM_APPEARANCE").map(str::to_owned).or_else(|| get("appearance")).unwrap_or_default()),
@@ -904,6 +995,8 @@ impl App {
             anim_bg: get("anim_bg").is_none_or(|v| v == "1"),
             glass_on: get("glass_on").is_none_or(|v| v == "1"),
             reactive_bg: get("reactive_bg").is_none_or(|v| v == "1"),
+            dim_bright: get("dim_bright").is_none_or(|v| v == "1"),
+            seek_knob_always: get("seek_knob_always").is_some_and(|v| v == "1"),
             sponsorblock: get("sponsorblock").is_some_and(|v| v == "1"),
             crossfade: get("crossfade").is_some_and(|v| v == "1"),
             handoff: false,
@@ -912,6 +1005,11 @@ impl App {
             eq_on: get("eq").is_some_and(|v| v == "1"),
             eq_gains: get("eq_gains").and_then(|v| parse_gains(&v)).unwrap_or_default(),
             eq_no_clip: get("eq_no_clip").is_none_or(|v| v == "1"),
+            stereo: crate::audio::stereo::Settings {
+                crossfeed: get("crossfeed").map(|v| crate::audio::stereo::Crossfeed::from_key(&v)).unwrap_or_default(),
+                mono: get("mono").is_some_and(|v| v == "1"),
+                balance: get("balance").and_then(|v| v.parse::<i8>().ok()).unwrap_or(0).clamp(-100, 100),
+            },
             tempo_on: get("tempo").is_some_and(|v| v == "1"),
             speed: 1.0,
             segments: None,
@@ -928,9 +1026,11 @@ impl App {
             np_open: false,
             np_tab: if get("np_art").is_some_and(|v| v == "1") { NpTab::Art } else { NpTab::Lyrics },
             queue_open: false,
+            queue_float: None,
             row_drag: None,
             settings_tab: Default::default(),
             settings_query: String::new(),
+            palette: Default::default(),
             // Dev hook: the full screen layout, leaving the window where it is.
             fullscreen: dev_var("YTM_FAKE_FULLSCREEN").is_some(),
             video_full: false,
@@ -940,6 +1040,9 @@ impl App {
             extras_asked: None,
             show_roman: get("show_roman").is_none_or(|v| v == "1"),
             show_trans: get("show_trans").is_none_or(|v| v == "1"),
+            quick_lyric_scroll: get("quick_lyric_scroll").is_some_and(|v| v == "1"),
+            lyrics_full_rate: get("lyrics_full_rate").is_some_and(|v| v == "1"),
+            full_rate_frame: false,
             lyric_prefs: lyric_prefs::Prefs::load(&get),
             lyric_view: Default::default(),
             lyric_clock: Default::default(),
@@ -950,6 +1053,8 @@ impl App {
             xfer: Default::default(),
             jam: Default::default(),
             toast: None,
+            toast_after_unlike: None,
+            undo: None,
             actions: Vec::new(),
             dialog: None,
             share_pending: None,
@@ -1004,9 +1109,9 @@ impl App {
             Ok(p) if p.starts_with("search:") => app.go(Page::Search(p[7..].to_owned())),
             _ => {}
         }
-        // YTM_UPLOAD=<file> uploads that file as if it had been picked.
-        if let Some(f) = std::env::var_os("YTM_UPLOAD") {
-            *app.picked_uploads.lock().unwrap() = Some(vec![f.into()]);
+        // YTM_UPLOAD=<file>[|<file>…] uploads those files as if they had been picked together.
+        if let Some(f) = std::env::var("YTM_UPLOAD").ok().filter(|f| !f.is_empty()) {
+            *app.picked_uploads.lock().unwrap() = Some(f.split('|').map(Into::into).collect());
         }
         // Dev hook: YTM_PROXY_INPUT=<address> opens Settings › Network on Custom with it typed in.
         if let Some(v) = dev_var("YTM_PROXY_INPUT") {
@@ -1050,12 +1155,50 @@ impl App {
         app.audio.set_normalize(app.normalize);
         app.set_crossfade();
         app.set_eq();
+        app.audio.set_stereo(app.stereo);
         app
     }
 
     // ---------------------------------------------------------------- navigation
 
     fn go(&mut self, page: Page) {
+        self.go_from(page, false);
+    }
+
+    fn sidebar_playlists(&self) -> Option<&[crate::model::Card]> {
+        self.library.as_ref().map(|l| l.playlists.as_slice()).or(self.sidebar_cache.as_deref())
+    }
+
+    fn current_visit(&self) -> navigation::Visit {
+        // Library tabs change the current page in place rather than pushing history.
+        let mut visit = self.active_visit.clone();
+        visit.page = self.page.clone();
+        visit
+    }
+
+    fn take_visit(&mut self, visit: navigation::Visit, intent: navigation::Route) -> navigation::Visit {
+        let previous = self.current_visit();
+        let stacked = self.look().app.stacked_navigation;
+        let order = if stacked && intent != navigation::Route::Plain {
+            self.sidebar_playlists().map(|cards| {
+                collections::pinned_first(&self.pinned, cards, 0..cards.len()).into_iter().filter_map(|i| {
+                    if let crate::model::Target::Playlist(id) = &cards[i].target { Some(id.clone()) } else { None }
+                }).collect::<Vec<_>>()
+            }).unwrap_or_default()
+        } else { Vec::new() };
+        self.navigation.route(&previous, &visit, stacked, intent, |page| {
+            if let Page::Playlist(id) = page { order.iter().position(|item| item == id) } else { None }
+        });
+        self.page = visit.page.clone();
+        self.active_visit = visit;
+        previous
+    }
+
+    fn go_from(&mut self, page: Page, via_sidebar: bool) {
+        self.go_with_cover(page, via_sidebar, None);
+    }
+
+    fn go_with_cover(&mut self, page: Page, via_sidebar: bool, cover: Option<navigation::CoverOrigin>) {
         // An episode's show stands where a song's artist does; it opens as the playlist it is.
         let page = match page {
             Page::Artist(id) if crate::ytm::list_id(&id) != id => Page::Playlist(id),
@@ -1063,11 +1206,20 @@ impl App {
         };
         self.np_open = false;
         if page == self.page {
+            if via_sidebar && !self.active_visit.via_sidebar && matches!(page, Page::Playlist(_)) {
+                let mut visit = self.current_visit();
+                visit.via_sidebar = true;
+                self.take_visit(visit, navigation::Route::Sidebar);
+            }
             // Clicking the page you're on refreshes it.
             self.refresh();
             return;
         }
-        let prev = std::mem::replace(&mut self.page, page);
+        let intent = if via_sidebar { navigation::Route::Sidebar } else { navigation::Route::Plain };
+        let from = self.current_visit();
+        let stacked = self.look().app.stacked_navigation;
+        let visit = self.navigation.new_visit(&from, page, intent, cover, stacked);
+        let prev = self.take_visit(visit, intent);
         self.back.push(prev);
         self.forward.clear();
         self.page_loaded();
@@ -1077,16 +1229,26 @@ impl App {
         if self.np_open {
             self.np_open = false;
         } else if let Some(p) = self.back.pop() {
-            self.forward.push(std::mem::replace(&mut self.page, p));
-            self.page_loaded();
+            let previous = self.take_visit(p, navigation::Route::Back);
+            self.forward.push(previous);
+            self.history_page_loaded(true);
         }
     }
 
     fn nav_forward(&mut self) {
         if let Some(p) = self.forward.pop() {
-            self.back.push(std::mem::replace(&mut self.page, p));
-            self.page_loaded();
+            let previous = self.take_visit(p, navigation::Route::Forward);
+            self.back.push(previous);
+            self.history_page_loaded(false);
         }
+    }
+
+    fn history_page_loaded(&mut self, back: bool) {
+        // A reversal only retraces the distance already travelled.
+        let distance = if self.page_entry.is_sign_negative() != back { 1.0 - self.page_remaining } else { 1.0 };
+        self.page_loaded();
+        self.page_entry = if back { -distance } else { distance };
+        self.page_remaining = distance;
     }
 
     /// Reload the current page's data in place: no page transition, the page stays as
@@ -1108,15 +1270,17 @@ impl App {
                 _ => {}
             }
         }
-        let changed = self.page_changed;
+        let motion = (self.page_changed, self.page_entry, self.page_remaining);
         self.page_loaded();
-        self.page_changed = changed;
+        (self.page_changed, self.page_entry, self.page_remaining) = motion;
     }
 
     /// Start the page transition and (re)load the page's data. Every page refreshes on
     /// each visit (things change outside the app: likes, other devices, new releases),
     /// showing the cached copy meanwhile.
     fn page_loaded(&mut self) {
+        self.page_entry = 1.0;
+        self.page_remaining = 1.0;
         self.page_changed = -1.0; // stamped with the frame time on the next pass
         // The search box holds the query of the search page you're on, and is empty elsewhere.
         self.search_text = match &self.page {
@@ -1246,6 +1410,12 @@ impl App {
         if theme::light() { theme::deepen(c, theme::bg(), 3.0) } else { c }
     }
 
+    fn progress_color(&self, track_alpha: f32) -> Color32 {
+        let color = &self.look().chrome.progress_color;
+        let c = if color == "white" { theme::text() } else { crate::preset::paint(color, self.accent_color()) };
+        if theme::light() { theme::deepen(c, theme::over(theme::glass(track_alpha), theme::bg()), 3.0) } else { c }
+    }
+
     /// Whether pages draw light: Settings › Appearance › Mode, in any theme.
     fn light_pages(&self, ctx: &egui::Context) -> bool {
         // A theme file's background says which it is.
@@ -1255,25 +1425,52 @@ impl App {
         self.appearance.is_light(ctx)
     }
 
-    /// The active theme. Synced once per frame (`sync_look`), so this is a plain index, not a search.
+    /// The preset shared by the player and its views.
     fn look(&self) -> &'static crate::preset::Preset {
         crate::preset::active()
-    }
-
-    fn sync_look(&self) {
-        if crate::preset::active().id != self.theme_id {
-            crate::preset::set_active(&self.theme_id);
-        }
     }
 
     /// Height of the bottom player area (a floating bar leaves a margin around it).
     /// Back to the cover after a video had the background.
     fn restore_art(&mut self) {
         if self.look().background.video_backdrop
-            && let (Some(bg), Some(art)) = (&self.bg, &self.track_art)
+            && let Some(art) = self.cover_colours().cloned()
+            && let Some(bg) = &self.bg
         {
-            bg.set_live(art.clone());
             self.art_brightness = art.brightness;
+            bg.set_live(art);
+        }
+    }
+
+    /// The colours of the cover on screen: the animated cover's while it's up, else the
+    /// still cover's (when it's the song playing's).
+    fn cover_colours(&self) -> Option<&crate::art::Art> {
+        let id = self.current_id()?;
+        self.cover_clip
+            .as_ref()
+            .filter(|c| c.id == id && c.showing())
+            .and(self.clip_art.as_ref())
+            .filter(|(clip, _)| clip == id)
+            .map(|(_, art)| art)
+            .or_else(|| self.track_art.as_ref().filter(|_| self.art_key.as_deref() == Some(id)))
+    }
+
+    /// The accent and background to [`Self::cover_colours`], crossfading there.
+    fn show_cover_colours(&mut self, now: f64) {
+        let Some(art) = self.cover_colours().cloned() else { return };
+        self.accent = art.accent;
+        self.art_brightness = art.brightness;
+        if let Some(bg) = &self.bg {
+            bg.set_art(art);
+        }
+        self.art_changed = now;
+    }
+
+    /// The animated cover stops (Now playing closed, the window hidden): the colours go
+    /// back to the still cover's if they were its.
+    fn drop_cover_clip(&mut self, now: f64) {
+        if self.cover_clip.take().is_some_and(|c| c.showing() && self.clip_art.as_ref().is_some_and(|(id, _)| *id == c.id)) {
+            self.show_cover_colours(now);
         }
     }
 
@@ -1283,7 +1480,28 @@ impl App {
     }
 
     fn toast(&mut self, msg: impl Into<String>) {
-        self.toast = Some((msg.into(), -1.0));
+        let msg = msg.into();
+        if !self.pending_unlikes().is_empty() {
+            self.toast_after_unlike = Some(msg);
+            return;
+        }
+        self.settle();
+        self.toast_after_unlike = None;
+        self.toast = Some((msg, -1.0));
+    }
+
+    /// How long the toast stays before it fades: long enough to reach its Undo, if it has one.
+    fn toast_hold(&self) -> f32 {
+        let secs = self.look().app.toast_look.secs.max(1.5);
+        if self.undo.is_some() { secs.max(7.0) } else { secs }
+    }
+
+    /// Settings › Storage's Clear cache, once asked. An update that's downloading or
+    /// waiting to install keeps its files.
+    fn clear_cache(&mut self, ctx: &egui::Context) {
+        use crate::update::State;
+        let keep_updates = self.updater.as_ref().is_some_and(|u| matches!(u.state(), State::Downloading { .. } | State::Ready { .. }));
+        self.storage.clear(ctx, self.backend.data_dir(), keep_updates);
     }
 
 
@@ -1306,7 +1524,11 @@ impl eframe::App for App {
         pace::frame(ctx);
         self.lyric_view.release_hidden(ctx.cumulative_pass_nr());
         let now = ctx.input(|i| i.time);
-        self.sync_look();
+        let focused = ctx.input(|i| i.focused);
+        let refocused = focused && !std::mem::replace(&mut self.was_focused, focused);
+        if refocused {
+            self.ratings.refresh_if_stale(now);
+        }
         self.pump(ctx, now);
         // A sorted playlist that loads again in a while, for its new order.
         if let Some(t) = self.sorting.values().filter_map(lists::SortWait::due).reduce(f64::min) {
@@ -1317,6 +1539,8 @@ impl eframe::App for App {
         // System media controls and taskbar buttons follow the player however it changed.
         let playing = self.playing() || self.buffering;
         if let Some(m) = &mut self.media {
+            // Play and pause from the OS skip the frame while they'd do what `toggle` does.
+            m.set_direct(self.queue.index.is_some() && self.resume_at.is_none() && !self.jam.guest());
             // Not for a song shown without loading, while the last one may still be stopping.
             if self.resume_at.is_none() {
                 m.sync_length(self.audio.status.stream_duration(self.generation));
@@ -1356,6 +1580,7 @@ impl eframe::App for App {
         }
         jam::tick(self);
         jam::dev_script(self, ctx, now);
+        self.dev_skip(ctx, now);
         if self.page_changed < 0.0 {
             self.page_changed = now;
         }
@@ -1399,10 +1624,17 @@ impl eframe::App for App {
         self.mini.tick(ctx, now);
         self.tray_window(ctx, frame);
         self.sync_title(ctx);
-        self.window_hidden = self.in_tray || ctx.input(|i| i.viewport().minimized == Some(true));
+        let was_hidden = self.window_hidden;
+        let minimized = ctx.input(|i| i.viewport().minimized);
+        #[cfg(windows)]
+        let minimized = frame.winit_window().and_then(|window| window.is_minimized()).or(minimized);
+        self.window_hidden = self.in_tray || minimized == Some(true);
+        if was_hidden || self.window_hidden {
+            shell::track_particles::clear(ctx);
+        }
         // Nothing takes a video's frames now, while its decoder would go on working in bursts.
         if self.window_hidden || self.mini.busy() {
-            self.cover_clip = None;
+            self.drop_cover_clip(now);
         }
         // Picture in picture goes on with the video, on the way there and back included.
         if (self.window_hidden || (self.mini.busy() && !mini::video_active())) && self.video.take().is_some() {
@@ -1412,10 +1644,10 @@ impl eframe::App for App {
         }
         self.sync_remote(ctx);
         self.sync_tempo();
-        self.sync_discord();
+        self.sync_discord(ctx);
         self.sync_song_notification(ctx);
         self.sync_scrobbles();
-        self.sync_server_queue(ctx, now);
+        self.sync_server_queue(refocused, now);
         self.tick_updates(ctx, now);
         let np = widgets::NowPlaying {
             song: self.current_id().map(str::to_owned),
@@ -1424,17 +1656,33 @@ impl eframe::App for App {
             playing: self.playing() || self.buffering,
         };
         ctx.data_mut(|d| d.insert_temp(widgets::NowPlaying::id(), np));
+        let hold = f64::from(self.toast_hold()) + 0.4;
+        let toast_hovered = !self.window_hidden && shell::toast_hovered(ctx);
         if let Some((_, t)) = &mut self.toast {
             if *t < 0.0 {
                 *t = now;
-            } else if now - *t > 4.5 {
+            } else if toast_hovered && now - *t > 0.25 {
+                // The toast stays available while its Undo is under the pointer.
+                *t = now - 0.25;
+            } else if now - *t > hold {
                 self.toast = None;
             }
+        }
+        if self.toast.is_none() {
+            self.settle();
+            if let Some(msg) = self.toast_after_unlike.take() {
+                self.toast = Some((msg, now));
+                ctx.request_repaint();
+            }
+        } else if self.undo.is_some() {
+            // Its time runs out even with the window hidden, when nothing else draws.
+            ctx.request_repaint_after(Duration::from_secs(1));
         }
         // Frame pacing: idle costs nothing. The background drifts slowly, so ~15 fps
         // reads as smooth on pages; the now-playing view and a page showing the playing
         // row's bars run at 30 fps, and the synced lyrics ask for 60 while they animate
-        // (the karaoke sweep must be smooth). Each egui frame re-lays-out the UI, so frame rate is the main CPU cost.
+        // (the karaoke sweep must be smooth), or the screen's rate with "Lyrics at the
+        // screen's refresh rate" on. Each egui frame re-lays-out the UI, so frame rate is the main CPU cost.
         let playing = self.playing();
         if self.window_hidden {
             // In the tray or minimized: nothing to draw, only the player bookkeeping.
@@ -1456,14 +1704,34 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
+        self.rating_settings.share_unlike_settings(&ctx, self.backend.api().epoch());
         crate::shader::set_glass_on(self.glass_on);
         let now = ctx.input(|i| i.time);
+        self.sync_ratings(&ctx, now);
         let screen = ctx.content_rect();
 
-        self.sync_look();
         let look = self.look();
+        if !look.app.stacked_navigation {
+            self.navigation.cancel_covers();
+        } else if let Some(destination) = self.navigation.cover_destination() {
+            let ready = match destination {
+                Page::Album(id) | Page::Playlist(id) => self.opened(id).is_some(),
+                _ => false,
+            };
+            let failed = self.load_failed && *destination == self.page;
+            self.navigation.cover_loading(ready, failed);
+        }
+        if look.app.stacked_navigation && self.navigation.cover_lands_on(&self.page) {
+            // A short reversal can settle before the ordinary page fade would finish.
+            self.page_entry = 0.0;
+            self.page_remaining = 0.0;
+        }
+        if self.navigation.update(&self.page, now) && look.app.stacked_navigation {
+            ctx.request_repaint();
+        }
         // A spring's overshoot isn't for this: it would say "covered" before it is.
-        let np = theme::anim_bool_timed(&ctx, "np-open", self.np_open && self.current().is_some(), look.app.np_open_secs).min(1.0);
+        let np = theme::anim_bool_timed(&ctx, "np-open", self.np_open && self.current().is_some(), theme::panel_secs(&ctx, look.app.np_open_secs)).min(1.0);
+        let queue = theme::anim_bool(&ctx, "queue-drawer", self.queue_open && !self.np_open, theme::panel_secs(&ctx, 0.25)).min(1.0);
         // The pages keep their mode while now playing slides over them. Now playing is dark;
         // once it's most of the way up, so are the player bar and what opens over it.
         theme::set_file_theme(&ctx, self.file_theme());
@@ -1472,6 +1740,9 @@ impl eframe::App for App {
         theme::set_mode(&ctx, light);
         // The mini player, or nothing but the background while the window changes size.
         let layout = self.mini.layout(&ctx);
+        if self.fullscreen || layout != mini::Layout::Full {
+            shell::track_particles::clear(&ctx);
+        }
         // Only the player bar shows the window's material once the pages are covered.
         crate::backdrop::follow(crate::backdrop::shows() && !self.mini.pill_showing(), light && (np < 1.0 || layout != mini::Layout::Full));
         // The installed fonts arrived: the theme's can be loaded now. Not the first frame,
@@ -1499,8 +1770,9 @@ impl eframe::App for App {
         // Once now playing has slid all the way up it hides everything but the player
         // bar, so the pages and the full-screen background under it aren't drawn.
         let covered = !self.fullscreen && np >= 1.0;
-        let bar_strip = egui::Rect::from_min_max(egui::pos2(screen.left(), screen.bottom() - self.bar_height()), screen.max);
         titlebar::set_fullscreen(&ctx, self.fullscreen);
+        // Mid-switch to or from the mini player, the frame stays as it is.
+        titlebar::sync(&ctx, (layout != mini::Layout::Blank).then_some(layout == mini::Layout::Full));
         dev::dev_memory(&ctx, now);
         dev::dev_probe(&ctx);
         if layout == mini::Layout::Mini && mini::video_active() {
@@ -1518,7 +1790,7 @@ impl eframe::App for App {
             return;
         }
         if layout != mini::Layout::Full {
-            shell::background(self, ui, screen, now, None);
+            shell::background(self, ui, screen, now);
             if layout == mini::Layout::Mini {
                 mini::strip(self, ui, now);
                 titlebar::resize_sides(&ctx);
@@ -1529,25 +1801,27 @@ impl eframe::App for App {
             dev_screenshot(&ctx, now);
             return;
         }
-        // Full-screen now playing paints over all of it.
-        if self.fullscreen && np >= 1.0 {
+        let panel = nowplaying::panel_motion(self, &ctx, now, np);
+        // Now playing all the way up paints over all of it, under the player bar too.
+        if np >= 1.0 {
             // Not drawn, but now playing's own backdrop runs on the same clock.
             shell::background_clock(self, now);
         } else {
-            shell::background(self, ui, screen, now, covered.then_some(bar_strip));
-        }
-        if !self.fullscreen && np >= 0.5 {
-            // What shows around and through the player bar carries on from now playing above it,
-            // from the moment the bar turns dark: a light bar keeps the page under it.
-            let pages = theme::set_mode(&ctx, false);
-            nowplaying::backdrop(self, ui, screen, bar_strip, now, false);
-            theme::set_mode(&ctx, pages);
+            shell::background(self, ui, screen, now);
         }
         if !self.fullscreen && !covered {
             // The top of the window, down to the search box's row: what's on it comes after.
             titlebar::drag_area(ui, egui::Rect::from_min_size(screen.min, egui::vec2(screen.width(), titlebar::HEIGHT)), "main");
         }
         let mut floating_slot = None;
+        // While now playing is up or on its way, it's one sheet over the whole window, the
+        // part under the player bar included. The bar then goes on a layer of its own, kept
+        // just above it, so the sheet slides up behind the bar instead of over it.
+        let over_np = (!self.fullscreen && np > 0.001).then(|| {
+            let bar = egui::LayerId::new(egui::Order::Middle, egui::Id::unique("player-bar"));
+            ctx.set_sublayer(nowplaying::layer(), bar);
+            bar
+        });
         if !self.fullscreen {
             let pages = theme::set_mode(&ctx, bar_light);
             let floating = look.chrome.player_bar == crate::preset::PlayerBar::Floating;
@@ -1568,7 +1842,8 @@ impl eframe::App for App {
             };
             egui::Panel::bottom("player").resizable(false)
                 .exact_size(self.bar_height())
-                .frame(frame)
+                // Over now playing its fill goes on the bar's own layer, with the rest of it.
+                .frame(if over_np.is_some() && !floating { egui::Frame::new() } else { frame })
                 .show_separator_line(false)
                 .show(ui, |ui| {
                     if bar_light != light {
@@ -1579,17 +1854,29 @@ impl eframe::App for App {
                         floating_slot = Some(ui.max_rect());
                         return;
                     }
-                    shell::player_bar(self, ui, now)
+                    match over_np {
+                        Some(layer) => {
+                            let r = ui.max_rect();
+                            let mut bar = ui.new_child(egui::UiBuilder::new().layer_id(layer).max_rect(r));
+                            bar.painter().add(frame.paint(r));
+                            bar_layer_state(&ctx, layer, r);
+                            shell::player_bar(self, &mut bar, now, np, queue, panel)
+                        }
+                        None => shell::player_bar(self, ui, now, np, queue, panel),
+                    }
                 });
             theme::set_mode(&ctx, pages);
         }
+        self.queue_float = None;
         if !self.fullscreen && !covered {
             use crate::preset::SidebarStyle;
             let side_alpha = app_style.sidebar_alpha.clamp(0.0, 1.0);
             // Clear over the top of a page, filling in as it scrolls.
             let side_alpha = if app_style.nav_item.scroll_fill { side_alpha * (self.page_scrolled / 40.0).clamp(0.0, 1.0) } else { side_alpha };
             // The logo's row is 32 points tall.
-            let side_margin = egui::Margin { left: 14, right: 14, top: titlebar::top_margin(16, 32.0), bottom: 16 };
+            // On macOS it starts below the traffic lights, which have the top row to themselves.
+            let below = titlebar::below_lights(&ctx) as i8;
+            let side_margin = egui::Margin { left: 14, right: 14, top: titlebar::top_margin(16, 32.0) + below, bottom: 16 };
             let border = egui::Stroke::new(if app_style.sidebar_border > 0.0 { 1.0 } else { 0.0 }, theme::glass(app_style.sidebar_border));
             let side_frame = match app_style.sidebar {
                 SidebarStyle::Glass => egui::Frame::new().fill(theme::panel(side_alpha)).inner_margin(side_margin),
@@ -1599,7 +1886,7 @@ impl eframe::App for App {
                     .fill(theme::panel(side_alpha.max(0.3)))
                     .stroke(egui::Stroke::new(1.0, theme::glass_panel(0.08)))
                     .corner_radius(egui::CornerRadius::same(theme::panel_radius().max(12)))
-                    .outer_margin(egui::Margin { left: 10, right: 4, top: 10, bottom: 10 })
+                    .outer_margin(egui::Margin { left: 10, right: 4, top: 10 + below, bottom: 10 })
                     .inner_margin(egui::Margin::symmetric(12, 14)),
             };
             egui::Panel::left("nav").resizable(false)
@@ -1617,11 +1904,16 @@ impl eframe::App for App {
                     }
                     shell::sidebar(self, ui)
                 });
-            let q = theme::anim_bool(&ctx, "queue-drawer", self.queue_open && !self.np_open, 0.25).min(1.0);
-            if q > 0.01 && screen.width() < 1000.0 {
+            if queue > 0.01 && screen.width() < 1000.0 {
                 // No room to give it without crushing the page: it floats over that instead.
-                let r = egui::Rect::from_min_size(egui::pos2(screen.right() - 340.0 * q, screen.top()), egui::vec2(340.0, screen.height() - self.bar_height()));
-                egui::Area::new(egui::Id::unique("queue-float")).order(egui::Order::Middle).fixed_pos(r.min).show(&ctx, |ui| {
+                let r = egui::Rect::from_min_size(egui::pos2(screen.right() - 340.0 * queue, screen.top()), egui::vec2(340.0, screen.height() - self.bar_height()));
+                self.queue_float = Some(r);
+                egui::Area::new(egui::Id::unique("queue-float")).order(egui::Order::Middle).fixed_pos(r.min).fade_in(false).show(&ctx, |ui| {
+                    if ui.is_sizing_pass() {
+                        ui.set_min_size(r.size());
+                        ctx.request_discard("size the floating queue");
+                        return;
+                    }
                     ui.allocate_rect(r, egui::Sense::click_and_drag());
                     ui.painter().rect_filled(r, 0.0, theme::panel(0.94));
                     // Its top is still the window's top: the window moves by it, around the heading.
@@ -1630,28 +1922,30 @@ impl eframe::App for App {
                     inner.set_clip_rect(r);
                     shell::queue_drawer(self, &mut inner);
                 });
-            } else if q > 0.01 {
+            } else if queue > 0.01 {
                 egui::Panel::right("queue").resizable(false)
-                    .exact_size(340.0 * q)
+                    .exact_size(340.0 * queue)
                     .frame(egui::Frame::new().fill(theme::panel(0.42)).inner_margin(egui::Margin::symmetric(14, 16)))
                     .show_separator_line(false)
                     .show(ui, |ui| shell::queue_drawer(self, ui));
             }
             let sheet = app_style.sheet.map_or((Color32::TRANSPARENT, 0), |[a, r]| (theme::glass(a), r as u8));
+            // At high zoom the window buttons and search may need separate rows.
+            let top_margin = if titlebar::buttons_rect(&ctx).is_some_and(|b| b.left() - ui.available_rect_before_wrap().left() < 28.0 + 40.0 + 16.0 + 100.0 + 60.0) {
+                titlebar::HEIGHT as i8 + 6
+            } else { titlebar::top_margin(14, 42.0) };
             egui::CentralPanel::default()
-                .frame(egui::Frame::new().fill(sheet.0).corner_radius(egui::CornerRadius { nw: sheet.1, ne: 0, sw: 0, se: 0 }).inner_margin(egui::Margin { left: 28, right: 0, top: titlebar::top_margin(14, 42.0), bottom: 0 }))
+                .frame(egui::Frame::new().fill(sheet.0).corner_radius(egui::CornerRadius { nw: sheet.1, ne: 0, sw: 0, se: 0 }).inner_margin(egui::Margin { left: 28, right: 0, top: top_margin, bottom: 0 }))
                 .show(ui, |ui| {
                     let glass = crate::shader::glass_ready() && !light;
                     let under_top = glass && app_style.glass.top_bar.is_some();
                     let under_bar = glass && app_style.glass.bar.is_some() && floating_slot.is_some();
-                    // The page is one place in either arrangement, so where it's scrolled to (and
-                    // the rest of what it remembers) stays when a theme switches between them.
-                    let page_id = egui::Id::unique("main-page");
                     if !under_top && !under_bar {
                         self.page_insets = [0.0, 0.0];
                         shell::top_bar(self, ui);
                         ui.add_space(6.0);
-                        ui.scope_builder(egui::UiBuilder::new().scope_id(page_id), |ui| pages::page(self, ui, now));
+                        let bounds = ui.available_rect_before_wrap();
+                        pages::page(self, ui, now, bounds);
                         return;
                     }
                     // The page first, running under the glass, then what's over it.
@@ -1661,9 +1955,7 @@ impl eframe::App for App {
                     let bottom = if under_bar { screen.bottom() } else { panel.bottom() };
                     let page_rect = egui::Rect::from_min_max(egui::pos2(panel.left(), top), egui::pos2(panel.right(), bottom));
                     self.page_insets = [if under_top { panel.top() + row_h - screen.top() } else { 0.0 }, if under_bar { self.bar_height() } else { 0.0 }];
-                    let mut page_ui = ui.new_child(egui::UiBuilder::new().scope_id(page_id).max_rect(page_rect));
-                    page_ui.set_clip_rect(page_rect);
-                    pages::page(self, &mut page_ui, now);
+                    pages::page(self, ui, now, page_rect);
                     if under_top {
                         // Dragging the window still works over what's scrolled up there.
                         titlebar::drag_area(ui, egui::Rect::from_min_size(screen.min, egui::vec2(screen.width(), titlebar::HEIGHT)), "main-over");
@@ -1674,26 +1966,34 @@ impl eframe::App for App {
                 });
         }
         if let Some(r) = floating_slot {
-            let mut bar = ui.new_child(egui::UiBuilder::new().max_rect(r));
+            let mut builder = egui::UiBuilder::new().max_rect(r);
+            if let Some(layer) = over_np {
+                builder = builder.layer_id(layer);
+                bar_layer_state(&ctx, layer, shell::floating_rect(self.look(), r));
+            }
+            let mut bar = ui.new_child(builder);
             bar.set_clip_rect(screen);
             let pages = theme::set_mode(&ctx, bar_light);
             if bar_light != light {
                 bar.style_mut().visuals = ctx.global_style().visuals.clone();
             }
-            shell::floating_bar(self, &mut bar, r, now);
+            shell::floating_bar(self, &mut bar, r, now, np, queue, panel);
             theme::set_mode(&ctx, pages);
         }
         if np > 0.001 {
             theme::set_mode(&ctx, false);
-            nowplaying::overlay(self, &ctx, now);
-        } else if self.cover_clip.take().is_some() || self.video.take().is_some() {
+            nowplaying::overlay(self, &ctx, now, np, panel);
+        } else if self.cover_clip.is_some() || self.video.is_some() {
             // Now playing's closed, and its own cleanup only runs while it's drawn.
+            self.drop_cover_clip(now);
+            self.video = None;
             self.video_frame = None;
             self.glow = None;
             self.restore_art();
         }
         theme::set_mode(&ctx, bar_light);
         self.draw_dialog(&ctx);
+        palette::show(self, &ctx);
         hotkeys::capture_dialog(self, &ctx);
         notes::card(self, &ctx);
         notes::dialog(self, &ctx);
@@ -1706,11 +2006,7 @@ impl eframe::App for App {
         // Back from the mini player.
         self.mini.fade_in(&ctx, now, shell::base_color(self));
 
-        if dev_var("YTM_THEME_TOUR").is_some() {
-            self.theme_tour(&ctx, now);
-        } else {
-            dev_screenshot(&ctx, now);
-        }
+        dev_screenshot(&ctx, now);
         // Next frame's root starts from the pages' mode.
         theme::set_mode(&ctx, light);
     }
@@ -1750,7 +2046,7 @@ impl eframe::App for App {
         if self.wheel.filter(&mut raw.events, raw.time.unwrap_or(0.0), raw.predicted_dt, viewport_h) {
             ctx.request_repaint();
         }
-        frame_pace(raw);
+        frame_pace(raw, std::mem::take(&mut self.full_rate_frame));
         if let Some((x, y)) = dev_var("YTM_FAKE_POINTER").and_then(|v| {
             let (x, y) = v.split_once(',')?;
             Some((x.trim().parse::<f32>().ok()?, y.trim().parse::<f32>().ok()?))
@@ -1799,7 +2095,9 @@ impl eframe::App for App {
         storage.set_string("animated_covers", b(self.animated_covers));
         storage.set_string("hide_search_videos", b(self.hide_search_videos));
         storage.set_string("hide_explicit", b(self.hide_explicit));
+        self.rating_settings.save(storage);
         storage.set_string("list_sorts", serde_json::to_string(&self.find.sorts).unwrap_or_default());
+        storage.set_string("pinned_playlists", serde_json::to_string(&self.pinned).unwrap_or_default());
         storage.set_string("podcasts", b(self.show_podcasts));
         storage.set_string("comments", b(self.show_comments));
         storage.set_string("restricted_mode", b(self.restricted_mode));
@@ -1808,6 +2106,7 @@ impl eframe::App for App {
         let (device, device_name) = self.output_device.clone().unzip();
         storage.set_string("output_device", device.unwrap_or_default());
         storage.set_string("output_device_name", device_name.unwrap_or_default());
+        storage.set_string("language", self.language.clone().unwrap_or_default());
         storage.set_string("auto_update", b(self.auto_update));
         storage.set_string("update_channel", if self.update_nightly { "nightly" } else { "stable" }.to_owned());
         // eframe has just saved the window's geometry. Minimized or in the tray that's
@@ -1838,15 +2137,15 @@ impl eframe::App for App {
             storage.set_string("update_seen", v.clone());
         }
         storage.set_string("discord_enabled", b(self.discord_enabled));
+        storage.set_string("discord", serde_json::to_string(&self.discord_prefs).unwrap_or_default());
         storage.set_string("remote_enabled", b(self.remote_enabled));
         storage.set_string("default_theme", b(false));
         if dev_var("YTM_APPEARANCE").is_none() {
             storage.set_string("appearance", self.appearance.key().to_owned());
             storage.set_string("custom_accent", self.accent_source.key());
         }
-        if std::env::var_os("YTM_THEME").is_none() {
-            storage.set_string("theme", self.theme_id.clone());
-        }
+        // Keep the saved choice compatible with older portable builds.
+        storage.set_string("theme", crate::preset::DEFAULT_ID.to_owned());
         if dev_var("YTM_FONT").is_none() {
             storage.set_string("font", theme::font_choice());
         }
@@ -1854,6 +2153,8 @@ impl eframe::App for App {
         storage.set_string("anim_bg", b(self.anim_bg));
         storage.set_string("glass_on", b(self.glass_on));
         storage.set_string("reactive_bg", b(self.reactive_bg));
+        storage.set_string("dim_bright", b(self.dim_bright));
+        storage.set_string("seek_knob_always", b(self.seek_knob_always));
         storage.set_string("sponsorblock", b(self.sponsorblock));
         storage.set_string("crossfade", b(self.crossfade));
         storage.set_string("crossfade_secs", self.crossfade_secs.to_string());
@@ -1861,9 +2162,14 @@ impl eframe::App for App {
         storage.set_string("eq", b(self.eq_on));
         storage.set_string("eq_gains", self.eq_gains.map(|g| g.to_string()).join(","));
         storage.set_string("eq_no_clip", b(self.eq_no_clip));
+        storage.set_string("crossfeed", self.stereo.crossfeed.key().to_owned());
+        storage.set_string("mono", b(self.stereo.mono));
+        storage.set_string("balance", self.stereo.balance.to_string());
         storage.set_string("tempo", b(self.tempo_on));
         storage.set_string("show_roman", b(self.show_roman));
         storage.set_string("show_trans", b(self.show_trans));
+        storage.set_string("quick_lyric_scroll", b(self.quick_lyric_scroll));
+        storage.set_string("lyrics_full_rate", b(self.lyrics_full_rate));
         // Background test runs mustn't change the listener's sources or per-song picks.
         if std::env::var_os("YTM_BACKGROUND").is_none() || std::env::var_os("YTM_SAVE_SESSION").is_some() {
             self.lyric_prefs.save(storage);
@@ -1877,6 +2183,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        self.settle_now();
         if let (Some(bg), Some(gl)) = (&self.bg, gl) {
             bg.destroy(gl);
             crate::shader::destroy_glass(gl);
@@ -1903,12 +2210,13 @@ const VIDEO_QUALITIES: [u32; 4] = [1080, 720, 480, 360];
 
 /// The pointer moving wakes a frame per event, up to the monitor's rate, and each of those
 /// asks for more: frames wait for 60 fps unless the listener is doing something that wants
-/// every frame (clicking, typing, scrolling).
-fn frame_pace(raw: &egui::RawInput) {
+/// every frame (clicking, typing, scrolling), or the lyrics run at the screen's rate.
+fn frame_pace(raw: &egui::RawInput, full_rate: bool) {
     use egui::Event as E;
     static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
     let mut last = LAST.lock().unwrap();
-    let acting = raw.events.iter().any(|e| matches!(e, E::PointerButton { .. } | E::MouseWheel { .. } | E::Key { .. } | E::Text(_) | E::Ime(_) | E::Zoom(_) | E::Touch { .. }));
+    let acting = full_rate
+        || raw.events.iter().any(|e| matches!(e, E::PointerButton { .. } | E::MouseWheel { .. } | E::Key { .. } | E::Text(_) | E::Ime(_) | E::Zoom(_) | E::Touch { .. }));
     if !acting && let Some(wait) = last.and_then(|l| Duration::from_millis(16).checked_sub(l.elapsed())) {
         std::thread::sleep(wait);
     }
@@ -2040,20 +2348,6 @@ fn too_big(size: egui::Vec2, monitor: egui::Vec2) -> bool {
     size.x > monitor.x + 24.0 || size.y > monitor.y + 24.0
 }
 
-/// Fisher-Yates with a clock-seeded xorshift; shuffling doesn't need a real RNG crate.
-pub fn shuffle<T>(v: &mut [T]) {
-    let mut x = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0x9e37_79b9_7f4a_7c15, |d| d.as_nanos() as u64)
-        | 1;
-    for i in (1..v.len()).rev() {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        v.swap(i, (x % (i as u64 + 1)) as usize);
-    }
-}
-
 /// Whether this is the installed or the portable app, or the .deb or the Arch package
 /// (which only say a new version is out): updates only apply there. It
 /// can't change while running, and the check touches the disk, so it runs once.
@@ -2082,6 +2376,11 @@ mod session_tests {
         let video = Track { music_video: true, explicit: true, ..s.queue[0].clone() };
         let back: Track = serde_json::from_str(&serde_json::to_string(&video).unwrap()).unwrap();
         assert!(back.music_video && back.explicit);
+        // A song standing in for a liked video keeps that video across launches.
+        assert!(!saved.contains("stands_for"), "{saved}");
+        let stand_in = Track { stands_for: Some("u6Pr452s_2s".into()), ..s.queue[0].clone() };
+        let back: Track = serde_json::from_str(&serde_json::to_string(&stand_in).unwrap()).unwrap();
+        assert_eq!(back.stands_for.as_deref(), Some("u6Pr452s_2s"));
     }
 }
 
@@ -2139,4 +2438,10 @@ mod start_page_tests {
         assert_eq!(start_page(&lib(LibTab::Podcasts), true, false), Page::Home);
         assert_eq!(start_page(&lib(LibTab::Podcasts), true, true), lib(LibTab::Podcasts));
     }
+}
+
+/// The player bar's own layer, over now playing, takes the pointer over `rect` from the
+/// sheet under it. A layer that isn't an `Area` needs telling where it is, every frame.
+fn bar_layer_state(ctx: &egui::Context, layer: egui::LayerId, rect: egui::Rect) {
+    ctx.memory_mut(|m| m.areas_mut().set_state(layer, egui::AreaState { pivot_pos: Some(rect.min), size: Some(rect.size()), interactable: true, ..Default::default() }));
 }

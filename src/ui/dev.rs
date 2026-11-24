@@ -1,4 +1,4 @@
-//! Dev hooks: test screenshots, the theme tour, frame pacing and `YTM_*` variables.
+//! Dev hooks: test screenshots, frame pacing and `YTM_*` variables.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -7,48 +7,27 @@ use std::time::Duration;
 use super::App;
 
 impl App {
-    /// Dev hook: `YTM_THEME_TOUR=<secs>` steps through every theme preset from
-    /// `YTM_SCREENSHOT_AT`, saving `<YTM_SCREENSHOT stem>_<id>.png` for each, then exits.
-    pub(super) fn theme_tour(&mut self, ctx: &egui::Context, now: f64) {
-        let Some(path) = dev_var("YTM_SCREENSHOT").map(std::path::PathBuf::from) else { return };
-        let at: f64 = dev_var("YTM_SCREENSHOT_AT").and_then(|v| v.parse().ok()).unwrap_or(8.0);
-        let step: f64 = dev_var("YTM_THEME_TOUR").and_then(|v| v.parse().ok()).unwrap_or(3.0);
-        // YTM_TOUR_ONLY=id,id limits the tour to those presets.
-        let only = dev_var("YTM_TOUR_ONLY").unwrap_or_default();
-        let all: Vec<&crate::preset::Preset> = crate::preset::all().iter().filter(|p| only.is_empty() || only.split(',').any(|o| o == p.id)).collect();
-        ctx.request_repaint_after(Duration::from_millis(100));
-        if now < at {
+    /// Dev hook: `YTM_SKIP=<secs>` skips to the next song once a song has played that
+    /// long, and logs how many it has skipped: memory over many song changes (#107).
+    pub(super) fn dev_skip(&mut self, ctx: &egui::Context, now: f64) {
+        use std::sync::Mutex;
+        let Some(every) = dev_var("YTM_SKIP").and_then(|v| v.parse::<f64>().ok()) else { return };
+        // When the current song started playing, and how many songs have been skipped.
+        static STATE: Mutex<(Option<f64>, usize)> = Mutex::new((None, 0));
+        ctx.request_repaint_after(Duration::from_millis(500));
+        let mut state = STATE.lock().unwrap();
+        if !self.playing() || self.buffering {
             return;
         }
-        let n = ((now - at) / step) as usize;
-        if n >= all.len() {
-            // Let the last screenshot land, then quit.
-            if now - at > step * all.len() as f64 + 1.5 {
-                self.quit(ctx);
-            }
-        } else if self.theme_id != all[n].id {
-            self.theme_id = all[n].id.clone();
-            self.art_key = None;
-            self.request_art();
-        }
-        let shot_id = egui::Id::unique("tour-shot");
-        let requested: usize = ctx.data(|d| d.get_temp(shot_id)).unwrap_or(usize::MAX);
-        let in_slot = (now - at) - n as f64 * step;
-        if n < all.len() && requested != n && in_slot > step * 0.8 {
-            ctx.data_mut(|d| d.insert_temp(shot_id, n));
-            let id = all[n].id.clone();
-            let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            let out = path.with_file_name(format!("{stem}_{n:02}_{id}.png"));
-            ctx.request_screenshot(move |img| {
-                let [w, h] = img.size;
-                let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
-                match image::RgbaImage::from_raw(w as u32, h as u32, bytes).map(|im| im.save(&out)) {
-                    Some(Ok(())) => log::info!("tour screenshot saved: {id}"),
-                    other => log::warn!("tour screenshot failed: {other:?}"),
-                }
-            });
+        let since = *state.0.get_or_insert(now);
+        if now - since >= every {
+            state.0 = None;
+            state.1 += 1;
+            log::info!("skip: {} songs", state.1);
+            self.next();
         }
     }
+
 }
 
 /// Dev hook: `YTM_SCREENSHOT=out.png` saves the app's own framebuffer after
@@ -113,7 +92,7 @@ pub(super) fn dev_screenshot(ctx: &egui::Context, now: f64) {
 
 /// Dev hook: `YTM_SCRIPT="<secs>:<step>;…"` drives a test window that has no mouse or
 /// keyboard, with seconds from the first frame. Steps: `m:x,y` moves the pointer, `c:x,y`
-/// clicks, `r:w,h` resizes, `t:text` types, `k:esc` presses Esc (`k:f` F, and so on), `w:n` scrolls n lines (down), `f:n` flicks a touchpad n pixels (down) over 0.1 s, as Wayland sends it, `s:name` saves `<YTM_SCRIPT_DIR>/name.png`, `q` quits.
+/// clicks, `d:x,y` and `u:x,y` press and let go there (a drag, with moves between), `r:w,h` resizes, `t:text` types, `k:esc` presses Esc (`k:f` F, and so on), `w:n` scrolls n lines (down), `f:n` flicks a touchpad n pixels (down) over 0.1 s, as Wayland sends it, `s:name` saves `<YTM_SCRIPT_DIR>/name.png`, `q` quits.
 pub(super) fn dev_script(ctx: &egui::Context, raw: &mut egui::RawInput) {
     use std::sync::OnceLock;
     use std::time::Instant;
@@ -142,6 +121,9 @@ pub(super) fn dev_script(ctx: &egui::Context, raw: &mut egui::RawInput) {
             match (kind, point(value)) {
                 ("m", Some(p)) => steps.push((at, Step::Move(p))),
                 ("c", Some(p)) => steps.extend([(at, Step::Move(p)), (at + 0.2, Step::Press(p, true)), (at + 0.3, Step::Press(p, false))]),
+                // Press and let go as two steps, with moves between them: a drag.
+                ("d", Some(p)) => steps.extend([(at, Step::Move(p)), (at, Step::Press(p, true))]),
+                ("u", Some(p)) => steps.extend([(at, Step::Move(p)), (at, Step::Press(p, false))]),
                 ("r", Some(p)) => steps.push((at, Step::Resize(p))),
                 ("t", _) => steps.push((at, Step::Text(value))),
                 ("k", _) if egui::Key::from_name(&value.to_uppercase()).is_some() || value == "esc" => {
@@ -244,8 +226,9 @@ pub(super) fn dev_probe(ctx: &egui::Context) {
 }
 
 /// Dev hook: `YTM_MEM=<secs>` logs, that often, what the app's own caches hold: GPU
-/// textures (thumbnails and the rest), the font atlas, and the image loaders' bytes. The
-/// process's own figures come from outside (Task Manager, `Get-Process`).
+/// textures (thumbnails and the rest), the font atlas, the image loaders' bytes and, on
+/// Linux, the process's resident memory. Elsewhere those come from outside (Task
+/// Manager, `Get-Process`).
 pub(super) fn dev_memory(ctx: &egui::Context, now: f64) {
     use std::sync::Mutex;
     let Some(every) = dev_var("YTM_MEM").and_then(|v| v.parse::<f64>().ok()) else { return };
@@ -274,13 +257,27 @@ pub(super) fn dev_memory(ctx: &egui::Context, now: f64) {
     let images: usize = loaders.image.lock().iter().map(|l| l.byte_size()).sum();
     let tex_loaders: usize = loaders.texture.lock().iter().map(|l| l.byte_size()).sum();
     log::info!(
-        "mem: {count} textures {:.1} MB (loader {:.1}); font atlas {}x{}; bytes {:.1} MB, decoded {:.1} MB; {} audio buffers [{biggest}]",
+        "mem: {count} textures {:.1} MB (loader {:.1}); font atlas {}x{}; bytes {:.1} MB, decoded {:.1} MB; {} audio buffers{} [{biggest}]",
         mb(textures),
         mb(tex_loaders),
         atlas[0],
         atlas[1],
         mb(bytes),
         mb(images),
-        crate::stream::LIVE.load(std::sync::atomic::Ordering::Relaxed)
+        crate::stream::LIVE.load(std::sync::atomic::Ordering::Relaxed),
+        process_memory()
     );
+}
+
+/// The process's resident memory as Linux counts it (`; VmRSS … RssAnon … RssFile …`), so
+/// the `YTM_MEM` line alone shows whether it's growing; empty elsewhere.
+fn process_memory() -> String {
+    let status = if cfg!(target_os = "linux") { std::fs::read_to_string("/proc/self/status").unwrap_or_default() } else { String::new() };
+    let fields: Vec<String> = status
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .filter(|(k, _)| matches!(*k, "VmRSS" | "RssAnon" | "RssFile"))
+        .map(|(k, v)| format!("{k} {}", v.trim()))
+        .collect();
+    if fields.is_empty() { String::new() } else { format!("; {}", fields.join(", ")) }
 }

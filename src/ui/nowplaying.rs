@@ -17,12 +17,96 @@ pub(super) struct Glow {
     tex: egui::TextureHandle,
 }
 
-pub fn overlay(app: &mut App, ctx: &egui::Context, now: f64) {
-    // A spring's overshoot isn't for this: past its place it would leave a gap over the bar.
-    let t = theme::anim_bool_timed(ctx, "np-open", app.np_open && app.current().is_some(), app.look().app.np_open_secs).min(1.0);
+/// Now playing's layer. The player bar keeps its own layer just above it while it's up.
+pub fn layer() -> egui::LayerId {
+    egui::LayerId::new(egui::Order::Middle, egui::Id::unique("now-playing"))
+}
+
+const PANEL_TABS: [(NpTab, &str); 3] = [
+    (NpTab::Lyrics, "np-tab-lyrics"),
+    (NpTab::UpNext, "np-tab-upnext"),
+    (NpTab::Comments, "np-tab-comments"),
+];
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct PanelMotion {
+    progress: f32,
+    tabs: [f32; PANEL_TABS.len()],
+}
+
+impl PanelMotion {
+    fn panel_opacity(self) -> f32 {
+        theme::ease_out((self.progress - 0.3) / 0.7)
+    }
+
+    fn art_opacity(self) -> f32 {
+        1.0 - theme::ease_out(self.progress / 0.45)
+    }
+
+    pub(super) fn visibility(self, tab: NpTab) -> f32 {
+        PANEL_TABS.iter().position(|(kind, _)| *kind == tab)
+            .map_or(0.0, |i| self.panel_opacity() * self.tabs[i])
+    }
+}
+
+fn video_lyrics_available(app: &App, width: f32) -> bool {
+    app.look().now_playing.video_lyrics && !app.no_lyrics() && width >= 860.0
+}
+
+/// Sample the side panel before painting the player bar or overlay.
+pub(super) fn panel_motion(app: &App, ctx: &egui::Context, now: f64, sheet: f32) -> PanelMotion {
+    if sheet <= 0.001 {
+        return PanelMotion::default();
+    }
+    let look = &app.look().now_playing;
+    if app.shown_video().is_some() {
+        let [pad_x, _] = look.fullscreen_padding.filter(|_| app.fullscreen).unwrap_or([32.0, 20.0]);
+        let width = ctx.content_rect().width() - 2.0 * pad_x;
+        let show = !(app.fullscreen && app.video_full) && app.np_tab == NpTab::Lyrics
+            && video_lyrics_available(app, width);
+        return if show { PanelMotion { progress: 1.0, tabs: [1.0, 0.0, 0.0] } } else { PanelMotion::default() };
+    }
+
+    let lyrics_missing = app.no_lyrics();
+    let wait = look.no_lyrics.center_after;
+    let target = if lyrics_missing && wait <= 0.0 && app.np_tab == NpTab::Lyrics {
+        NpTab::Art
+    } else {
+        app.np_tab
+    };
+    let id = egui::Id::unique("np-last-panel");
+    let tab = if target == NpTab::Art {
+        ctx.data(|d| d.get_temp(id)).unwrap_or(NpTab::Lyrics)
+    } else {
+        ctx.data_mut(|d| d.insert_temp(id, target));
+        target
+    };
+    let shown = ctx.animate_bool_with_time(egui::Id::unique("np-panel"), target != NpTab::Art, theme::panel_secs(ctx, 0.6) * theme::SPEED);
+    if shown <= 0.0 {
+        return PanelMotion::default();
+    }
+    let mut progress = shown;
+    if tab == NpTab::Lyrics && lyrics_missing && wait > 0.0 && let Some(track) = app.current() {
+        let since = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(egui::Id::unique(("no-lyrics-wait", &track.id)), || now));
+        if now - since < wait as f64 {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait as f64 - (now - since) + 0.01));
+        }
+        let centered = ctx.animate_bool_with_time(egui::Id::unique(("no-lyrics-move", &track.id)), now - since >= wait as f64, 0.6);
+        progress *= 1.0 - centered;
+    }
+    // Below the panel's visibility threshold, only its selected tab needs a state.
+    let tab_secs = if progress <= 0.3 { 0.0 } else { theme::panel_secs(ctx, 0.45) * theme::SPEED };
+    let tabs = PANEL_TABS.map(|(kind, key)| {
+        let w = ctx.animate_bool_with_time(egui::Id::unique(key), tab == kind, tab_secs);
+        if kind == NpTab::Lyrics && lyrics_missing { 0.0 } else { theme::ease_out((w - 0.35) / 0.65) }
+    });
+    PanelMotion { progress, tabs }
+}
+
+pub(super) fn overlay(app: &mut App, ctx: &egui::Context, now: f64, t: f32, panel: PanelMotion) {
     if t <= 0.001 {
         // Closed: nothing to decode for. It picks up from the music's place when opened.
-        app.cover_clip = None;
+        app.drop_cover_clip(now);
         if app.video.take().is_some() {
             app.video_frame = None;
             app.glow = None;
@@ -31,21 +115,39 @@ pub fn overlay(app: &mut App, ctx: &egui::Context, now: f64) {
         return;
     }
     let screen = ctx.content_rect();
-    let full = if app.fullscreen { screen } else { Rect::from_min_max(screen.min, pos2(screen.right(), screen.bottom() - app.bar_height())) };
-    let rect = full.translate(vec2(0.0, full.height() * (1.0 - t)));
+    // One sheet the size of the window, coming up from its bottom edge. The player bar
+    // stays over it (on its own layer, above this one), so it slides up behind the bar,
+    // and around a floating bar it shows the whole way.
+    let sheet = screen.translate(vec2(0.0, screen.height() * (1.0 - t)));
+    // Its content, where it sits once the sheet is up: above the bar, moving with the sheet.
+    let content_h = if app.fullscreen { screen.height() } else { screen.height() - app.bar_height() };
+    let rect = Rect::from_min_size(sheet.min, vec2(sheet.width(), content_h));
     let look = app.look();
     let video_only = app.fullscreen && app.video_full;
     let video_only = video_only.then(|| app.shown_video().cloned()).flatten();
-    egui::Area::new(egui::Id::unique("now-playing"))
-        .order(egui::Order::Middle)
-        .fixed_pos(rect.min)
-        // Sliding in or out it runs over the player bar: until it's in place, the pointer
-        // stays with what's under it, so a click on the bar doesn't flash the hand of
-        // whatever slides past.
+    egui::Area::new(layer().id)
+        .order(layer().order)
+        .fixed_pos(sheet.min)
+        // While it's moving, the pointer stays with what's under it, so a click doesn't
+        // flash the hand of whatever slides past.
         .interactable(t >= 1.0)
+        .fade_in(false)
         .show(ctx, |ui| {
+            if ui.is_sizing_pass() {
+                ui.set_min_size(sheet.size());
+                ctx.request_discard("size the Now playing sheet");
+                return;
+            }
+            let shown = sheet.intersect(screen);
+            ui.set_clip_rect(shown.intersect(ui.clip_rect()));
+            // A soft shadow over the page it's covering, so its top edge isn't a hard cut.
+            // Once it's all the way up that's above the window.
+            if !app.fullscreen && t < 1.0 {
+                let band = Rect::from_min_max(pos2(sheet.left(), sheet.top() - 28.0), pos2(sheet.right(), sheet.top()));
+                super::shell::vgradient(&ui.ctx().layer_painter(ui.layer_id()).with_clip_rect(screen), band, Color32::TRANSPARENT, theme::shade(0.3));
+            }
             // Swallow input so the page underneath doesn't react.
-            ui.allocate_rect(rect, Sense::click_and_drag());
+            ui.allocate_rect(shown, Sense::click_and_drag());
             if let Some(video) = &video_only {
                 video_fullscreen(app, ui, rect, video, now);
                 return;
@@ -66,18 +168,15 @@ pub fn overlay(app: &mut App, ctx: &egui::Context, now: f64) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
             }
-            // Laid out as if it ran under the player bar, which shows the rest of it.
-            let under_bar = Rect::from_min_max(rect.min, rect.max + vec2(0.0, screen.bottom() - full.bottom()));
-            backdrop(app, ui, under_bar, rect, now, true);
+            backdrop(app, ui, sheet, shown, now);
             let [pad_x, pad_y] = look.now_playing.fullscreen_padding.filter(|_| app.fullscreen).unwrap_or([32.0, 20.0]);
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(pad_x, pad_y))));
-            body(app, &mut child, now);
+            body(app, &mut child, now, panel);
         });
 }
 
-/// Now playing's background laid out over `rect`, drawn only inside `clip`. `step_glow`:
-/// this is the frame's main drawing, which moves the video's glow along.
-pub(super) fn backdrop(app: &mut App, ui: &mut Ui, rect: Rect, clip: Rect, now: f64, step_glow: bool) {
+/// Now playing's background laid out over `rect`, drawn only inside `clip`.
+fn backdrop(app: &mut App, ui: &mut Ui, rect: Rect, clip: Rect, now: f64) {
     use crate::preset::BgMode;
     let look = app.look();
     let b = &look.background;
@@ -88,6 +187,12 @@ pub(super) fn backdrop(app: &mut App, ui: &mut Ui, rect: Rect, clip: Rect, now: 
     let on_video = (b.video_backdrop && app.video.as_ref().is_some_and(|(_, player)| player.is_some())).then_some(());
     let over = ((app.art_brightness - b.auto_dim_from) / (1.0 - b.auto_dim_from).max(0.01)).max(0.0);
     let auto_dim = 1.0 - on_video.and(b.video.auto_dim).unwrap_or(b.auto_dim) * over;
+    let theme_fullscreen = b.fullscreen_fullbleed.filter(|_| app.fullscreen);
+    let fullbleed_level = theme_fullscreen.unwrap_or(b.np_dim).clamp(0.0, 1.0);
+    // Then darker still where the art would show too bright for the white text over it,
+    // unless the theme sets how bright its full-screen cover is (reCover: at full).
+    let readable = if app.dim_bright && theme_fullscreen.is_none() { crate::art::readable_dim(app.art_brightness * shown_level(b, art, fullbleed_level, app.fullscreen, auto_dim)) } else { 1.0 };
+    let auto_dim = auto_dim * readable;
     if let (Some(layer), Some(bg)) = (b.layer, app.bg.as_ref()) {
         // The theme's still cover under everything, pulsing if it does.
         let pulse = if layer.pulse_secs > 0.0 { (now as f32 * std::f32::consts::TAU / layer.pulse_secs).sin() * layer.pulse } else { 0.0 };
@@ -137,7 +242,7 @@ pub(super) fn backdrop(app: &mut App, ui: &mut Ui, rect: Rect, clip: Rect, now: 
             let area = if side_by_side { Rect::from_min_size(rect.min, Vec2::splat(rect.height())) } else { rect };
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area));
             child.set_clip_rect(area.intersect(clip));
-            let tint = Color32::from_gray((b.fullscreen_fullbleed.filter(|_| app.fullscreen).unwrap_or(b.np_dim).clamp(0.0, 1.0) * 255.0) as u8);
+            let tint = Color32::from_gray((fullbleed_level * readable * 255.0) as u8);
             // Over the theme's own background it fades away to show that; alone, into its flat colour.
             let mask = (side_by_side && b.mode != BgMode::CoverFullbleed).then_some(b.fade);
             let fading = b.fullbleed_fade.then(|| fullbleed_fade(&child, &track.id, &track.thumbs, now, b.crossfade_delay as f64, b.crossfade_secs as f64)).flatten();
@@ -170,8 +275,32 @@ pub(super) fn backdrop(app: &mut App, ui: &mut Ui, rect: Rect, clip: Rect, now: 
         super::shell::overlay_light(&painter, rect, o, app.accent_color());
     }
     if app.ambient_light && app.shown_video().is_some() {
-        paint_glow(app, ui, rect, clip, step_glow);
+        paint_glow(app, ui, rect, clip);
     }
+}
+
+/// About how much of the art's own brightness now playing's background shows, after the
+/// theme's dimming (`auto_dim` included) and scrim: `art`, the theme's background is
+/// the art; `fullbleed_level`, the full-screen cover's brightness where there is one.
+fn shown_level(b: &crate::preset::Background, art: bool, fullbleed_level: f32, fullscreen: bool, auto_dim: f32) -> f32 {
+    // Without the art, what's under it is a flat colour (which covers any layer too).
+    let mut level = match b.layer {
+        _ if !art => 0.0,
+        None => b.np_dim * auto_dim,
+        // The art at `np_dim` over the layer.
+        Some(l) => auto_dim * (b.np_dim + (1.0 - b.np_dim) * l.opacity * l.brightness.unwrap_or(1.0)),
+    };
+    if b.fullbleed(fullscreen) {
+        level = level.max(fullbleed_level);
+    }
+    // The scrim's darkening, on average across the screen.
+    let k = b.scrim / 0.3;
+    let scrim = match b.scrim_gradient {
+        Some([from, to]) => (from + to) / 2.0,
+        None if k > 0.0 => ((0.18 * k).min(0.95) + (0.42 * k).min(0.95)) / 2.0,
+        None => 0.0,
+    };
+    level * (1.0 - scrim.clamp(0.0, 1.0))
 }
 
 /// A cover filling `area`. `mask`: it's whole up to the first fraction across and gone by
@@ -199,13 +328,13 @@ fn paint_fullbleed(ui: &Ui, area: Rect, thumbs: &[crate::model::Thumb], tint: Co
     ui.painter().add(mesh);
 }
 
-fn body(app: &mut App, ui: &mut Ui, now: f64) {
+fn body(app: &mut App, ui: &mut Ui, now: f64, panel: PanelMotion) {
     let Some(track) = app.current().cloned() else { return };
     let look = app.look();
     let area = ui.max_rect();
     let video = app.shown_video().cloned();
     let video_mode = video.is_some();
-    let video_lyrics = video_mode && look.now_playing.video_lyrics && !app.no_lyrics() && content_wide(area);
+    let video_lyrics = video_mode && video_lyrics_available(app, area.width());
     let no_lyrics = app.no_lyrics() || (video_mode && !video_lyrics);
     // Header: on the window buttons' line, when the app draws them.
     let lift = 20.0 - f32::from(super::titlebar::top_margin(20, 44.0));
@@ -232,15 +361,21 @@ fn body(app: &mut App, ui: &mut Ui, now: f64) {
     if app.fullscreen && look.now_playing.fullscreen_progress_px > 0.0 {
         fullscreen_progress(app, ui, ui.ctx().content_rect(), look.now_playing.fullscreen_progress_px);
     }
-    np_content(app, ui, content, &track, video.as_ref(), video_lyrics, no_lyrics, now);
+    np_content(app, ui, content, &track, video.as_ref(), no_lyrics, now, panel);
     // A song gets the switch too once its music video is found (or is playing). Songs, not
     // music videos, with videos off: no switch on a song, and no music video looked up for
     // it. A music video keeps its own: it's the only way from its song back to the video.
-    let songs_only = app.play_songs && !app.show_video;
+    // A song standing in for a liked video is that video's too, as a music video is.
+    let songs_only = app.play_songs && !app.show_video && track.stands_for.is_none();
     if look.now_playing.show_video_switch && !app.jam.active() && (track.has_video() || (!songs_only && (app.playing_as().is_some() || app.song_video().is_some()))) {
         song_video_switch(app, ui, header);
     }
     let mut hui = ui.new_child(egui::UiBuilder::new().max_rect(header).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    // macOS: past the traffic lights, which stay over now playing.
+    let gap = super::titlebar::left_gap(hui.ctx(), hui.max_rect(), 0.0);
+    if gap > 0.0 {
+        hui.add_space(gap);
+    }
     if icon_button(&mut hui, icon::CHEVRON_DOWN, 22.0, "Close now playing", false).clicked() {
         app.np_open = false;
         if app.fullscreen {
@@ -320,7 +455,7 @@ fn body(app: &mut App, ui: &mut Ui, now: f64) {
 
 /// What's under the header: the video, or the cover and the panel beside it.
 #[allow(clippy::too_many_arguments)]
-fn np_content(app: &mut App, ui: &mut Ui, content: Rect, track: &crate::model::Track, video: Option<&crate::model::Track>, video_lyrics: bool, no_lyrics: bool, now: f64) {
+fn np_content(app: &mut App, ui: &mut Ui, content: Rect, track: &crate::model::Track, video: Option<&crate::model::Track>, no_lyrics: bool, now: f64, panel: PanelMotion) {
     use crate::preset::{Layout, Side};
     let look = app.look();
     let cs = &look.cover;
@@ -328,7 +463,7 @@ fn np_content(app: &mut App, ui: &mut Ui, content: Rect, track: &crate::model::T
     let cover_side = cs.fullscreen.filter(|_| app.fullscreen).and_then(|f| f.side).unwrap_or(cs.side);
     if let Some(video) = video {
         // Lyrics beside the video, with the video keeping the rest of the view.
-        if video_lyrics && app.np_tab == NpTab::Lyrics {
+        if panel.visibility(NpTab::Lyrics) > 0.0 {
             let share = look.now_playing.video_panel_frac.map_or(0.63, |[win, full]| if app.fullscreen { full } else { win });
             let split = content.left() + content.width() * share;
             video_stage(app, ui, Rect::from_min_max(content.min, pos2(split - 24.0, content.bottom())), video);
@@ -346,47 +481,12 @@ fn np_content(app: &mut App, ui: &mut Ui, content: Rect, track: &crate::model::T
         app.glow = None;
         app.restore_art();
     }
-    // The side panel (lyrics / up next) slides in and out when its chip is toggled.
-    // A song without lyrics shows just the artwork, with no transition.
-    let last_id = egui::Id::unique("np-last-panel");
-    let panel_tab = if app.np_tab == NpTab::Art {
-        ui.ctx().data(|d| d.get_temp(last_id)).unwrap_or(NpTab::Lyrics)
-    } else {
-        ui.ctx().data_mut(|d| d.insert_temp(last_id, app.np_tab));
-        app.np_tab
-    };
-    // Linear 0..1 over the transition; each part eases its own slice of it.
-    let shown = ui.ctx().animate_bool_with_time(egui::Id::unique("np-panel"), app.np_tab != NpTab::Art, 0.6 * theme::SPEED);
-    if shown > 0.0 && shown < 1.0 {
-        // Every frame while sliding, not the now-playing view's usual 30 fps.
-        ui.ctx().request_repaint();
-    }
     let ppp = ui.ctx().pixels_per_point();
     let window_w = ui.ctx().content_rect().width();
-    let wait = look.now_playing.no_lyrics.center_after;
-    let p = if panel_tab == NpTab::Lyrics && no_lyrics {
-        if wait > 0.0 {
-            // A while in its usual place, then over to the middle.
-            let since = ui.ctx().memory_mut(|m| *m.data.get_temp_mut_or_insert_with(egui::Id::unique(("no-lyrics-wait", &track.id)), || now));
-            if now - since < wait as f64 {
-                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(wait as f64 - (now - since) + 0.01));
-            }
-            1.0 - ui.ctx().animate_bool_with_time(egui::Id::unique(("no-lyrics-move", &track.id)), now - since >= wait as f64, 0.6)
-        } else {
-            0.0
-        }
-    } else {
-        shown
-    };
-    // Whichever is leaving slides and fades out over the first 45%, then the other
-    // comes in over the last 70%, both easing out, in either direction.
-    let (panel_vis, art_vis) = if app.np_tab != NpTab::Art {
-        (theme::ease_out((p - 0.3) / 0.7), 1.0 - theme::ease_out(p / 0.45))
-    } else {
-        let q = 1.0 - p;
-        (1.0 - theme::ease_out(q / 0.45), theme::ease_out((q - 0.3) / 0.7))
-    };
-    // The cover gliding between its two places (wide layouts): a gentle S-curve.
+    let panel_vis = panel.panel_opacity();
+    let art_vis = panel.art_opacity();
+    // Cover geometry and both opacities are functions of progress in either direction.
+    let p = panel.progress;
     let glide = p * p * (3.0 - 2.0 * p);
     let narrow = content.width() < 860.0;
     let corner = !narrow && layout == Layout::Corner;
@@ -473,24 +573,12 @@ fn np_content(app: &mut App, ui: &mut Ui, content: Rect, track: &crate::model::T
     let rect = right.translate(vec2(toward * (1.0 - panel_vis), 0.0));
     let inset = look.now_playing.fullscreen_panel_inset.filter(|_| app.fullscreen);
     let rect = inset.map_or(rect, |[top, bottom]| Rect::from_min_max(pos2(rect.left(), rect.top() + top), pos2(rect.right(), rect.bottom() - bottom)));
-    // Switching between Lyrics, Up next and Comments: the old one fades out over the first 55%,
-    // the new one fades in and rises into place from a third of the way.
-    for (tab, key) in [(NpTab::Lyrics, "np-tab-lyrics"), (NpTab::UpNext, "np-tab-upnext"), (NpTab::Comments, "np-tab-comments")] {
-        let w = ui.ctx().animate_bool_with_time(egui::Id::unique(key), panel_tab == tab, 0.45 * theme::SPEED);
-        if w > 0.0 && w < 1.0 {
-            ui.ctx().request_repaint();
-        }
-        let vis = if panel_tab == tab {
-            theme::ease_out((w - 0.35) / 0.65)
-        } else {
-            let x = ((w - 0.45) / 0.55).clamp(0.0, 1.0);
-            x * x * (3.0 - 2.0 * x)
-        };
-        if vis <= 0.001 || (tab == NpTab::Lyrics && no_lyrics) {
+    // The outgoing and incoming tabs use the same opacity and offset curves.
+    for ((tab, _), vis) in PANEL_TABS.into_iter().zip(panel.tabs) {
+        if vis <= 0.001 {
             continue;
         }
-        let rise = if panel_tab == tab { 18.0 * (1.0 - vis) } else { 0.0 };
-        let r = rect.translate(vec2(0.0, rise));
+        let r = rect.translate(vec2(0.0, 18.0 * (1.0 - vis)));
         let mut rui = ui.new_child(egui::UiBuilder::new().max_rect(r));
         rui.set_clip_rect(if inset.is_some() { ui.clip_rect() } else { content.intersect(ui.clip_rect()) });
         rui.multiply_opacity(panel_vis * vis);
@@ -552,17 +640,14 @@ fn fullscreen_progress(app: &mut App, ui: &mut Ui, screen: Rect, px: f32) {
 }
 
 /// Room for lyrics beside something else.
-fn content_wide(area: Rect) -> bool {
-    area.width() >= 860.0
-}
-
 /// Size of the artwork laid out in `col`.
 fn art_side(cs: &crate::preset::CoverStyle, col: Rect, fullscreen: bool, window_w: f32) -> f32 {
     let fs = cs.fullscreen.filter(|_| fullscreen).unwrap_or_default();
     let width_frac = fs.width_frac;
     let side = match fs.size_vh.or(cs.size_vh) {
-        // As much of the window's height as the theme asks: it may run past the column.
-        Some(vh) => (col.height() + 76.0) * vh,
+        // As much of the window's height as the theme asks: it may run past the column's
+        // top and bottom, but not its sides, or a tall window puts it under the lyrics.
+        Some(vh) => ((col.height() + 76.0) * vh).min(col.width()),
         None => (col.width() * 0.82 * cs.size.clamp(0.5, 1.35)).min(col.height() - 110.0).max(160.0),
     };
     let side = match width_frac {
@@ -758,8 +843,8 @@ fn cover_player(app: &mut App, ui: &mut Ui, track: &crate::model::Track, art: Re
     }
 
     let at = |k: f32| pos2(c.x + gap * k, row_y);
-    if cover_glyph(ui, at(-2.0), icon::SHUFFLE, 20.0 * s, "shuffle", "Shuffle up next", true).clicked() {
-        app.shuffle_upcoming();
+    if cover_glyph(ui, at(-2.0), icon::SHUFFLE, 20.0 * s, "shuffle", "Shuffle", app.queue.shuffled()).clicked() {
+        app.toggle_shuffle();
     }
     if cover_glyph(ui, at(-1.0), icon::SKIP_BACK, 26.0 * s, "prev", "Previous", true).clicked() {
         app.prev();
@@ -1320,7 +1405,8 @@ fn video_fullscreen(app: &mut App, ui: &mut Ui, rect: Rect, track: &crate::model
     ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
     let frame = video_frame(app, &ctx, track);
     let (w, h) = frame.as_ref().map_or((16.0, 9.0), |t| (t.size()[0] as f32, t.size()[1] as f32));
-    if ui.input(|i| i.key_pressed(egui::Key::Z) && !i.modifiers.any()) {
+    // Not while typing: into the command palette, say.
+    if !ctx.egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Z) && !i.modifiers.any()) {
         set_video_fill(app, !app.video_fill);
     }
     // Filling: the picture inside its own bars, as large as covers the screen, its edges cut.
@@ -1450,7 +1536,7 @@ fn quality_button(app: &mut App, ui: &mut Ui, playing_at: Option<u32>) {
     widgets::icon_at(ui, pos2(rect.left() + 17.0, rect.center().y), icon::SETTINGS, 15.0, Color32::WHITE);
     ui.painter().galley(pos2(rect.left() + 30.0, rect.center().y - g.size().y / 2.0), g, Color32::WHITE);
     widgets::focus_ring(ui, &resp, rect, 16.0);
-    widgets::menu_popup(&resp).align(egui::RectAlign::TOP_END).show(|ui| {
+    widgets::dropdown_popup_at(&resp, Some(egui::RectAlign::TOP_END), None, egui::PopupCloseBehavior::CloseOnClick, |ui| {
         widgets::menu_body(ui, 170.0);
         quality_rows(app, ui);
     });
@@ -1500,24 +1586,31 @@ fn video_line_pill(app: &App, ui: &Ui, picture: Rect) {
 }
 
 /// The video's colours, eased toward the latest frame's, across all of Now playing.
-fn paint_glow(app: &mut App, ui: &mut Ui, rect: Rect, clip: Rect, step: bool) {
+fn paint_glow(app: &mut App, ui: &mut Ui, rect: Rect, clip: Rect) {
+    let dim_bright = app.dim_bright;
     let Some(Glow { current, target, tex }) = &mut app.glow else { return };
-    if step {
-        let k = (ui.input(|i| i.stable_dt) * 2.5).clamp(0.0, 1.0);
-        for (c, t) in current.iter_mut().zip(target.iter()) {
-            for i in 0..3 {
-                c[i] += (t[i] - c[i]) * k;
-            }
+    let k = (ui.input(|i| i.stable_dt) * 2.5).clamp(0.0, 1.0);
+    for (c, t) in current.iter_mut().zip(target.iter()) {
+        for i in 0..3 {
+            c[i] += (t[i] - c[i]) * k;
         }
-        let [w, h] = crate::video::GLOW_SIZE;
-        let pixels = current.iter().map(|c| Color32::from_rgb(c[0] as u8, c[1] as u8, c[2] as u8)).collect();
-        tex.set(egui::ColorImage { size: [w, h], source_size: vec2(w as f32, h as f32), pixels }, egui::TextureOptions::LINEAR);
     }
+    let [w, h] = crate::video::GLOW_SIZE;
+    let pixels = current.iter().map(|c| Color32::from_rgb(c[0] as u8, c[1] as u8, c[2] as u8)).collect();
+    tex.set(egui::ColorImage { size: [w, h], source_size: vec2(w as f32, h as f32), pixels }, egui::TextureOptions::LINEAR);
     // Bigger than the view, so its coarse edges stay out of sight.
     let full = rect.expand2(rect.size() * 0.08);
     let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
     let painter = ui.painter_at(clip);
-    painter.image(tex.id(), full, uv, Color32::from_gray(150));
+    // Drawn at 150/255 under a quarter's shade; darker still for a bright picture.
+    const LEVEL: f32 = 150.0 / 255.0 * 0.75;
+    let readable = if dim_bright && !current.is_empty() {
+        let luma = current.iter().map(|c| (0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]) / 255.0).sum::<f32>() / current.len() as f32;
+        crate::art::readable_dim(luma * LEVEL)
+    } else {
+        1.0
+    };
+    painter.image(tex.id(), full, uv, Color32::from_gray((150.0 * readable) as u8));
     painter.rect_filled(rect, 0.0, theme::shade(0.25));
 }
 
@@ -1534,11 +1627,18 @@ pub(super) struct CoverClip {
     resized: Option<(u32, f64)>,
 }
 
+impl CoverClip {
+    /// A frame of it is up.
+    pub fn showing(&self) -> bool {
+        self.frame.is_some()
+    }
+}
+
 /// The animated cover's latest frame, and how far it has faded in. Keeps the clip in step
 /// with the song.
 fn cover_clip(app: &mut App, ctx: &egui::Context, track: &crate::model::Track, px: u32, now: f64) -> Option<(egui::TextureHandle, f32)> {
     if !app.animated_covers {
-        app.cover_clip = None;
+        app.drop_cover_clip(now);
         return None;
     }
     if app.cover_clip.as_ref().is_none_or(|c| c.id != track.id) {
@@ -1568,7 +1668,20 @@ fn cover_clip(app: &mut App, ctx: &egui::Context, track: &crate::model::Track, p
         c.resized = None;
     }
     let player = c.player.as_mut().filter(|p| !p.failed())?;
+    // The clip is what's on screen, and a song's single and album covers can differ: its
+    // first frame sets the colours (kept for the song), crossfading from the still cover's.
+    // They stay put while it plays: each theme decides whether its background moves.
+    let mut recolour = false;
     if let Some(f) = player.take_due(now, playing) {
+        if c.frame.is_none() {
+            if app.clip_art.as_ref().is_none_or(|(id, _)| *id != c.id)
+                && let Some(mut art) = crate::art::from_cover_frame(&f.image)
+            {
+                crate::art::soften(&mut art, crate::preset::active().background.blur_passes.saturating_sub(6));
+                app.clip_art = Some((c.id.clone(), art));
+            }
+            recolour = app.clip_art.as_ref().is_some_and(|(id, _)| *id == c.id);
+        }
         match &mut c.frame {
             Some((tex, _)) => tex.set(f.image, egui::TextureOptions::LINEAR),
             None => c.frame = Some((ctx.load_texture("cover-clip", f.image, egui::TextureOptions::LINEAR), now)),
@@ -1582,7 +1695,11 @@ fn cover_clip(app: &mut App, ctx: &egui::Context, track: &crate::model::Track, p
     } else if shown < 1.0 {
         super::pace::repaint_after(ctx, std::time::Duration::from_millis(16));
     }
-    c.frame.as_ref().map(|(tex, _)| (tex.clone(), shown))
+    let out = c.frame.as_ref().map(|(tex, _)| (tex.clone(), shown));
+    if recolour {
+        app.show_cover_colours(now);
+    }
+    out
 }
 
 /// Play videos at most `height` tall, the one on show too: it carries on from where the
@@ -1625,7 +1742,7 @@ pub(super) fn video_frame(app: &mut App, ctx: &egui::Context, track: &crate::mod
                 let v = crate::preset::active().background.video;
                 // `from_frame` is about as soft as the art's usual six.
                 crate::art::soften(&mut art, v.blur_passes.map_or(0, |n| n.saturating_sub(6)));
-                if v.auto_dim.is_some() {
+                if v.auto_dim.is_some() || app.dim_bright {
                     app.art_brightness = art.brightness;
                 }
                 bg.set_live(art);
@@ -1752,8 +1869,7 @@ fn synced(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, lyrics: &Lyrics, now
         let mut h = std::collections::hash_map::DefaultHasher::new();
         id.hash(&mut h);
         lyrics.provider.key().hash(&mut h);
-        app.theme_id.hash(&mut h);
-                for r in &roman {
+        for r in &roman {
             match r {
                 Some(karaoke::Roman::Timed(_, s)) | Some(karaoke::Roman::Text(s)) => s.hash(&mut h),
                 None => 0u8.hash(&mut h),
@@ -1765,7 +1881,8 @@ fn synced(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, lyrics: &Lyrics, now
     let scale = app.lyric_prefs.text_scale;
     let fullscreen = app.fullscreen;
     let glass_chip = app.look().app.glass.instrumental;
-    let frame = karaoke::Frame { lyrics, key, roman, trans, t, playing, now, rect, style, accent, centered, scale, fullscreen, glass_chip };
+    let quick_scroll = app.quick_lyric_scroll;
+    let frame = karaoke::Frame { lyrics, key, roman, trans, t, playing, now, rect, style, accent, centered, scale, fullscreen, glass_chip, quick_scroll };
     // The view lives in `app`; the frame borrows `app` for decorations, so swap it out.
     let mut view = std::mem::take(&mut app.lyric_view);
     let out = if karaoke::dev_off("view") { karaoke::Out { seek: None, animating: true, user_scrolling: false } } else { view.show(ui, frame) };
@@ -1776,8 +1893,14 @@ fn synced(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, lyrics: &Lyrics, now
         app.actions.push(Action::Seek(at.max(0.0) as f32));
     }
     if out.animating && !app.window_hidden {
-        // Smooth, without following a fast monitor: frame rate is the main CPU and GPU cost.
-        super::pace::repaint_after(ui.ctx(), std::time::Duration::from_millis(16));
+        if app.lyrics_full_rate {
+            // As fast as the screen shows them: vsync, or `pace::frame`, sets the rate.
+            app.full_rate_frame = true;
+            ui.ctx().request_repaint();
+        } else {
+            // Smooth, without following a fast monitor: frame rate is the main CPU and GPU cost.
+            super::pace::repaint_after(ui.ctx(), std::time::Duration::from_millis(16));
+        }
     }
     // The extension's `.autoscroll-resume-button` (YouTube Music's rem is 10 px): a frosted
     // pill under the top edge in the lyrics font at 600, 1.75rem; padding .5rem 1rem;
@@ -1887,8 +2010,7 @@ fn options_menu(app: &mut App, ui: &mut Ui, track: &crate::model::Track, lyrics:
     for dx in [-6.0, 0.0, 6.0] {
         ui.painter().circle_filled(rect.center() + vec2(dx, 0.0), 1.9, theme::with_alpha(Color32::WHITE, 0.75 + 0.25 * h));
     }
-    widgets::menu_popup(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-        widgets::menu_body(ui, 270.0);
+    widgets::player_options_menu(&resp, false, 270.0, |ui| {
         if lyrics {
             lyric_options(app, ui);
             menu_divider(ui);
@@ -1900,10 +2022,10 @@ fn options_menu(app: &mut App, ui: &mut Ui, track: &crate::model::Track, lyrics:
         let liked = app.heard_liked();
         let asked = app.actions.len();
         widgets::song_actions(ui, track, liked, None, &mut app.actions);
-        for a in &mut app.actions[asked..] {
-            if let Action::Like(_, like) = a {
-                *a = Action::LikeHeard(*like);
-            }
+        if let Some(index) = app.actions[asked..].iter().position(|action| matches!(action, Action::Like(..)))
+            && let Some(rating) = app.heard_like_action(!liked)
+        {
+            app.actions[asked + index] = rating;
         }
     });
 }
@@ -1957,7 +2079,10 @@ fn menu_caption(ui: &mut Ui, text: &str) {
 fn source_row(ui: &mut Ui, name: &str, sync: SyncKind, current: bool) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::click());
     let resp = named(resp, &format!("Lyrics source {name}")).on_hover_cursor(egui::CursorIcon::PointingHand);
-    let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered(), 0.12);
+    if resp.gained_focus() {
+        resp.scroll_to_me(None);
+    }
+    let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered() || resp.has_focus(), 0.12);
     if h > 0.0 || current {
         ui.painter().rect_filled(rect, theme::menu_item_radius(), theme::glass(0.05 * current as u8 as f32 + 0.08 * h));
     }
@@ -1975,10 +2100,13 @@ fn source_row(ui: &mut Ui, name: &str, sync: SyncKind, current: bool) -> bool {
 fn switch_row(ui: &mut Ui, label: &str, on: &mut bool) {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
     let resp = named(resp, label).on_hover_cursor(egui::CursorIcon::PointingHand);
+    if resp.gained_focus() {
+        resp.scroll_to_me(None);
+    }
     if resp.clicked() {
         *on = !*on;
     }
-    let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered(), 0.12);
+    let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered() || resp.has_focus(), 0.12);
     if h > 0.0 {
         ui.painter().rect_filled(rect, theme::menu_item_radius(), theme::glass(0.08 * h));
     }

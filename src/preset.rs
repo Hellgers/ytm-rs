@@ -1,17 +1,12 @@
-//! Themes. Each is one file in `assets/themes/presets/<id>.json`, a complete description of
-//! the app's look over a base of stock YouTube Music and Better Lyrics: a field a theme leaves
-//! out looks stock, never like another theme. Better Lyrics community themes
-//! (github.com/better-lyrics/themes) are ported from their stylesheets, in YouTube Music's
-//! units (1 rem = 10 px). No code may branch on a theme's id: everything a theme can do is a
-//! field here, available to all of them. Covers live in `assets/themes/covers/<id>.jpg`.
+//! AppleTify and the style data used to render it.
 
 use std::sync::OnceLock;
 
 use egui::Color32;
 use serde::Deserialize;
 
-/// Id of the app's own look, used when a saved theme no longer exists.
-pub const DEFAULT_ID: &str = "ytm-rs";
+/// The theme used by every desktop profile.
+pub const DEFAULT_ID: &str = "ad-nextgen";
 
 // ------------------------------------------------------------------ background
 
@@ -301,11 +296,17 @@ pub struct LetterWave {
     pub rest_scale: f32,
     /// The glow on waving words, rem, in place of `glow_rem`.
     pub glow_rem: f32,
+    /// Use each timed letter's wave envelope as the opacity of its glow mask.
+    pub glow_follows_wave: bool,
+    /// Fit emphasis to supplied parts and light untimed rows as a whole.
+    pub follow_part_timing: bool,
+    /// Peak letter scale on ordinary timed parts.
+    pub regular_emphasis: f32,
 }
 
 impl Default for LetterWave {
     fn default() -> Self {
-        Self { on: true, crest: 0.05, settle: 0.02, secs: 0.9, emphasis: 1.11, long_secs: 1.5, min_secs: 0.0, max_letters: 0, rest_scale: 1.0, glow_rem: 0.0 }
+        Self { on: true, crest: 0.05, settle: 0.02, secs: 0.9, emphasis: 1.11, long_secs: 1.5, min_secs: 0.0, max_letters: 0, rest_scale: 1.0, glow_rem: 0.0, glow_follows_wave: false, follow_part_timing: false, regular_emphasis: 1.0 }
     }
 }
 
@@ -1224,6 +1225,8 @@ pub struct Chrome {
     /// The progress line kept this far from the bar's sides, and its knob: radius and a dot in it.
     pub progress_inset: f32,
     pub progress_thumb_px: f32,
+    /// Space below a bottom progress line, inside the bar.
+    pub progress_bottom_inset: f32,
     pub progress_thumb_dot: bool,
     /// The docked bar's outline over now playing too.
     pub bar_np_border: bool,
@@ -1277,6 +1280,8 @@ pub enum BarLayout {
     SongLeft,
     /// The transport on the left, the song in the middle: stock YouTube Music.
     SongMiddle,
+    /// Distinct song, transport, volume and view groups with an adaptive two-row layout.
+    Grouped,
 }
 
 impl Default for Chrome {
@@ -1331,6 +1336,7 @@ impl Default for Chrome {
             like_on_hover: false,
             like_hover_scale: 1.0,
             progress_inset: 0.0,
+            progress_bottom_inset: 0.0,
             progress_thumb_px: 7.0,
             progress_thumb_dot: false,
             bar_np_border: true,
@@ -1454,6 +1460,8 @@ pub struct AppStyle {
     /// Every weight of interface text in bold.
     pub all_bold: bool,
     pub controls: Controls,
+    /// Give icon-button tooltips a separate graphite surface in dark mode.
+    pub dark_icon_tooltips: bool,
     pub nav_item: NavItem,
     pub chip_look: ChipLook,
     pub card_look: CardLook,
@@ -1476,6 +1484,10 @@ pub struct AppStyle {
     pub page_foot: Option<[f32; 2]>,
     /// New pages rise this many px as they fade in.
     pub page_rise_px: f32,
+    /// Slide the destination from the history direction instead of lifting it vertically.
+    pub page_slide_px: f32,
+    /// Scroll the four main sections vertically, with Settings over the current screen.
+    pub stacked_navigation: bool,
     /// Album and playlist pages open under their art, at this opacity, fading out down the header.
     pub immersive_header: Option<f32>,
     /// Their title's size.
@@ -1611,6 +1623,8 @@ pub struct Controls {
     /// White alpha of an outline on hover, and of a fill while pressed.
     pub hover_border: f32,
     pub press_fill: f32,
+    /// Fill of a selected circular icon button.
+    pub icon_selected_fill: f32,
     /// `[px down, blur, alpha]` under buttons.
     pub shadow: Option<[f32; 3]>,
     /// Pressing a card, chip or row shrinks it to this.
@@ -1628,7 +1642,7 @@ pub struct Controls {
 
 impl Default for Controls {
     fn default() -> Self {
-        Self { idle_alpha: 1.0, ghost_outline: 0.0, press_scale: 0.9, hover_scale: 1.0, arrow_hover: None, button_fill: 0.10, button_hover: 0.08, hover_color: String::new(), accent_primary: false, hover_border: 0.0, press_fill: 0.0, shadow: None, press_cards: 1.0, press_chips: 1.0, press_rows: 1.0, play_hover_scale: 1.05, play_hover_color: String::new(), focus: None, spring: false }
+        Self { idle_alpha: 1.0, ghost_outline: 0.0, press_scale: 0.9, hover_scale: 1.0, arrow_hover: None, button_fill: 0.10, button_hover: 0.08, hover_color: String::new(), accent_primary: false, hover_border: 0.0, press_fill: 0.0, icon_selected_fill: 0.0, shadow: None, press_cards: 1.0, press_chips: 1.0, press_rows: 1.0, play_hover_scale: 1.05, play_hover_color: String::new(), focus: None, spring: false }
     }
 }
 
@@ -1827,6 +1841,8 @@ impl Default for RowLook {
 #[derive(Clone, Copy, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MenuLook {
+    /// Style player options as an opaque, animated surface with eased row highlights.
+    pub player_style: bool,
     pub row_px: f32,
     pub hover: f32,
     /// `menu_color`'s alpha.
@@ -1854,7 +1870,7 @@ pub struct MenuLook {
 
 impl Default for MenuLook {
     fn default() -> Self {
-        Self { row_px: 36.0, hover: 0.12, alpha: 1.0, icon_right: false, shadow: None, row_radius: 7.0, pop: None, item_slide: 0.0, separator: 0.0, min_px: 260.0, hover_accent: false, row_slide: 0.0, dialog_alpha: None }
+        Self { player_style: false, row_px: 36.0, hover: 0.12, alpha: 1.0, icon_right: false, shadow: None, row_radius: 7.0, pop: None, item_slide: 0.0, separator: 0.0, min_px: 260.0, hover_accent: false, row_slide: 0.0, dialog_alpha: None }
     }
 }
 
@@ -1896,6 +1912,8 @@ impl Default for SearchLook {
 #[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TopBarLook {
+    /// Use navigation-style circular window controls with compact targets.
+    pub round_window_buttons: bool,
     /// A pill around the row, this wide at most.
     pub capsule_px: Option<f32>,
     /// Its fill: `[black alpha, radius]`.
@@ -1979,6 +1997,7 @@ impl Default for AppStyle {
             frost: false,
             all_bold: false,
             controls: Controls::default(),
+            dark_icon_tooltips: false,
             nav_item: NavItem::default(),
             chip_look: ChipLook::default(),
             card_look: CardLook::default(),
@@ -1996,6 +2015,8 @@ impl Default for AppStyle {
             page_wash_color: String::new(),
             page_foot: None,
             page_rise_px: 0.0,
+            page_slide_px: 0.0,
+            stacked_navigation: false,
             immersive_header: None,
             header_title_px: 40.0,
             glass: GlassLook::default(),
@@ -2115,53 +2136,17 @@ pub fn hex(s: &str) -> Option<Color32> {
     Some(Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
 }
 
-const FILES: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/theme_presets.rs"));
-
-/// Every theme: the app's own and Classic first, then the rest by name.
-pub fn all() -> &'static [Preset] {
-    static ALL: OnceLock<Vec<Preset>> = OnceLock::new();
-    ALL.get_or_init(|| {
-        let mut v: Vec<Preset> = FILES
-            .iter()
-            .filter_map(|(file, json)| match serde_json::from_str::<Preset>(json) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    log::error!("theme {file}: {e}");
-                    None
-                }
-            })
-            .collect();
-        let rank = |p: &Preset| match p.id.as_str() {
-            DEFAULT_ID => 0,
-            "classic" => 1,
-            _ => 2,
-        };
-        v.sort_by_key(|p| (rank(p), p.name.to_lowercase()));
-        v
+/// The desktop uses the bundled AppleTify preset for every profile.
+pub fn active() -> &'static Preset {
+    static ACTIVE: OnceLock<Preset> = OnceLock::new();
+    ACTIVE.get_or_init(|| {
+        serde_json::from_str(include_str!("../assets/themes/presets/ad-nextgen.json"))
+            .expect("the bundled AppleTify preset is valid")
     })
 }
 
-pub fn get(id: &str) -> &'static Preset {
-    all().iter().find(|p| p.id == id).unwrap_or(&all()[0])
-}
-
-static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Make `id` the preset that widgets without access to the app read from.
-pub fn set_active(id: &str) {
-    let i = all().iter().position(|p| p.id == id).unwrap_or(0);
-    ACTIVE.store(i, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn active() -> &'static Preset {
-    &all()[ACTIVE.load(std::sync::atomic::Ordering::Relaxed).min(all().len() - 1)]
-}
-
-/// The preset's cover thumbnail (JPEG), if it has one.
-pub fn cover(id: &str) -> Option<&'static [u8]> {
-    const COVERS: &[(&str, &[u8])] = include!(concat!(env!("OUT_DIR"), "/theme_covers.rs"));
-    COVERS.iter().find(|(k, _)| *k == id).map(|(_, b)| *b)
-}
+#[cfg(test)]
+const FILES: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/theme_presets.rs"));
 
 #[cfg(test)]
 mod tests {
@@ -2186,34 +2171,35 @@ mod tests {
             assert!(!l.font_rem.is_empty() || l.font_vw.is_some(), "{file}: no lyric size");
             assert!(p.cover.spin_secs > 0.0 && l.rem > 0.0, "{file}: zero rem or spin");
         }
-        assert_eq!(all().len(), FILES.len());
-        assert_eq!(get("nope").id, DEFAULT_ID);
-        assert_eq!(all()[0].id, DEFAULT_ID);
-        assert_eq!(all()[1].id, "classic");
+        assert_eq!(active().id, DEFAULT_ID);
+        assert_eq!(active().name, "AppleTify");
     }
 
-    /// Every theme has a cover for its card in Settings.
+    /// Every archived theme has its catalog cover.
     #[test]
     fn themes_have_covers() {
-        for p in all().iter().filter(|p| p.source != "ytm-rs") {
-            assert!(cover(&p.id).is_some(), "{} has no cover", p.id);
+        let folder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/themes/covers");
+        for (id, json) in FILES {
+            let preset: Preset = serde_json::from_str(json).unwrap();
+            if preset.source != "ytm-rs" {
+                assert!(folder.join(format!("{id}.jpg")).is_file(), "{id} has no cover");
+            }
         }
     }
 
-    /// Romanization and translation are drawn from the app's own theme in every theme, so
-    /// no other theme sets them: nothing would read it.
+    /// Archived presets follow the shared text decoration convention.
     #[test]
-    fn only_the_default_theme_styles_romanization_and_translation() {
+    fn archived_themes_keep_shared_romanization_and_translation() {
         const KEYS: &[&str] = &[
             "romanization_rem", "romanization_alpha", "romanization_pill", "romanization_weight", "romanization_font",
             "translation_rem", "translation_alpha", "translation_weight", "translation_font", "translation_delay",
             "both_rem", "deco_enter", "decor_tracking_em", "decor_fullscreen_scale", "decor_gap_em",
             "decor_active_alpha", "decor_em", "decor_line_height",
         ];
-        for (file, json) in FILES.iter().filter(|(file, _)| *file != DEFAULT_ID) {
+        for (file, json) in FILES.iter().filter(|(file, _)| *file != "ytm-rs") {
             let v: serde_json::Value = serde_json::from_str(json).unwrap();
             for key in KEYS {
-                assert!(v["lyrics"].get(key).is_none(), "{file}: lyrics.{key} is only read from {DEFAULT_ID}");
+                assert!(v["lyrics"].get(key).is_none(), "{file}: unexpected shared lyrics field {key}");
             }
         }
     }

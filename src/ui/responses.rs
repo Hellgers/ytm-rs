@@ -12,7 +12,7 @@ use crate::ytm::HomePage;
 
 use crate::remote::{Cmd, RepeatMode};
 
-use super::{Action, App, Dialog, HomeState, LibTab, Page, PlayingAs, Repeat, dev_var, shuffle};
+use super::{Action, App, Dialog, HomeState, LibTab, Page, PlayingAs, Repeat, dev_var};
 
 impl App {
     pub(super) fn pump(&mut self, ctx: &egui::Context, now: f64) {
@@ -52,6 +52,11 @@ impl App {
                 AudioEvent::Ending { .. } => {}
                 AudioEvent::Interrupted { generation, at, reason } if generation == self.generation => self.recover(at, &reason),
                 AudioEvent::Interrupted { .. } => {}
+                AudioEvent::FallbackStarted { generation, listed } => {
+                    if generation == self.generation && self.current_id() == Some(listed.as_str()) {
+                        self.toast("Playback continued using another audio stream");
+                    }
+                }
                 AudioEvent::Error(e) => self.toast(e),
             }
         }
@@ -138,8 +143,13 @@ impl App {
             Cmd::VolumeUp => self.nudge_volume(true),
             Cmd::VolumeDown => self.nudge_volume(false),
             Cmd::SetVolume(v) => self.audio.set_volume(v.clamp(0.0, 1.0)),
-            Cmd::Like(v) => self.apply(Action::LikeHeard(v.unwrap_or(!self.heard_liked()))),
-            Cmd::Shuffle => self.shuffle_upcoming(),
+            Cmd::Like(v) => {
+                // Asked for outright: holding the heart is for clicks that might slip.
+                if let Some(action) = self.heard_like_action(v.unwrap_or(!self.heard_liked())) {
+                    self.apply(action);
+                }
+            }
+            Cmd::Shuffle => self.toggle_shuffle(),
             Cmd::Repeat(mode) => {
                 self.queue.repeat = match mode {
                     Some(RepeatMode::Off) => Repeat::Off,
@@ -279,6 +289,8 @@ impl App {
                     Target::Playlist(id) if self.lists.edits.pending(id) => Some(id.clone()),
                     _ => None,
                 }).collect();
+                // One deleted here, waiting on its Undo, stays out.
+                l.playlists.retain(|c| !matches!(&c.target, Target::Playlist(p) if self.deleting_soon(p)));
                 self.library = Some(l);
                 for id in edited {
                     self.sync_card_count(&id);
@@ -288,6 +300,10 @@ impl App {
             Resp::History(h) => {
                 self.history = Some(h);
                 self.loading = false;
+            }
+            Resp::UploadDeleted(t) => {
+                self.uploads = Some(t);
+                self.toast("Deleted from your uploads");
             }
             Resp::Uploads(t) => {
                 self.uploads = Some(t);
@@ -330,6 +346,9 @@ impl App {
                 }
             }
             Resp::CommentsPage { token, page } => super::comments::on_page(&token, page),
+            Resp::ArtistPicture { id, pic } => {
+                self.artist_pics.insert(id, pic);
+            }
             Resp::Segments { video_id, segments } => {
                 if self.playing_id() == Some(video_id.as_str()) {
                     log::info!("sponsorblock: {} segment(s) for {video_id}", segments.len());
@@ -344,27 +363,27 @@ impl App {
             Resp::Art { key, mut art } => {
                 if self.current_id() == Some(key.as_str()) {
                     crate::art::soften(&mut art, self.look().background.blur_passes.saturating_sub(6));
-                    self.accent = art.accent;
-                    self.art_brightness = art.brightness;
-                    if let Some(bg) = &self.bg {
-                        bg.set_art(art.clone());
-                    }
                     self.track_art = Some(art);
                     self.art_key = Some(key);
-                    self.art_changed = now;
+                    // An animated cover on screen keeps its own colours.
+                    self.show_cover_colours(now);
                 }
             }
-            Resp::Radio { seed, tracks } => {
-                self.radio_pending = false;
+            Resp::Radio { load, tracks } => {
+                let Some(seed) = self.queue.finish_radio(load, self.backend.api().epoch()) else { return };
                 // For a queue since replaced: the one playing now gets its own.
                 if !self.queue.tracks.iter().any(|t| t.id == seed) {
                     self.top_up();
                     return;
                 }
+                let tracks = match tracks {
+                    Ok(tracks) => tracks,
+                    Err(e) => return self.toast(e),
+                };
                 let had = self.queue.tracks.len();
                 self.queue.add_radio(&seed, tracks);
                 let grew = self.queue.tracks.len() > had;
-                if std::mem::take(&mut self.ended) && grew {
+                if grew && std::mem::take(&mut self.ended) {
                     // The track ended while radio was loading: continue now.
                     self.next();
                 } else if !self.buffering {
@@ -372,25 +391,74 @@ impl App {
                 }
             }
             // Unless something else was asked to play meanwhile; shuffled as last asked.
-            Resp::PlayQueue { target, title, mut tracks } => {
+            Resp::PlayQueue { target, title, tracks } => {
                 if let Some((p, shuffled)) = &self.play_pending
                     && *p == target
                 {
-                    if *shuffled {
-                        shuffle(&mut tracks);
-                    }
+                    let shuffled = *shuffled;
                     self.played_title = Some((target.clone(), title));
                     self.queue_source = Some(target);
-                    self.play_list(tracks, 0);
+                    if shuffled {
+                        self.play_shuffled(tracks, None);
+                    } else {
+                        self.play_list(tracks, 0);
+                    }
                 }
             }
             Resp::Liked { video_id, like, other } => {
-                self.lists.edits.confirm_likes(std::slice::from_ref(&video_id), &[]);
-                if like {
-                    self.liked.insert(video_id);
+                self.ratings.invalidate(&video_id);
+                if !self.unliking_soon(&video_id) {
+                    self.lists.edits.confirm_likes(std::slice::from_ref(&video_id), &[]);
+                    if like {
+                        self.liked.insert(video_id);
+                    }
                 }
                 self.other_half_unliked(other);
             }
+            Resp::Disliked { video_id, skip_generation, ok } => {
+                let id = std::slice::from_ref(&video_id);
+                if ok {
+                    self.ratings.confirm(&video_id, crate::ytm::SongRating::Dislike);
+                    self.lists.edits.confirm_likes(id, &[]);
+                    if self.rating_settings.dislike_notices {
+                        self.toast("Disliked song");
+                    }
+                    let rated = Some(video_id.as_str());
+                    if self.rating_settings.skip_disliked
+                        && skip_generation == Some(self.generation)
+                        && (self.current_id() == rated || self.playing_id() == rated)
+                    {
+                        self.skip_disliked();
+                    }
+                } else {
+                    self.lists.edits.confirm_likes(&[], id);
+                    self.request_liked(true);
+                    self.toast("Couldn't dislike song");
+                }
+            }
+            Resp::RatingRemoved { video_id, was_disliked, ok } => {
+                if ok {
+                    self.ratings.confirm(&video_id, crate::ytm::SongRating::Indifferent);
+                    if was_disliked {
+                        if self.rating_settings.dislike_notices {
+                            self.toast("Dislike removed");
+                        }
+                    } else {
+                        self.liked.remove(&video_id);
+                        self.lists.edits.forget_like_edit(&video_id);
+                        // YouTube Music may list a video like under its matched audio track.
+                        self.request_liked(true);
+                    }
+                } else {
+                    if !was_disliked {
+                        self.ratings.invalidate(&video_id);
+                        self.lists.edits.confirm_likes(&[], std::slice::from_ref(&video_id));
+                        self.request_liked(true);
+                    }
+                    self.toast(if was_disliked { "Couldn't remove dislike" } else { "Couldn't remove like" });
+                }
+            }
+            Resp::SongRating { video_id, round, rating } => self.ratings.finish(video_id, round, rating, now),
             Resp::QuickPicksMore { seed, tracks } => {
                 if let Some(h) = &mut self.home {
                     h.picks_loading = false;
@@ -405,19 +473,21 @@ impl App {
                 }
             }
             Resp::LikeProgress { taken, done, total, like } => {
-                if !like {
-                    let tracks: Vec<Track> = taken.iter().filter_map(|id| self.unliking.remove(id)).collect();
-                    self.set_liked(&tracks, false);
+                for id in &taken {
+                    self.ratings.invalidate(id);
                 }
                 if done == 0 {
                     // A Spotify transfer is adding to Liked Music (maybe paused): this waits for it.
                     self.toast("Waiting for the transfer to finish adding to Liked Music…");
-                } else if total > 1 && done < total {
+                } else if total > 1 && done < total && (like || self.rating_settings.unlike_notices) {
                     let note = if self.backend.api().limited() { " (YouTube Music is limiting requests; waiting)" } else { "" };
                     self.toast(format!("{} {done} of {total} songs…{note}", if like { "Liking" } else { "Removing likes:" }));
                 }
             }
             Resp::LikedMany { video_ids, failed, like, others } => {
+                for id in &video_ids {
+                    self.ratings.invalidate(id);
+                }
                 self.on_liked_many(video_ids, failed, like);
                 self.other_half_unliked(others);
             }
@@ -448,9 +518,14 @@ impl App {
                     (false, false) => "Couldn't unsubscribe",
                 });
             }
+            Resp::DeleteFailed { error } => {
+                // It's still there: the library lists it again.
+                self.request_library();
+                self.toast(error);
+            }
             Resp::RemoveFailed { id, error } => {
                 // Its songs are still there: they come back with a reload.
-                self.lists.edits.removal_failed(&id);
+                self.removal_failed(&id);
                 if self.lists.known(&id) {
                     self.load_list(&id, false, true);
                 }
@@ -515,7 +590,7 @@ impl App {
             Resp::MusicVideo { song, video } => {
                 self.music_videos.insert(song, video);
             }
-            Resp::PlayError { generation, msg } => self.on_play_error(generation, msg),
+            Resp::PlayError { generation, at, msg } => self.on_play_error(generation, at, msg),
             Resp::ServerQueue(q) => self.adopt_server_queue(q),
             Resp::Account { name, photo } => {
                 self.account_name = name.or(self.account_name.take());
@@ -575,6 +650,7 @@ impl App {
     /// Songs whose likes went along with their other versions': not liked here either.
     fn other_half_unliked(&mut self, ids: impl IntoIterator<Item = String>) {
         for id in ids {
+            self.ratings.invalidate(&id);
             self.liked.remove(&id);
             let listed = self.opened(super::LIKED_MUSIC).and_then(|o| o.c.tracks.iter().find(|t| t.id == id).cloned());
             if let Some(t) = listed {
@@ -646,19 +722,17 @@ impl App {
     /// Liking or unliking many songs at once has finished: `failed` are the ones YouTube
     /// Music refused.
     fn on_liked_many(&mut self, video_ids: Vec<String>, failed: Vec<String>, like: bool) {
-        // Any left (a retry took them) leave the list now.
-        if !like {
-            let rest: Vec<Track> = video_ids.iter().filter_map(|id| self.unliking.remove(id)).collect();
-            self.set_liked(&rest, false);
-            for id in &failed {
-                self.unliking.remove(id);
-            }
+        for id in &failed {
+            self.ratings.invalidate(id);
         }
         log::debug!("like={like} answered: {} taken, {} refused {:?}", video_ids.len(), failed.len(), failed.iter().take(5).collect::<Vec<_>>());
         self.lists.edits.confirm_likes(&video_ids, &failed);
         // The refused ones come back as they were with a reload.
         if !failed.is_empty() {
             self.request_liked(true);
+        }
+        if !like && (!self.rating_settings.unlike_notices || video_ids.len() <= 1) && failed.is_empty() {
+            return;
         }
         let count = video_ids.len();
         let mut msg = format!("{} {count} {}", if like { "Liked" } else { "Removed like from" }, if count == 1 { "song" } else { "songs" });
@@ -688,15 +762,7 @@ impl App {
             if self.queue.fill.as_ref().is_some_and(|f| f.id == id) {
                 self.queue.fill = None;
             }
-            let gone = Page::Playlist(id);
-            if self.page == gone {
-                self.go(Page::Library(LibTab::Playlists));
-            }
-            // Back and Forward skip it.
-            self.back.retain(|p| *p != gone);
-            self.back.dedup();
-            self.forward.retain(|p| *p != gone);
-            self.forward.dedup();
+            self.leave_playlist(&id);
         } else {
             if message == "Removed from playlist" {
                 self.lists.edits.confirm_removal(&id);
@@ -707,29 +773,14 @@ impl App {
                 self.load_list(&id, false, true);
             }
         }
-        self.toast(message);
+        // These the toast said when they were made (and another now would take an Undo's place).
+        if !matches!(message, "Removed from playlist" | "Playlist deleted") {
+            self.toast(message);
+        }
     }
 
     /// A song couldn't play: skip it, or stop when skipping can't help.
-    fn on_play_error(&mut self, generation: u64, msg: String) {
-        match play_error_action(generation, self.generation, self.recovery_at) {
-            PlayErrorAction::Ignore => return,
-            PlayErrorAction::KeepTrackAt(at) => {
-                // The interrupted play still owns its queue item and exact target.
-                // Do not let the initial-play handler skip it or mark it ended.
-                self.recovery_at = None;
-                self.buffering = false;
-                self.ended = false;
-                self.resume_at = Some(at);
-                self.audio.status.position_ms.store(at.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
-                self.audio.status.playing.store(false, std::sync::atomic::Ordering::Relaxed);
-                let title = self.current().map(|t| t.title.clone()).unwrap_or_default();
-                log::warn!("recovery generation {generation} failed at {at:?}: {msg}");
-                self.toast(format!("Couldn't resume \"{title}\": {msg}. Press play to try again from {}.", super::fmt_time(at.as_secs() as u32)));
-                return;
-            }
-            PlayErrorAction::Initial => {}
-        }
+    fn on_play_error(&mut self, generation: u64, at: Duration, msg: String) {
         if generation == self.generation {
             self.buffering = false;
             let title = self.current().map(|t| t.title.clone()).unwrap_or_default();
@@ -738,6 +789,12 @@ impl App {
             } else {
                 msg
             };
+            if self.recoveries > 0 || !at.is_zero() {
+                self.audio.status.position_ms.store(at.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+                self.resume_at = Some(at);
+                self.toast(format!("Couldn't resume \"{title}\". Press play to try again."));
+                return;
+            }
             let has_next = !self.queue.at_end() && self.queue.index.is_some();
             // Skipping can't help when the account is the problem: the rest of
             // an album like this needs it too. Stop on the song instead.
@@ -761,7 +818,16 @@ impl App {
     /// Signed in or out: what belonged to the last account goes, and the new one's home,
     /// library and likes load.
     fn on_logged_in(&mut self, v: bool, now: f64) {
+        // An Undo made meanwhile was the last account's: it isn't sent as this one.
+        self.undo = None;
+        self.toast_after_unlike = None;
+        self.ratings.reset();
         self.logged_in = v;
+        if let Some(seed) = self.queue.radio_seed.take()
+            && let Some(t) = self.current().filter(|t| t.id == seed).cloned()
+        {
+            self.request_radio(t);
+        }
         self.channels = None;
         self.channels_asked = None;
         // Recent searches belong to the account.
@@ -786,7 +852,6 @@ impl App {
         self.lists.clear();
         self.lists.edits = Default::default();
         self.liked.clear();
-        self.unliking.clear();
         self.queue.fill = None;
         self.play_pending = None;
         if self.page_list().is_some() || matches!(self.page, Page::Artist(_)) {
@@ -819,7 +884,6 @@ impl App {
         self.load_failed |= self.loading || (self.page == Page::Home && self.home_loading);
         self.loading = false;
         self.home_loading = false;
-        self.radio_pending = false;
         if let Some(h) = &mut self.home {
             h.loading_more = None;
             h.picks_loading = false;
@@ -828,47 +892,6 @@ impl App {
     }
 }
 
-/// Startup failures may skip an unplayable item; recovery failures retain its position.
-#[derive(Debug, PartialEq, Eq)]
-enum PlayErrorAction {
-    Ignore,
-    KeepTrackAt(Duration),
-    Initial,
-}
-
-fn play_error_action(generation: u64, current: u64, recovery_at: Option<Duration>) -> PlayErrorAction {
-    if generation != current {
-        PlayErrorAction::Ignore
-    } else if let Some(at) = recovery_at {
-        PlayErrorAction::KeepTrackAt(at)
-    } else {
-        PlayErrorAction::Initial
-    }
-}
-
-#[cfg(test)]
-mod recovery_error_tests {
-    use super::{PlayErrorAction, play_error_action};
-    use std::time::Duration;
-
-    #[test]
-    fn failed_recovery_keeps_exact_interruption_position_instead_of_skipping() {
-        let at = Duration::from_millis(113_195);
-        assert_eq!(play_error_action(191, 191, Some(at)), PlayErrorAction::KeepTrackAt(at));
-        assert_eq!(play_error_action(192, 192, Some(at)), PlayErrorAction::KeepTrackAt(at));
-    }
-
-    #[test]
-    fn stale_recovery_failure_cannot_change_current_playback() {
-        assert_eq!(play_error_action(191, 192, Some(Duration::from_millis(113_195))), PlayErrorAction::Ignore);
-        assert_eq!(play_error_action(191, 192, None), PlayErrorAction::Ignore);
-    }
-
-    #[test]
-    fn initial_play_failure_keeps_existing_initial_error_policy() {
-        assert_eq!(play_error_action(191, 191, None), PlayErrorAction::Initial);
-    }
-}
 /// Unplayable songs skipped in a row before playback stops.
 const MAX_SKIPS: u32 = 3;
 

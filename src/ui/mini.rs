@@ -34,6 +34,7 @@ const PINNED_BY_DEFAULT: bool = true;
 const CLOSE: CloseButton = CloseButton::LikeFullWindow;
 /// From the work area's corner, the first time.
 const MARGIN: f32 = 16.0;
+const RATING_ICON_SIZE: f32 = 17.0;
 /// The open pill's button that grows it into a card with more of the song: only where the
 /// window can be clipped to a shape (Windows). Elsewhere a window big enough for the card
 /// would take the clicks meant for what's around the pill.
@@ -86,8 +87,18 @@ static MOVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 #[cfg(windows)]
 static SHAPE: std::sync::Mutex<Option<(f32, Vec2, Vec2)>> = std::sync::Mutex::new(None);
 
+/// The mini player is up and kept on top. Windows' Show desktop minimizes even windows
+/// kept on top, so the window takes itself back then; only the user's own minimize counts.
+static ON_TOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keep the window above others or not, and say so to the window's own handling.
+fn set_level(ctx: &egui::Context, on_top: bool) {
+    ON_TOP.store(on_top, std::sync::atomic::Ordering::Relaxed);
+    ctx.send_viewport_cmd(ViewportCommand::WindowLevel(if on_top { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal }));
+}
+
 /// Keeps picture in picture in the video's shape while it's resized (Windows; elsewhere it
-/// takes the shape once the resize is over).
+/// takes the shape once the resize is over), and a kept-on-top mini player on top.
 #[cfg_attr(not(windows), allow(unused_variables))]
 pub fn set_hwnd(hwnd: *mut std::ffi::c_void) {
     #[cfg(windows)]
@@ -96,13 +107,32 @@ pub fn set_hwnd(hwnd: *mut std::ffi::c_void) {
 
 #[cfg(windows)]
 mod shape {
-    use std::sync::atomic::Ordering;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
-    use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_SIZING, WMSZ_BOTTOMLEFT, WMSZ_BOTTOM, WMSZ_LEFT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetClientRect, GetWindowLongW, GetWindowRect, HWND_TOPMOST, IsIconic, PostMessageW, RegisterWindowMessageW, SC_MINIMIZE, SIZE_MINIMIZED, SW_SHOWNOACTIVATE,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, ShowWindow, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_SIZE, WM_SIZING, WM_SYSCOMMAND, WM_WINDOWPOSCHANGED, WMSZ_BOTTOMLEFT,
+        WMSZ_BOTTOM, WMSZ_LEFT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WS_EX_TOPMOST,
+    };
+    use windows::core::w;
+
+    /// The user minimized the window (its taskbar button, Win+Down, the window menu), which
+    /// Windows asks for first. Show desktop doesn't.
+    static ASKED: AtomicBool = AtomicBool::new(false);
+
+    /// Posted to bring the window back (after Show desktop, or onto the top again) once
+    /// Windows is done with what it's doing to it.
+    fn restore_msg() -> u32 {
+        static MSG: OnceLock<u32> = OnceLock::new();
+        // SAFETY: a constant, NUL-terminated name.
+        *MSG.get_or_init(|| unsafe { RegisterWindowMessageW(w!("ytm-rs mini player restore")) })
+    }
 
     pub fn init(hwnd: *mut std::ffi::c_void) {
+        restore_msg();
         // SAFETY: the app's own window, on the thread that made it; the subclass lives as
         // long as the window.
         if !unsafe { SetWindowSubclass(HWND(hwnd), Some(proc), 3, 0) }.as_bool() {
@@ -111,9 +141,42 @@ mod shape {
     }
 
     unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _: usize, _: usize) -> LRESULT {
+        let on_top = super::ON_TOP.load(Ordering::Relaxed);
         match msg {
             WM_ENTERSIZEMOVE => super::MOVING.store(true, Ordering::Relaxed),
             WM_EXITSIZEMOVE => super::MOVING.store(false, Ordering::Relaxed),
+            WM_SYSCOMMAND if wparam.0 as u32 & 0xFFF0 == SC_MINIMIZE => ASKED.store(true, Ordering::Relaxed),
+            // Minimized without being asked: Show desktop (or minimize all). Back, without
+            // taking the keyboard from what the user went to.
+            WM_SIZE if wparam.0 as u32 == SIZE_MINIMIZED => {
+                if !ASKED.swap(false, Ordering::Relaxed) && on_top {
+                    log::info!("mini player: minimized by the system while kept on top, showing it again");
+                    // SAFETY: the app's own window.
+                    let _ = unsafe { PostMessageW(Some(hwnd), restore_msg(), WPARAM(0), LPARAM(0)) };
+                }
+            }
+            WM_SIZE => ASKED.store(false, Ordering::Relaxed),
+            // Taken off the top by something else (the app's own unpin clears `ON_TOP` first):
+            // back on top once Windows is done with this change.
+            WM_WINDOWPOSCHANGED if on_top && !topmost(hwnd) => {
+                log::info!("mini player: taken off the top while kept there, putting it back");
+                // SAFETY: the app's own window.
+                let _ = unsafe { PostMessageW(Some(hwnd), restore_msg(), WPARAM(0), LPARAM(0)) };
+            }
+            _ if msg == restore_msg() => {
+                if on_top {
+                    // SAFETY: the app's own window, on its thread.
+                    unsafe {
+                        if IsIconic(hwnd).as_bool() {
+                            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                        }
+                        if !topmost(hwnd) {
+                            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                        }
+                    }
+                }
+                return LRESULT(0);
+            }
             _ => {}
         }
         // SAFETY: the window's own message, passed on as it came.
@@ -147,6 +210,12 @@ mod shape {
             r.bottom = r.top + h;
         }
         LRESULT(1)
+    }
+
+    fn topmost(hwnd: HWND) -> bool {
+        // SAFETY: a plain query on the app's own window.
+        let ex = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
+        ex as u32 & WS_EX_TOPMOST.0 != 0
     }
 }
 
@@ -702,7 +771,7 @@ impl Mini {
     pub fn set_pinned(&mut self, ctx: &egui::Context, on: bool) {
         self.pinned = on;
         if self.active() {
-            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(if on { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal }));
+            set_level(ctx, on);
         }
     }
 
@@ -815,7 +884,7 @@ impl Mini {
                     corner_place(area, frame, scale, ctx.zoom_factor())
                 }
             };
-            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(if self.pinned { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal }));
+            set_level(ctx, self.pinned);
             self.go(ctx, target, false, true)
         } else {
             if let Some(p) = now_place {
@@ -823,7 +892,7 @@ impl Mini {
                 self.set_place(p);
             }
             (self.tall, self.lifted, self.grown) = (false, false, false);
-            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::Normal));
+            set_level(ctx, false);
             // Kept until the window has settled: a save meanwhile still writes it.
             match self.full {
                 Some((p, max)) if self.visible(p, frame) => self.go(ctx, p, max, false),
@@ -888,7 +957,7 @@ impl Mini {
     }
 }
 
-/// The strip: cover, title and artists, like / previous / play / next / volume, a seek
+/// The strip: cover, title and artists, rating and playback controls, a seek
 /// line along the bottom, and pin / full window / close at the top right.
 pub fn strip(app: &mut App, ui: &mut Ui, now: f64) {
     let ctx = ui.ctx().clone();
@@ -971,19 +1040,21 @@ pub fn strip(app: &mut App, ui: &mut Ui, now: f64) {
         app.mini.set_pinned(&ctx, !pinned);
     }
 
-    // One group, centred under the text: like, previous, play, next, volume.
+    // One group, centred under the text: like, dislike, previous, play, next, volume.
     let cy = art.bottom() - 17.0;
-    let cx = (x0 + x1) / 2.0;
+    let show_dislike = app.rating_settings.player_button;
+    let gap = if show_dislike { 36.0 } else { 44.0 };
+    let cx = (x0 + x1) / 2.0 + if show_dislike { gap / 2.0 } else { 0.0 };
     let enabled = track.is_some();
     let small = |ui: &mut Ui, c: Pos2, glyph: char, name: &str| -> bool {
         let b = Rect::from_center_size(c, Vec2::splat(34.0));
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(b));
         widgets::icon_button(&mut child, glyph, 18.0, name, false).clicked()
     };
-    if small(ui, pos2(cx - 44.0, cy), icon::SKIP_BACK, "Previous") && enabled {
+    if small(ui, pos2(cx - gap, cy), icon::SKIP_BACK, "Previous") && enabled {
         app.prev();
     }
-    if small(ui, pos2(cx + 44.0, cy), icon::SKIP_FORWARD, "Next") && enabled {
+    if small(ui, pos2(cx + gap, cy), icon::SKIP_FORWARD, "Next") && enabled {
         app.next();
     }
     let playing = app.playing();
@@ -1002,24 +1073,32 @@ pub fn strip(app: &mut App, ui: &mut Ui, now: f64) {
         // What's heard, like Now playing's menu: a song version standing in for the music video.
         let t = &app.playing_track().cloned().unwrap_or_else(|| t.clone());
         let liked = app.heard_liked();
-        let lpos = pos2(cx - 88.0, cy);
-        let lresp = ui.interact(Rect::from_center_size(lpos, Vec2::splat(32.0)), ui.scope_id().with("mini-like"), Sense::click());
+        let lpos = pos2(cx - gap * if show_dislike { 3.0 } else { 2.0 }, cy);
+        let lresp = ui.interact(Rect::from_center_size(lpos, Vec2::splat(32.0)), ui.scope_id().with(("mini-like", &t.id, app.generation)), Sense::click());
         let name = if liked { "Remove like" } else { "Like" };
-        let lresp = named(lresp, name).on_hover_text(name).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let lresp = named(lresp, name).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let gesture = super::ratings::like_gesture(ui, &lresp, (), liked, None);
         let lh = theme::anim_bool(&ctx, lresp.id.with("h"), lresp.hovered(), 0.15);
         let pop = theme::anim_bool(&ctx, ("liked", &t.id), liked, 0.3);
         ui.painter().circle_filled(lpos, 16.0, theme::glass(0.1 * lh));
-        let size = 17.0 * (1.0 + 0.25 * (pop * std::f32::consts::PI).sin());
+        let size = RATING_ICON_SIZE * (1.0 + 0.25 * (pop * std::f32::consts::PI).sin());
         let outline = theme::lerp_color(theme::lerp_color(theme::text_dim(), theme::text(), lh), theme::RED, pop);
-        widgets::heart(ui, lpos, size, pop, outline, theme::RED);
-        if lresp.clicked() {
-            app.actions.push(Action::LikeHeard(!liked));
+        super::ratings::unlike_heart(ui, lpos, size, pop, outline, theme::RED, gesture.progress);
+        if gesture.hint {
+            super::ratings::unlike_hint(ui, &lresp);
+        }
+        if gesture.activate && let Some(action) = app.heard_like_action(!liked) {
+            app.actions.push(action);
+        }
+        if show_dislike {
+            let rect = Rect::from_center_size(pos2(cx - 2.0 * gap, cy), Vec2::splat(34.0));
+            super::ratings::player_button(app, ui, rect, t, RATING_ICON_SIZE, true);
         }
     }
 
     // Volume: click to mute, scroll to change.
     let vol = app.audio.volume();
-    let vpos = pos2(cx + 88.0, cy);
+    let vpos = pos2(cx + 2.0 * gap, cy);
     let vresp = ui.interact(Rect::from_center_size(vpos, Vec2::splat(32.0)), ui.scope_id().with("mini-vol"), Sense::click());
     let pct = format!("Volume {}%", (vol * 100.0).round());
     let vresp = named(vresp, "Mute").on_hover_text(pct).on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1176,7 +1255,7 @@ fn pill_row(app: &mut App, ui: &mut Ui, rect: Rect, reveal: f32, toast: Option<S
             let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * frac * i as f32 / steps as f32;
             c + vec2(a.cos(), a.sin()) * 18.5
         });
-        ui.painter().add(egui::Shape::Path(egui::epaint::PathShape::line(pts.collect(), egui::epaint::PathStroke::new(2.0, app.accent_color()))));
+        ui.painter().add(egui::Shape::Path(egui::epaint::PathShape::line(pts.collect(), egui::epaint::PathStroke::new(2.0, app.progress_color(0.2)))));
     }
     let art = Rect::from_center_size(c, Vec2::splat(32.0));
     match &track {
@@ -1251,8 +1330,8 @@ fn pill_row(app: &mut App, ui: &mut Ui, rect: Rect, reveal: f32, toast: Option<S
     }
 }
 
-/// The pill's card: where it's playing from, the cover with title, artists and album and a
-/// like, a seek bar with the times, shuffle / previous / play / next / repeat, and volume.
+/// The pill's card: where it's playing from, the cover, song details and rating controls,
+/// a seek bar with the times, shuffle / previous / play / next / repeat, and volume.
 fn card_body(app: &mut App, ui: &mut Ui, cr: Rect, now: f64) {
     let ctx = ui.ctx().clone();
     let (l, rt, top) = (cr.left() + 18.0, cr.right() - 18.0, cr.top());
@@ -1263,8 +1342,8 @@ fn card_body(app: &mut App, ui: &mut Ui, cr: Rect, now: f64) {
         widgets::icon_button(&mut child, glyph, size, name, active).clicked()
     };
 
-    // Where it's playing from (its name opens it in the full window); the full window and
-    // back to the pill beside it.
+    // Where it's playing from (its name opens it in the full window); keep on top, the full
+    // window and back to the pill beside it.
     let head = top + 30.0;
     if button(ui, pos2(rt - 8.0, head), if app.mini.up { icon::CHEVRON_DOWN } else { icon::CHEVRON_UP }, 16.0, "Less", false) {
         app.mini.set_card(&ctx, false);
@@ -1272,8 +1351,12 @@ fn card_body(app: &mut App, ui: &mut Ui, cr: Rect, now: f64) {
     if button(ui, pos2(rt - 42.0, head), icon::MAXIMIZE_2, 14.0, "Full window (Ctrl+M)", false) {
         app.actions.push(Action::Mini(false));
     }
-    let head_w = rt - 66.0 - l;
-    // A toast ("Shuffled up next", "Sign in to like songs") takes the header's place while
+    let pinned = app.mini.pinned;
+    if button(ui, pos2(rt - 76.0, head), if pinned { icon::PIN } else { icon::PIN_OFF }, 14.0, if pinned { "Stop keeping on top" } else { "Keep on top" }, pinned) {
+        app.mini.set_pinned(&ctx, !pinned);
+    }
+    let head_w = rt - 100.0 - l;
+    // A toast ("Only the host can shuffle the jam", "Sign in to like songs") takes the header's place while
     // it lasts, kept through its fade-out.
     let toast_id = egui::Id::unique("card-toast");
     if let Some((msg, _)) = &app.toast {
@@ -1317,7 +1400,7 @@ fn card_body(app: &mut App, ui: &mut Ui, cr: Rect, now: f64) {
         }
     }
 
-    // The cover, title, artists and album, and a like.
+    // The cover, title, artists, album and rating controls.
     let art = Rect::from_min_size(pos2(l, top + 60.0), Vec2::splat(68.0));
     match &track {
         Some(t) => paint_cover(ui, art, &t.thumbs, theme::thumb_radius() + 4.0, 1.0),
@@ -1327,7 +1410,8 @@ fn card_body(app: &mut App, ui: &mut Ui, cr: Rect, now: f64) {
         }
     }
     let x0 = art.right() + 14.0;
-    let text_w = (rt - 34.0 - x0).max(20.0);
+    let show_dislike = app.rating_settings.player_button;
+    let text_w = (rt - if show_dislike { 68.0 } else { 34.0 } - x0).max(20.0);
     match &track {
         Some(t) => {
             let tr = widgets::title_at(ui, pos2(x0, art.top() + 6.0), &t.title, t.explicit, theme::semibold(15.0), theme::text(), text_w);
@@ -1345,18 +1429,26 @@ fn card_body(app: &mut App, ui: &mut Ui, cr: Rect, now: f64) {
         // What's heard, like Now playing's menu: a song version standing in for the music video.
         let t = &app.playing_track().cloned().unwrap_or_else(|| t.clone());
         let liked = app.heard_liked();
-        let lpos = pos2(rt - 8.0, art.center().y);
-        let lresp = ui.interact(Rect::from_center_size(lpos, Vec2::splat(32.0)), ui.scope_id().with("card-like"), Sense::click());
+        let lpos = pos2(rt - if show_dislike { 44.0 } else { 8.0 }, art.center().y);
+        let lresp = ui.interact(Rect::from_center_size(lpos, Vec2::splat(32.0)), ui.scope_id().with(("card-like", &t.id, app.generation)), Sense::click());
         let name = if liked { "Remove like" } else { "Like" };
-        let lresp = named(lresp, name).on_hover_text(name).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let lresp = named(lresp, name).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let gesture = super::ratings::like_gesture(ui, &lresp, (), liked, None);
         let lh = theme::anim_bool(&ctx, lresp.id.with("h"), lresp.hovered(), 0.15);
         let pop = theme::anim_bool(&ctx, ("liked", &t.id), liked, 0.3);
         ui.painter().circle_filled(lpos, 16.0, theme::glass(0.1 * lh));
-        let size = 17.0 * (1.0 + 0.25 * (pop * std::f32::consts::PI).sin());
+        let size = RATING_ICON_SIZE * (1.0 + 0.25 * (pop * std::f32::consts::PI).sin());
         let outline = theme::lerp_color(theme::lerp_color(theme::text_dim(), theme::text(), lh), theme::RED, pop);
-        widgets::heart(ui, lpos, size, pop, outline, theme::RED);
-        if lresp.clicked() {
-            app.actions.push(Action::LikeHeard(!liked));
+        super::ratings::unlike_heart(ui, lpos, size, pop, outline, theme::RED, gesture.progress);
+        if gesture.hint {
+            super::ratings::unlike_hint(ui, &lresp);
+        }
+        if gesture.activate && let Some(action) = app.heard_like_action(!liked) {
+            app.actions.push(action);
+        }
+        if show_dislike {
+            let rect = Rect::from_center_size(pos2(rt - 8.0, art.center().y), Vec2::splat(34.0));
+            super::ratings::player_button(app, ui, rect, t, RATING_ICON_SIZE, true);
         }
     }
 
@@ -1365,8 +1457,12 @@ fn card_body(app: &mut App, ui: &mut Ui, cr: Rect, now: f64) {
     // Shuffle, previous, play, next, repeat.
     let cy = top + 192.0;
     let cx = cr.center().x;
-    if button(ui, pos2(cx - 104.0, cy), icon::SHUFFLE, 16.0, "Shuffle up next", false) {
-        app.shuffle_upcoming();
+    let spos = pos2(cx - 104.0, cy);
+    if button(ui, spos, icon::SHUFFLE, 16.0, "Shuffle", app.queue.shuffled()) {
+        app.toggle_shuffle();
+    }
+    if app.queue.shuffled() {
+        ui.painter().circle_filled(spos + vec2(0.0, 15.0), 2.0, app.accent_color());
     }
     if button(ui, pos2(cx - 54.0, cy), icon::SKIP_BACK, 20.0, "Previous", false) && enabled {
         app.prev();
@@ -1434,7 +1530,7 @@ fn card_seek(app: &mut App, ui: &mut Ui, line: Rect, track: Option<&crate::model
     ui.painter().rect_filled(bar, thick / 2.0, theme::glass(0.18));
     let frac = if total > 0.0 { pos / total } else { 0.0 };
     let fill = Rect::from_min_size(bar.min, vec2(bar.width() * frac, thick));
-    ui.painter().rect_filled(fill, thick / 2.0, app.accent_color());
+    ui.painter().rect_filled(fill, thick / 2.0, app.progress_color(0.18));
     if h > 0.0 {
         ui.painter().circle_filled(pos2(fill.right(), bar.center().y), 6.0 * h, theme::text());
     }
@@ -1553,7 +1649,9 @@ pub fn video_pip(app: &mut App, ui: &mut Ui, now: f64) {
 
     let mut faded = ui.new_child(egui::UiBuilder::new().max_rect(r));
     faded.multiply_opacity(reveal);
-    seek_line(app, &mut faded, r, track.as_ref());
+    let edge = titlebar::resize_inset(&ctx);
+    let seek = r.shrink2(vec2(edge, 0.0)).with_max_y(r.bottom() - edge);
+    seek_line(app, &mut faded, seek, track.as_ref());
 }
 
 /// What the mini player's × does.
@@ -1583,7 +1681,7 @@ fn seek_line(app: &mut App, ui: &mut Ui, r: Rect, track: Option<&crate::model::T
     let line = Rect::from_min_max(pos2(r.left(), r.bottom() - thick), r.max);
     ui.painter().rect_filled(line, 0.0, theme::glass(0.2));
     let frac = if total > 0.0 { pos / total } else { 0.0 };
-    ui.painter().rect_filled(Rect::from_min_size(line.min, vec2(line.width() * frac, thick)), 0.0, app.accent_color());
+    ui.painter().rect_filled(Rect::from_min_size(line.min, vec2(line.width() * frac, thick)), 0.0, app.progress_color(0.2));
     let at = |p: Pos2| ((p.x - r.left()) / r.width()).clamp(0.0, 1.0) * total;
     if h > 0.0
         && let Some(p) = resp.hover_pos().or(resp.interact_pointer_pos())

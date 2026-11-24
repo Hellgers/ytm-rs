@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// First: its tr! is used everywhere after.
+#[macro_use]
+mod i18n;
 mod appicon;
 mod fullscreen;
 mod hls;
@@ -7,11 +10,11 @@ mod proxy;
 mod renderer;
 mod art;
 mod audio;
-mod audio_source;
 mod awake;
 mod backdrop;
 mod backend;
 mod bidi;
+mod cache;
 mod canvas;
 mod deeplink;
 mod discord;
@@ -111,6 +114,7 @@ fn main() -> eframe::Result {
     }
     init_logging();
     settle_window_system();
+    trim_heap_periodically();
     update::clean_portable();
     stream::init_dev_hooks();
     proxy::init(&data_dir());
@@ -127,6 +131,11 @@ fn main() -> eframe::Result {
         // Windows, and Linux where the desktop draws none: the app draws its own title
         // bar (see `ui::titlebar`).
         .with_decorations(!ui::custom_titlebar())
+        // macOS: its frame, without its title strip; the traffic lights go on the app's
+        // top row (see `ui::titlebar`).
+        .with_fullsize_content_view(ui::titlebar_inset())
+        .with_titlebar_shown(!ui::titlebar_inset())
+        .with_title_shown(!ui::titlebar_inset())
         .with_icon(appicon::get(appicon::load(&data_dir())).icon_data().expect("bundled icons are valid PNGs"));
     if background {
         viewport = viewport.with_position([-4000.0, 0.0]).with_inner_size([1920.0, 1057.0]).with_active(false).with_taskbar(false);
@@ -216,6 +225,17 @@ fn main() -> eframe::Result {
             egui_extras::install_image_loaders(&ctx);
             ctx.add_bytes_loader(Arc::new(images::HttpImages::new(backend.clone())));
 
+            // Which GL driver this is, for reports of drawing problems (Windows on ARM runs
+            // GL through Mesa's D3D12 layer), and for the title bar's driver workaround.
+            let gl_vendor = cc.gl.as_ref().map(|gl| {
+                use eframe::glow::HasContext;
+                // SAFETY: plain string queries on the current context.
+                let (vendor, renderer, version) =
+                    unsafe { (gl.get_parameter_string(eframe::glow::VENDOR), gl.get_parameter_string(eframe::glow::RENDERER), gl.get_parameter_string(eframe::glow::VERSION)) };
+                log::info!("gl: {renderer} ({version}, {vendor})");
+                vendor
+            });
+
             let (media_tx, media_rx) = unbounded();
             if let Some(h) = hwnd(cc) {
                 appicon::set_hwnd(h);
@@ -225,22 +245,20 @@ fn main() -> eframe::Result {
                 if let Some(window) = cc.winit_window().map(Arc::downgrade) {
                     fullscreen::set_drag(move || window.upgrade().is_some_and(|w| w.has_focus() && w.drag_window().is_ok()));
                 }
-                ui::set_titlebar_hwnd(h);
+                ui::set_titlebar_hwnd(h, gl_vendor.as_deref());
                 ui::set_mini_hwnd(h);
                 backdrop::prepare(h);
                 // eframe sets only the small icon; the taskbar button wants the big one.
                 appicon::set_window_icon(appicon::get(appicon::load(backend.data_dir())));
             }
-            let media = media::Media::new(hwnd(cc), media_tx, wake);
-
-            // Which GL driver this is, for reports of drawing problems (Windows on ARM runs
-            // GL through Mesa's D3D12 layer).
-            if let Some(gl) = &cc.gl {
-                use eframe::glow::HasContext;
-                // SAFETY: plain string queries on the current context.
-                let (renderer, version) = unsafe { (gl.get_parameter_string(eframe::glow::RENDERER), gl.get_parameter_string(eframe::glow::VERSION)) };
-                log::info!("gl: {renderer} ({version})");
+            #[cfg(target_os = "macos")]
+            if let Ok(h) = raw_window_handle::HasWindowHandle::window_handle(cc)
+                && let raw_window_handle::RawWindowHandle::AppKit(h) = h.as_raw()
+            {
+                ui::set_titlebar_view(h.ns_view.as_ptr());
             }
+            let media = media::Media::new(hwnd(cc), media_tx, media::Direct::new(audio.clone()), wake);
+
             if let Some(rs) = &cc.wgpu_render_state {
                 let info = rs.adapter.get_info();
                 log::info!("wgpu: {} ({:?}, driver {} {})", info.name, info.backend, info.driver, info.driver_info);
@@ -349,6 +367,22 @@ fn x11_for_tray(wayland: bool, x11: bool, close_to_tray: bool, keep_wayland: boo
 /// decided before the window, and so the settings, exist.
 fn close_to_tray_saved(app_ron: &str) -> bool {
     app_ron.split_whitespace().collect::<String>().contains("\"close_to_tray\":\"1\"")
+}
+
+/// Linux: every few minutes, give the system back the memory glibc keeps after it's freed
+/// (#107). Two heaps and the early release of big blocks (`main`) leave the small pieces:
+/// glibc only shrinks a heap from its end, so a freed page between live ones stays with
+/// the app until a trim. A trim is glibc walking its heaps, on its own thread.
+fn trim_heap_periodically() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    std::thread::Builder::new()
+        .name("heap-trim".into())
+        .spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(180));
+            // SAFETY: takes no pointers; glibc locks each heap while it trims it.
+            unsafe { libc::malloc_trim(0) };
+        })
+        .ok();
 }
 
 /// Linux: note what the session is, and pick the window system for this run. Called

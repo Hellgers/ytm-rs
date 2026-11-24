@@ -84,6 +84,11 @@ impl Session {
         self.active() && !self.is_host()
     }
 
+    /// The room's code, once it has let you in.
+    pub fn code(&self) -> Option<&str> {
+        self.conn.as_ref().filter(|_| self.welcomed).map(|c| c.code.as_str())
+    }
+
     pub fn member_count(&self) -> usize {
         self.members.len()
     }
@@ -196,10 +201,19 @@ pub fn dev_script(app: &mut App, ctx: &egui::Context, now: f64) {
     }
 }
 
-/// A link (or a code from another launch) asked to join a room.
+/// A link (or a code from another launch) asked to join a room: its code is filled in on
+/// the page, and joining waits for Join, so a web page can't put anyone in a room.
 pub fn open_link(app: &mut App, code: String) {
     app.go(Page::Jam);
-    join(app, &code);
+    let normalized = crate::jam::normalize_code(&code);
+    if normalized.is_some() && app.jam.conn.as_ref().map(|c| Some(&c.code)) == Some(normalized.as_ref()) {
+        return;
+    }
+    app.jam.code_input = normalized.unwrap_or(code);
+    app.jam.error = None;
+    if app.jam.conn.is_some() {
+        app.toast("Leave this jam to join the one in the link");
+    }
 }
 
 /// Every frame: handle what arrived, then (host) send changes or (guest) catch up.
@@ -452,6 +466,9 @@ fn apply_state(app: &mut App, state: RoomState, at: Instant) {
     app.jam.owner = state.owner;
     app.queue_source = None;
     app.queue.fill = None;
+    app.queue.radio_seed = None;
+    // The host's queue, in the host's order.
+    app.queue.clear_shuffle();
     app.play_pending = None;
     if state.queue.is_empty() {
         app.queue.tracks.clear();
@@ -583,9 +600,10 @@ pub fn guest_action(app: &mut App, a: Action) -> Option<Action> {
         }
         Action::Open(Target::Song(t)) | Action::Radio(t) | Action::Enqueue(t) => request(app, Cmd::Add { track: t }),
         Action::PlayNext(t) => request(app, Cmd::Next { track: t }),
-        Action::PlayCollection(..) => app.toast("In a jam, add songs one at a time"),
+        Action::PlayCollection(..) | Action::Shuffle(_) => app.toast("In a jam, add songs one at a time"),
         Action::QueueJump(i) => request(app, Cmd::Jump { index: i }),
         Action::QueueRemove(_) => app.toast("Only the host can remove songs"),
+        Action::QueueClear => app.toast("Only the host can clear the jam's queue"),
         Action::QueueMove { .. } => app.toast("Only the host can reorder the jam"),
         Action::Seek(secs) => request(app, Cmd::Seek { pos: (secs.max(0.0) * 1000.0) as u64 }),
         Action::TogglePlay => request(app, Cmd::Toggle),

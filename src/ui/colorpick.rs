@@ -17,7 +17,7 @@ pub fn button(ui: &mut Ui, c: &mut Color32, name: &str) {
     let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered() || resp.has_focus() || open, 0.12);
     ui.painter().circle_filled(rect.center(), 11.0, *c);
     ui.painter().circle_stroke(rect.center(), 14.0, Stroke::new(1.5, theme::glass(0.18 + 0.27 * h)));
-    egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| picker(ui, resp.id, c));
+    widgets::menu_popup(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| picker(ui, resp.id, c));
 }
 
 fn picker(ui: &mut Ui, id: Id, c: &mut Color32) {

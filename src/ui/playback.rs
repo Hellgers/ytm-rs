@@ -146,6 +146,21 @@ impl App {
         if hidden {
             self.toast(if played { "Skipped an explicit song" } else { "Nothing to play that isn't explicit" });
         }
+        self.start_queue(played);
+    }
+
+    /// Play `tracks` shuffled, with shuffle on; `fill` as for `play_list_filling`.
+    pub(super) fn play_shuffled(&mut self, tracks: Vec<Track>, fill: Option<QueueFill>) {
+        let hidden = self.hide_explicit && !tracks.is_empty() && tracks.iter().all(|t| t.explicit);
+        let played = self.queue.replace_shuffled(tracks, fill);
+        if hidden {
+            self.toast("Nothing to play that isn't explicit");
+        }
+        self.start_queue(played);
+    }
+
+    /// The queue was replaced (`played`): its song starts.
+    fn start_queue(&mut self, played: bool) {
         if !played {
             return;
         }
@@ -178,12 +193,10 @@ impl App {
     /// Ask for the queue YouTube Music keeps across devices when the app starts and
     /// whenever its window comes back into focus with nothing playing, so a song
     /// started on the phone is here to carry on with.
-    pub(super) fn sync_server_queue(&mut self, ctx: &egui::Context, now: f64) {
+    pub(super) fn sync_server_queue(&mut self, refocused: bool, now: f64) {
         if self.playing() {
             self.listened_at = unix_now();
         }
-        let focused = ctx.input(|i| i.focused);
-        let refocused = focused && !std::mem::replace(&mut self.was_focused, focused);
         let idle = !self.playing() && !self.buffering && !self.jam.active() && self.smoke.is_none();
         let due = self.queue_checked.is_none_or(|t| refocused && now - t > 60.0);
         if self.logged_in && idle && due && std::env::var_os("YTM_SMOKE").is_none() {
@@ -237,10 +250,9 @@ impl App {
     /// stream, rather than letting it end early and skip to the next one. If that keeps
     /// failing, stay on the song, ready to resume from there.
     pub(super) fn recover(&mut self, at: Duration, reason: &str) {
-        let attempt = recovery_attempt(self.recoveries, self.recovery_at, at);
-        self.recovery_at = Some(at);
-        if let Some(attempt) = attempt {
-            self.recoveries = attempt;
+        const MAX_RECOVERIES: u32 = 3;
+        if self.recoveries < MAX_RECOVERIES {
+            self.recoveries += 1;
             log::warn!("playback interrupted at {at:?} ({reason}); reopening (try {})", self.recoveries);
             self.play_current_at(at, false);
             return;
@@ -256,7 +268,6 @@ impl App {
 
     pub(super) fn play_current(&mut self) {
         self.recoveries = 0;
-        self.recovery_at = None;
         self.play_current_at(Duration::ZERO, true);
     }
 
@@ -291,11 +302,17 @@ impl App {
             if self.music_videos.len() >= 1000 {
                 self.music_videos.clear();
             }
-            self.music_videos.insert(t.id.clone(), None);
-            self.backend.request(Req::MusicVideo(t));
-            return None;
+            if let Some(id) = &t.stands_for {
+                // A video liked on YouTube, listed as its matched song: that video is its own.
+                let video = Track { id: id.clone(), video: true, stands_for: None, ..t.clone() };
+                self.music_videos.insert(t.id, Some(crate::ytm::MusicVideo { video, offset_ms: 0 }));
+            } else {
+                self.music_videos.insert(t.id.clone(), None);
+                self.backend.request(Req::MusicVideo(t));
+                return None;
+            }
         }
-        let found = self.music_videos.get(&t.id)?.as_ref()?;
+        let found = self.current().and_then(|t| self.music_videos.get(&t.id))?.as_ref()?;
         (!(self.hide_explicit && found.video.explicit)).then_some(found)
     }
 
@@ -343,10 +360,8 @@ impl App {
     fn start_current(&mut self, at: Duration, report: bool, swap: bool) {
         let swap = std::mem::take(&mut self.resume_as_song) || swap;
         let Some(track) = self.current().cloned() else { return };
-        // A stand-in swap can use another upload's clock within this same play.
-        // A failed reopen must retain this attempt's target, not an old interruption.
-        if self.recovery_at.is_some() {
-            self.recovery_at = Some(at);
+        if swap || (report && at.is_zero()) {
+            self.bar_track_epoch = self.bar_track_epoch.wrapping_add(1);
         }
         // Picking up mid-song (a resume, a download that broke off): the position is the
         // song version's when one was playing, so that goes on; a music video stays one.
@@ -371,7 +386,7 @@ impl App {
         self.audio.status.duration_ms.store(shown.duration.map_or(0, |d| d as u64 * 1000), Ordering::Relaxed);
         // A song running into the next crossfades (so does Next, when that's switched
         // on); going back or picking a song cuts over.
-        self.audio.send(if !at.is_zero() { AudioCmd::StopAt(at) } else if self.handoff { AudioCmd::Handoff } else { AudioCmd::Stop });
+        self.audio.send(if !at.is_zero() { AudioCmd::StopAt { generation: self.generation, at } } else if self.handoff { AudioCmd::Handoff } else { AudioCmd::Stop });
         self.audio.send(AudioCmd::Warm);
         self.buffering = true;
         self.seek_drag = None;
@@ -417,11 +432,16 @@ impl App {
     /// Keep the queue topped up so autoplay never stalls at the end; a playlist still
     /// coming in goes first.
     pub(super) fn top_up(&mut self) {
-        if self.autoplay && !self.radio_pending && !self.jam.guest() && self.queue.fill.is_none() && self.queue.at_end() && self.queue.repeat != Repeat::All
+        if self.autoplay && !self.jam.guest() && self.queue.fill.is_none() && self.queue.at_end() && self.queue.repeat != Repeat::All
             && let Some(t) = self.current().cloned()
         {
-            self.radio_pending = true;
-            self.backend.request(Req::Radio { song_of: self.song_of(&t), seed: t.id });
+            self.request_radio(t);
+        }
+    }
+
+    pub(super) fn request_radio(&mut self, t: Track) {
+        if let Some(load) = self.queue.start_radio(&t.id, self.backend.api().epoch()) {
+            self.backend.request(Req::Radio { load, song_of: self.song_of(&t), seed: t.id });
         }
     }
 
@@ -549,11 +569,36 @@ impl App {
         self.handoff = ending;
     }
 
+    pub(super) fn skip_disliked(&mut self) {
+        if self.jam.guest() {
+            return;
+        }
+        let generation = self.generation;
+        // With just this track in the queue, Repeat all would play it again.
+        if self.queue.repeat != Repeat::All || self.queue.tracks.len() > 1 || self.queue.fill.is_some() {
+            self.next();
+        }
+        if self.generation == generation {
+            // Nothing to advance to yet. Cancel a buffered play too, and carry on
+            // if more of the playlist or an autoplay queue arrives.
+            self.generation += 1;
+            self.audio.status.wanted_gen.store(self.generation, Ordering::Relaxed);
+            self.audio.send(AudioCmd::Stop);
+            self.buffering = false;
+            self.seek_drag = None;
+            self.resume_at = Some(Duration::ZERO);
+            self.resume_counts = true;
+            self.ended = true;
+            self.top_up();
+        }
+    }
+
     pub(super) fn prev(&mut self) {
         if self.jam.guest() {
             return jam::request(self, crate::jam::Cmd::Prev);
         }
         if self.audio.status.position() > Duration::from_secs(3) {
+            self.bar_track_epoch = self.bar_track_epoch.wrapping_add(1);
             self.seek_to(Duration::ZERO);
             return;
         }
@@ -580,12 +625,10 @@ impl App {
             return jam::request(self, crate::jam::Cmd::Toggle);
         }
         if let Some(at) = self.resume_at {
-            // Explicit retry starts a fresh bounded recovery episode.
-            self.recoveries = 0;
-            self.recovery_at = Some(at);
             // Last session's song, already counted when it started then (unless it was
             // another device's).
             let report = std::mem::take(&mut self.resume_counts);
+            self.recoveries = 0;
             self.play_current_at(at, report);
             return;
         }
@@ -594,23 +637,20 @@ impl App {
         self.audio.send(if playing { AudioCmd::Pause } else { AudioCmd::Resume });
     }
 
-    pub(super) fn shuffle_upcoming(&mut self) {
+    /// The Shuffle button: on, or off putting the queue back in order (see `Queue::toggle_shuffle`).
+    pub(super) fn toggle_shuffle(&mut self) {
         if self.jam.guest() {
             return self.toast("Only the host can shuffle the jam");
         }
-        if self.queue.shuffle_upcoming() {
-            self.toast("Shuffled up next");
-            self.prefetch_next();
+        self.queue.toggle_shuffle();
+        // Waiting at the end for a playlist's next page, with songs after this one now.
+        if !self.queue.at_end() && self.queue.fill.as_mut().is_some_and(|f| std::mem::take(&mut f.ran_out)) {
+            return self.next();
         }
+        // Off can leave the song playing last, so autoplay's songs are wanted now.
+        self.top_up();
+        self.prefetch_next();
     }
-}
-
-/// Reopening the same frozen position does not earn a fresh automatic retry budget.
-/// Only at least five seconds of forward progress separates recovery episodes.
-fn recovery_attempt(attempts: u32, previous: Option<Duration>, at: Duration) -> Option<u32> {
-    let progressed = previous.is_some_and(|before| at.saturating_sub(before) >= Duration::from_secs(5));
-    let attempts = if progressed { 0 } else { attempts };
-    (attempts < 3).then_some(attempts + 1)
 }
 
 /// `at` moved by `ms`, not before the start.
@@ -620,28 +660,4 @@ fn shifted(at: Duration, ms: i64) -> Duration {
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
-
-#[cfg(test)]
-mod recovery_budget_tests {
-    use super::recovery_attempt;
-    use std::time::Duration;
-
-    #[test]
-    fn frozen_or_backward_positions_do_not_reset_the_recovery_budget() {
-        let at = Duration::from_millis(113_195);
-        let (mut attempts, mut previous) = (0, None);
-        for expected in 1..=3 {
-            let next = recovery_attempt(attempts, previous, at);
-            assert_eq!(next, Some(expected));
-            attempts = next.unwrap();
-            previous = Some(at);
-        }
-        assert_eq!(recovery_attempt(attempts, previous, at), None);
-        assert_eq!(recovery_attempt(attempts, previous, at - Duration::from_secs(1)), None);
-        assert_eq!(recovery_attempt(attempts, previous, at + Duration::from_millis(4999)), None);
-        assert_eq!(recovery_attempt(attempts, previous, at + Duration::from_secs(5)), Some(1));
-        // Manual retry explicitly rearms the count at the retained timestamp.
-        assert_eq!(recovery_attempt(0, Some(at), at), Some(1));
-    }
 }

@@ -325,7 +325,7 @@ impl Api {
         self.call_as(endpoint, body, &account.on_channel(None)).await
     }
 
-    async fn call_as(&self, endpoint: &str, body: Value, account: &Session) -> anyhow::Result<Value> {
+    pub(crate) async fn call_as(&self, endpoint: &str, body: Value, account: &Session) -> anyhow::Result<Value> {
         match self.call_once(endpoint, &body, Some(account), false).await {
             Err(e) if is_refused(&e) => self.retry_signed_in(endpoint, &body, Some(account), e).await,
             r => r,

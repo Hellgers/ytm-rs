@@ -1,15 +1,17 @@
 ## Windows maintenance fork
 
-Version 0.3.4 integrates upstream 0.3.3 with the cumulative playback, radio and
-rendering fixes described in [the technical notes](docs/AUDIO_CONTINUITY_FIX.md).
+Version 0.3.5 uses AppleTify as the single desktop theme. Appearance still has
+light, dark and system modes. The bottom bar animates visible track changes
+and shows the current song immediately when the window is restored.
+
+AppleTify is adapted from a-dogann's theme in the Better Lyrics community.
 The original project is [grapedjuice/ytm-rs](https://github.com/grapedjuice/ytm-rs).
 
-Use this fork's [Windows releases](https://github.com/Hellgers/ytm-rs/releases/latest)
-for its unsigned installer or portable ZIP. These builds follow this fork's update
-channel. Release assets also include the source, a unified functional patch and
-SHA256 checksums. Preserve the previous executable for rollback.
+Use the fork's [Windows releases](https://github.com/Hellgers/ytm-rs/releases)
+for the unsigned installer and portable ZIP. These builds use the fork's update
+channel. Release assets include corresponding source and SHA-256 checksums.
 
-The upstream project's cross-platform documentation follows below.
+The upstream documentation and historical screenshots follow below.
 
 <div align="center">
   <img src="assets/icon/icon.png" alt="ytm-rs app icon" width="96">
@@ -83,7 +85,7 @@ Most YouTube Music desktop apps are the website running in a hidden browser. ytm
 **Lyrics and looks**
 - **Karaoke lyrics:** word-by-word lyrics drawn the way the Better Lyrics extension draws them, from every Better Lyrics source, with automatic fallback, romanization, translations and per-song timing offsets.
 - **Animated background:** the album art drifts and pulses with the music behind everything. Go full-screen, or hide the lyrics to see just the artwork.
-- **30 themes:** 27 rebuilt from the [Better Lyrics community themes](https://github.com/better-lyrics/themes), such as Apple Music, Spicy, Spinning Record, reCover and Material 3, plus the app's own ytm-rs and Classic looks and Fluent, in the style of Windows 11. Each one restyles the whole app, in light or dark mode, with real frosted glass where the theme has it. Use any bundled or installed font.
+- **AppleTify:** the desktop theme for this fork, with light, dark and system modes.
 - **Your colours:** the accent can follow the theme or your system, or be any colour you pick. A `theme.conf` file can set every colour in the app, for tools like wallust and pywal to write. Zoom makes everything bigger or smaller.
 
 **Together and across services**
@@ -99,6 +101,8 @@ Most YouTube Music desktop apps are the website running in a hidden browser. ytm
 - Automatic updates in the background for both the installed and portable versions, with release notes when an update is ready. Pick the Nightly channel for builds of the newest changes.
 
 ## Screenshots
+
+The screenshots below are from upstream or earlier versions. This branch uses AppleTify.
 
 <p align="center">
   <img src="docs/readme/v2/themes-grid.jpg" alt="Six of the 30 themes in Now playing: ytm-rs, Apple Music, Material 3, Spicy, Spinning Record and reCover, each with synced lyrics" width="100%">
